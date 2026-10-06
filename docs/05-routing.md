@@ -493,6 +493,8 @@ connect them. The plane-aware routing idea is credited to
 The first plane-cut preference charged 0.5 mm per lattice cell: at 0.1 mm pitch, crossing a board-wide pour
 made orthogonal steps six times their geometric cost. The unchanged lower-bound heuristic underestimated badly
 and exhausted the search budget on two-layer pour boards. The preference is now proportional to length.
+Zone targets originally used a zero heuristic, flooding all cells cheaper than one via before reaching an
+inner plane. On fine lattices, these plane searches exhausted the work budget before pad pairs were attempted.
 
 **What was built**
 
@@ -517,6 +519,12 @@ and exhausted the search budget on two-layer pour boards. The preference is now 
   including the increased cost of blind/buried vias. Zero disables the preference and skips the map,
   not soft-zone legality. Net comparison and penalties remain outside class caches and CPU/GPU fields,
   so the fields stay lower bounds. The surcharge no longer grows when the lattice pitch shrinks.
+- Soft plane targets use an admissible, unweighted A* bound: octile distance to the target fill's enclosing
+  box, plus the minimum enabled layer-change cost if the current layer is outside its copper layers.
+  An enabled through via supplies the base cost; blind/buried-only searches use the 3/2 premium; searches
+  without usable vias add no layer term. Obstacles, bends and nonnegative plane penalties are ignored.
+  Fields remain disabled for plane targets. `RouterOptions::zone_target_heuristic = false` selects the
+  zero-heuristic reference; option-off routing retains its previous heuristic.
 - The summary reports `plane_connections` and `zones_needing_refill`. The writer removes `filled_polygon`
   children only from zones whose original fills overlap/touch new foreign-net track or via copper. Other
   zones, including unknown children and fills, remain byte-identical. The log prints the count and refill
@@ -529,6 +537,11 @@ Obstacle parity tests cover hard/soft planes, rule areas, physical-hole rules, h
 tests cover plane targets, already-joined pads and equal-length plane-avoiding alternatives. A long route
 across a board-wide foreign pour checks the (1 + F) cost bound and bounded search expansions against an
 unpenalized route; writer tests cover selective track/via invalidation and untouched bytes.
+Plane-target tests compare with the zero heuristic at identical integer route costs on a generated
+four-layer board: directly above the inner plane, expansions drop from 51,429 to 1 (cost 3 mm);
+with the target 4 mm to the side, total expansions drop from 1,347,518 to 534,635 (cost 7.2 mm).
+The latter includes the same 521,284-expansion unsuccessful first window in both runs; the successful
+search drops from 826,234 to 13,351. The tests pin the above-plane count and total-work reduction.
 
 The generated all-SMD four-layer integration board (0402s, a QFN-like package, inner GND/3V3 planes and
 via-permitting track rule areas) routed 16/16 connections, including 15 plane connections. KiCad 10.0.3

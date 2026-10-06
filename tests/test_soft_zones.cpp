@@ -86,6 +86,50 @@ TEST_CASE("soft zones target unused planes with legal vias but not already conne
   CHECK(route::Router(joined, rules, o).run().connections == 0);
 }
 
+TEST_CASE("plane target box and layer heuristic preserves zero-heuristic costs", "[route][soft-zones]") {
+  model::DesignRules rules;
+  rules.classes.emplace_back();
+  route::RouterOptions o;
+  o.pitch = 50'000;
+  o.work_budget = 2'000'000;
+  o.gpu_device = -1;
+  o.field_min_cells = 1; // plane targets must still bypass cost-to-go fields
+  o.soft_zones = true;
+  o.plane_cut_cost = 0;
+  o.optimize = false;
+  for (bool beside : {false, true}) {
+    auto b = parse(board_text(plane("In1.Cu", 2, "GND",
+        beside ? "(xy 8 1) (xy 11 1) (xy 11 9) (xy 8 9)" : kPts)));
+    // One lattice-aligned start and a straight route make the exact search cost observable in the
+    // emitted copper: no stubs, bends, foreign planes, history, soft obstacles or clean-up costs.
+    b.pads[0].size_x = b.pads[0].size_y = 10'000;
+    o.zone_target_heuristic = false;
+    const auto reference = route::Router(b, rules, o).run();
+    o.zone_target_heuristic = true;
+    const auto bounded = route::Router(b, rules, o).run();
+    INFO("beside " << beside << ", zero heuristic " << reference.expansions << ", bounded " << bounded.expansions);
+    REQUIRE(reference.routed == 1);
+    REQUIRE(bounded.routed == 1);
+    REQUIRE(reference.vias.size() == 1);
+    REQUIRE(bounded.vias.size() == 1);
+    const auto cost = [&](const route::RouteResult& r) {
+      Coord result = static_cast<Coord>(o.via_cost_mm * 1e6);
+      for (const auto& t : r.tracks) {
+        REQUIRE(t.a.y == t.b.y);
+        REQUIRE(t.b.x > t.a.x);
+        REQUIRE((t.b.x - t.a.x) % o.pitch == 0);
+        result += t.b.x - t.a.x;
+      }
+      return result;
+    };
+    CHECK(cost(bounded) == cost(reference));
+    // The displaced target also requires an initial unsuccessful window: count that work in the
+    // bound rather than claiming only the successful search's speed-up.
+    CHECK(bounded.expansions * (beside ? 2 : 5) < reference.expansions);
+    if (!beside) CHECK(bounded.expansions <= 2);
+  }
+}
+
 TEST_CASE("plane map matches its reference with priorities and holes, without class-dependent ownership", "[route][soft-zones]") {
   auto b = parse(board_text(plane("In1.Cu", 2, "GND", kPts) + plane("In1.Cu", 1, "SIG", "(xy 2 2) (xy 8 2) (xy 8 8) (xy 2 8)") + kArea));
   b.zones[1].priority = 1;
