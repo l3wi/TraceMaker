@@ -206,3 +206,43 @@ TEST_CASE("DRC reports disallowed tracks and vias in pads as KiCad does", "[rule
   CHECK(count(r, "items_not_allowed") == 1);  // the SIG track on In1; the GND track on In2 is allowed
   CHECK(count(r, "hole_clearance") == 1);     // the via in R1's SIG pad (same net)
 }
+
+TEST_CASE("KiCad size conditions use local pad dimensions, relational operators and units", "[rules]") {
+  const Files f("size_expr", board_text(""), "");
+  auto lb = io::read_board_file(f.pcb.string());
+  lb.board.pads[0].size_x = 500'000;
+  lb.board.pads[0].size_y = 1'000'000;
+  lb.board.pads[0].angle = 90;
+  lb.board.footprints[0].angle = 45;
+  const auto copper = drc::build_copper(lb.board);
+  const drc::CopperItem* pad = nullptr;
+  for (const auto& it : copper.items)
+    if (it.kind == drc::ItemKind::Pad && it.index == 0) pad = &it;
+  REQUIRE(pad != nullptr);
+  drc::CopperItem via;
+  via.kind = drc::ItemKind::Via;
+  via.net = 1;
+  auto matches = [&](const std::string& expr) {
+    auto rules = io::read_design_rules(f.pcb.string());
+    model::CustomRule rule;
+    rule.name = "size";
+    rule.condition = expr;
+    rule.constraints.push_back({"physical_hole_clearance", 350'000, {}, {}, {}});
+    rules.custom.push_back(rule);
+    const drc::RuleEngine re(lb.board, rules);
+    REQUIRE(re.warnings().empty());
+    CHECK_FALSE(re.needs_exact_routing());
+    return re.physical_hole_clearance(&via, *pad, 0) == 350'000;
+  };
+  CHECK(matches("B.Size_X < 2mm && B.Size_Y <= 1mm"));
+  CHECK(matches("B.Size_X >= 0.5mm && B.Size_Y > 0.5mm"));
+  CHECK(matches("B.Size_X == 500000 && B.Size_Y != 500000"));
+  CHECK(matches("B.Size_X == 0.01968503937007874in && B.Size_Y == 1000000"));
+  CHECK(matches("0.5mil < B.Size_X && B.Size_Y >= 39mil"));
+  CHECK(matches("(A.Type == 'Via') && (B.Pad_Type == 'SMD') && B.Size_X < 2 mm"));
+  CHECK_FALSE(matches("B.Size_X > 1mm || B.Size_Y < 0.5mm"));
+  CHECK_FALSE(matches("B.Unknown < 2mm"));
+  CHECK_FALSE(matches("B.Unknown == 'anything'"));
+  CHECK_FALSE(matches("B.Unknown != 'anything'"));
+  CHECK_FALSE(matches("A.Size_X < 2mm"));
+}

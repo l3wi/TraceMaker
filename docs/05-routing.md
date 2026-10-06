@@ -483,3 +483,22 @@ physical-hole query gave −0.3%.
 **Remaining costs.** Open list ~16%, routed-copper queries ~17%, fixed-copper via checks ~16% (half rule
 evaluation), fields ~10%. Fixed-obstacle caches remain per variant: up to eight copies of the same lattice
 codes; sharing them needs a thread-safe cache.
+
+## 19. Keep vias off small pads (D62)
+
+The opt-in `--keep-vias-off-pads [MM]` preference is based on
+[@lucasbstn's upstream PR #1](https://github.com/DingoOz/TraceMaker/pull/1).
+
+**KiCad 10 source verification.** [`PAD` property registration](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/pcbnew/pad.cpp)
+registers “Size X” / “Size Y”; [`PCBEXPR_VAR_REF`](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/pcbnew/pcbexpr_evaluator.cpp)
+replaces underscores with spaces, so conditions use `Size_X` / `Size_Y`.
+[`PAD::GetSizeX/GetSizeY`](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/pcbnew/pad.h)
+return the padstack's own copper dimensions, not its rotated board-axis bounding box. Rotating a rectangular
+pad or its footprint therefore does not swap these properties.
+The [`condition grammar`](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/common/libeval_compiler/grammar.lemon)
+supports `<`, `<=`, `>`, `>=` and a number followed by a unit. The PCB unit resolver accepts `mm`, `mil`, `in`,
+`deg`, `fs` and `ps`. Lengths evaluate in internal nanometres; bare numbers are unscaled, **not millimetres**.
+The [`compiler`](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/common/libeval_compiler/libeval_compiler.cpp)
+also diagnoses a lone numeric literal without units. Use explicit units for dimensions.
+See KiCad's [custom rules manual](https://docs.kicad.org/10.0/en/pcbnew/pcbnew.html#custom-design-rules)
+for `.kicad_dru` placement, conditions and the `physical_hole_clearance` constraint.
