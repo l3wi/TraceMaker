@@ -5,6 +5,7 @@
 #include "route/escape_flow.hpp"
 #include "route/heat_grid.hpp"
 #include "route/global_router.hpp"
+#include "route/plane_map.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -51,6 +52,14 @@ struct Router::Impl {
   Coord pitch = 0;
   geom::Box lat;  // lattice bounds (aligned to pitch)
   int nx = 0, ny = 0, nl = 0;
+  PlaneMap planes;
+  std::int64_t plane_cut_penalty = 0;
+  std::int64_t plane_via_cost(int gx, int gy, NetId net, int l0, int l1) const {
+    if (plane_cut_penalty == 0) return 0;
+    std::int64_t cost = 0;
+    for (int l = l0; l <= l1; ++l) cost += planes.cost(l, gx, gy, net, plane_cut_penalty);
+    return cost;
+  }
   drc::UnionFind* clusters = nullptr;
   std::vector<int> pad_item;  // board pad -> copper item index (or -1)
 
@@ -197,7 +206,7 @@ struct Router::Impl {
   int to_iy(Coord y) const { return static_cast<int>(std::llround(static_cast<double>(y - lat.y0) / static_cast<double>(pitch))); }
 
   void setup() {
-    obs = std::make_unique<Obstacles>(b, rules);
+    obs = std::make_unique<Obstacles>(b, rules, opt.soft_zones);
     use_cache = !obs->needs_exact_routing();
     nl = b.copper_count();
     blind_ok = opt.blind_vias && rules.minimums.allow_blind_buried_vias && nl > 2;
@@ -228,6 +237,10 @@ struct Router::Impl {
     lat = geom::Box{bb.x0 / pitch * pitch, bb.y0 / pitch * pitch, bb.x1, bb.y1};
     nx = static_cast<int>((lat.x1 - lat.x0) / pitch) + 1;
     ny = static_cast<int>((lat.y1 - lat.y0) / pitch) + 1;
+    if (opt.soft_zones) {
+      planes.build(b, {lat.x0, lat.y0}, pitch, nx, ny);
+      plane_cut_penalty = mm_to_nm(std::max(0.0, opt.plane_cut_cost_mm));
+    }
     // Near-routed raster: how many routed items could conflict with a probe centred on each lattice point.
     // Points with a zero count skip the routed-copper query (a third of the search time on large boards).
     Coord probe = 0;
@@ -294,8 +307,8 @@ struct Router::Impl {
       if (!opt.only_net.empty() && b.nets[static_cast<std::size_t>(net)].name != opt.only_net) continue;
       std::vector<Cluster> groups;
       for (auto& [r, c] : cl)
-        if (!c.pads.empty()) groups.push_back(c);  // zone-only clusters (unused fills) are not targets on their own
-      if (groups.size() < 2) continue;
+        if (!c.pads.empty() || (opt.soft_zones && !c.zones.empty())) groups.push_back(c);
+      if (groups.size() < 2 || std::none_of(groups.begin(), groups.end(), [](const Cluster& c) { return !c.pads.empty(); })) continue;
       // Prim over clusters; a pad may connect to another cluster's pad or into its zone fill (plane).
       const std::size_t k = groups.size();
       std::vector<std::uint8_t> in(k, 0);
@@ -526,9 +539,10 @@ struct Router::Impl {
         hc += corridor_pen;
       }
     }
-    if (st == 1) return static_cast<std::int64_t>(opt.soft_cost_mm * 1e6) + hc * 4;
-    if (st == 3) return 3 * pitch + hc;
-    return hc;
+    const auto pc = planes.cost(layer, gx, gy, net, plane_cut_penalty);
+    if (st == 1) return static_cast<std::int64_t>(opt.soft_cost_mm * 1e6) + hc * 4 + pc;
+    if (st == 3) return 3 * pitch + hc + pc;
+    return hc + pc;
   }
   std::int64_t via_cost_at(const Window& w, int cx, int cy, NetId net, Coord d, Coord drill) {
     if (!vias_ok(net)) return -1;
@@ -564,7 +578,8 @@ struct Router::Impl {
       if (rc < 0) return -1;
       extra = std::max(extra, rc);
     }
-    return extra + (via_state[idx] == 1 ? static_cast<std::int64_t>(opt.soft_cost_mm * 1e6) : 0);
+    return extra + plane_via_cost(w.x0 + cx, w.y0 + cy, net, 0, nl - 1) +
+           (via_state[idx] == 1 ? static_cast<std::int64_t>(opt.soft_cost_mm * 1e6) : 0);
   }
 
   // Lattice cells of the window inside a pad's copper on each of its layers (falls back to cells next to the
@@ -930,7 +945,8 @@ struct Router::Impl {
           const int vs = obs->via_state_span(vp, vd, vdrill, net, vm, soft, nullptr, std::min(l, l2), std::max(l, l2));
           if (vs == 2) continue;
           const std::size_t ns = sidx(l2, ci, kNoDir);
-          const std::int64_t ng = gs + via_cost * 3 / 2 + (vs == 1 ? static_cast<std::int64_t>(opt.soft_cost_mm * 1e6) : 0);
+          const std::int64_t ng = gs + via_cost * 3 / 2 + plane_via_cost(w.x0 + cx, w.y0 + cy, net, std::min(l, l2), std::max(l, l2)) +
+                                  (vs == 1 ? static_cast<std::int64_t>(opt.soft_cost_mm * 1e6) : 0);
           if ((sn[ns].tag & kGenMask) == gen && sn[ns].g <= ng) continue;
           const std::int64_t hn = h(l2, w.x0 + cx, w.y0 + cy);
           if (hn >= kUnreachable) continue;
@@ -2972,6 +2988,9 @@ struct Router::Impl {
     res.routed = best_routed;
     res.tracks = std::move(best_tracks);
     res.vias = std::move(best_vias);
+    if (opt.soft_zones)
+      for (std::size_t ci = 0; ci < cs.size(); ++ci)
+        if (!best_unrouted[ci] && cs[ci].c.zone_b >= 0) ++res.plane_connections;
     // Failures relative to the best state are approximated by the connections unrouted at the end.
     for (std::size_t ci = 0; ci < cs.size(); ++ci) {
       const auto& st = cs[ci];

@@ -14,7 +14,8 @@ namespace tmk::route {
 using geom::Point;
 using geom::Shape;
 
-Obstacles::Obstacles(model::Board& board, const model::DesignRules& rules) : b_(board), r_(rules), cm_(drc::build_copper(board)) {
+Obstacles::Obstacles(model::Board& board, const model::DesignRules& rules, bool soft_zones)
+    : soft_zones_(soft_zones), b_(board), r_(rules), cm_(drc::build_copper(board)) {
   // KiCad checks routed copper against footprint copper graphics as net-less copper (keyboard-switch
   // footprints, logos), whatever pad they touch: block them for every net.
   for (auto& it : cm_.items)
@@ -27,6 +28,8 @@ Obstacles::Obstacles(model::Board& board, const model::DesignRules& rules) : b_(
   bounds_ = bounds_.inflated(5'000'000);
   const Coord cell = 1'000'000;
   grid_ = std::make_unique<index::UniformGrid>(bounds_, cell, cm_.items.size() + 1024);
+  // Connectivity uses this same grid and must retain fills already joined to pads. Routing queries share
+  // zone_is_soft instead (KiCad refills zones around newly routed copper; D61).
   for (std::size_t i = 0; i < cm_.items.size(); ++i) grid_->insert(static_cast<int>(i), cm_.items[i].box);
   rgrid_ = std::make_unique<index::UniformGrid>(bounds_, cell, 1024);
   // Non-plated holes are board edges for KiCad's copper_edge_clearance (verified on PCBench ErgoDone).
@@ -324,7 +327,7 @@ int Obstacles::copper_state(const Shape& s, const drc::CopperItem& probe, int la
   grid_->query(s.box.inflated(re_->max_clearance() + 1), [&](int id) {
     if (state == 2) return;
     const auto& it = cm_.items[static_cast<std::size_t>(id)];
-    if (it.removed || !(it.layers & model::layer_bit(layer))) return;
+    if (it.removed || zone_is_soft(it) || !(it.layers & model::layer_bit(layer))) return;
     if (it.net == probe.net && probe.net != 0) return;
     Coord req = re_->clearance(probe, it, layer);
     // Untented vias open the mask around themselves: other nets' copper must stay outside that opening.
@@ -470,7 +473,7 @@ bool Obstacles::physical_hole_blocked(const Shape& hole, model::NetId net, int l
   grid_->query(hole.box.inflated(re_->max_physical_hole_clearance() + 1), [&](int id) {
     if (hit) return;
     const auto& it = cm_.items[static_cast<std::size_t>(id)];
-    if (it.owner >= 0 || it.removed || !(it.layers & model::layer_bit(layer))) return;
+    if (it.owner >= 0 || it.removed || zone_is_soft(it) || !(it.layers & model::layer_bit(layer))) return;
     const Coord req = re_->physical_hole_clearance(&probe, it, layer);
     if (req <= 0) return;
     for (const auto& u : it.shapes)
@@ -627,7 +630,7 @@ std::int32_t Obstacles::fixed_code(Point p, int layer, Coord hw, Coord margin, m
   grid_->query(s.box.inflated(re_->max_clearance() + 1), [&](int id) {
     if (code == kBlocked) return;
     const auto& it = cm_.items[static_cast<std::size_t>(id)];
-    if (it.owner >= 0 || it.removed || !(it.layers & model::layer_bit(layer))) return;
+    if (it.owner >= 0 || it.removed || zone_is_soft(it) || !(it.layers & model::layer_bit(layer))) return;
     if (it.net != 0 && code == it.net) return;  // already known: only legal for this net
     Coord req = re_->clearance(probe, it, layer);
     if (via_mask_ > 0 && (layer == 0 || layer == b_.copper_count() - 1) && it.kind != drc::ItemKind::Zone && it.kind != drc::ItemKind::Pad) {
@@ -690,7 +693,7 @@ std::int32_t Obstacles::fixed_via_code(Point p, Coord d, Coord drill, Coord marg
     grid_->query(s.box.inflated(re_->max_clearance() + 1), [&](int id) {
       if (code == kBlocked) return;
       const auto& it = cm_.items[static_cast<std::size_t>(id)];
-      if (it.owner >= 0 || it.removed || !(it.layers & all)) return;
+      if (it.owner >= 0 || it.removed || zone_is_soft(it) || !(it.layers & all)) return;
       if (it.net != 0 && code == it.net) return;  // already known: only legal for this net
       for (int l = 0; l < nl; ++l) {
         if (!(it.layers & model::layer_bit(l))) continue;

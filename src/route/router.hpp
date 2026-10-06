@@ -35,6 +35,8 @@ struct RouterOptions {
   int soft_attempts = 3;        // window sizes tried by negotiated searches
   double via_cost_mm = 3.0;     // equivalent track length of one via
   bool allow_vias = true;
+  bool soft_zones = false;      // zone fills are refillable, not fixed routing obstacles (D61)
+  double plane_cut_cost_mm = 0.5;  // search-only cost per foreign-plane cell, equivalent track length
   bool rip_up = true;           // negotiated rip-up and reroute (design doc 05 §6 rung R2, doc 06 §3)
   int max_rips_per_connection = 8;
   int max_passes = 12;          // passes over still-unrouted connections
@@ -88,6 +90,8 @@ struct RouteResult {
   std::vector<model::Track> tracks;  // new copper, in commit order
   std::vector<model::Via> vias;
   int connections = 0, routed = 0;
+  int plane_connections = 0;    // routed connections whose target is a zone fill
+  int zones_needing_refill = 0;
   long expansions = 0;
   int rips = 0, passes = 0;
   int enclosed = 0;             // searches that proved the source boxed in (no larger window tried)

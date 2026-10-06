@@ -230,8 +230,13 @@ RouteJobResult run_route_job(RouteJob job) {
     for (const auto& u : res.unrouted) failed.push_back({u.net, u.a, u.b, 1});
     kb->record_failures(feat.hash, failed);
   }
+  io::BoardEditor ed(lb, opt.seed);
+  if (opt.soft_zones) {
+    res.zones_needing_refill = ed.invalidate_zone_fills(res.tracks, res.vias);
+    log(fmt("soft zones: %d plane connections, %d zones need refill", res.plane_connections, res.zones_needing_refill));
+    if (!job.out.empty()) log("refill and sign off: kicad-cli pcb drc --refill-zones --output drc.json \"" + job.out + "\"");
+  }
   if (!job.out.empty()) {
-    io::BoardEditor ed(lb, opt.seed);
     for (const auto& t : res.tracks) ed.add_track(t);
     for (const auto& v : res.vias) ed.add_via(v);
     ed.save(job.out);
@@ -247,6 +252,10 @@ RouteJobResult run_route_job(RouteJob job) {
                  {"vias", res.vias.size()},  {"seconds", res.seconds},         {"expansions", res.expansions},
                  {"pitch_mm", nm_to_mm(res.pitch)}, {"failures", res.failures}, {"variant", best_index}, {"variant_name", best_name},
                  {"escape_corridors", res.escape_corridors}};
+  if (opt.soft_zones) {
+    out.summary["plane_connections"] = res.plane_connections;
+    out.summary["zones_needing_refill"] = res.zones_needing_refill;
+  }
   // Differential pairs (doc 05 §15): how each wanted pair came out, measured on the new copper (only when pairs are on).
   if (opt.diff_pairs || !opt.pair_nets.empty()) {
     const drc::RuleEngine re(lb.board, rules);
