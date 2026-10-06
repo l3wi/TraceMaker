@@ -8,6 +8,7 @@
 #include <map>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <cmath>
 
 #include "app/defects.hpp"
 #include "app/inspect.hpp"
@@ -452,6 +453,11 @@ int main(int argc, char** argv) {
   route->add_flag("--diff-pairs", ropt.diff_pairs, "Route differential pairs (KiCad P/N or +/- names) as coupled pairs first (doc 05 §15)");
   double r_pair_skew_mm = 0;
   route->add_option("--pair-skew-mm", r_pair_skew_mm, "Intra-pair skew limit for coupled pairs: meanders on the shorter half (0 = custom skew rules only)");
+  double r_keep_vias_off_pads_mm = 2;
+  auto* keep_vias = route->add_flag("--keep-vias-off-pads{2}", r_keep_vias_off_pads_mm,
+      "Keep whole via copper clear of SMD pads smaller than MM on both axes (default 2 mm; route-only preference, doc 05 §19)")
+      ->expected(0, 1)->check(CLI::PositiveNumber);
+  route->validate_optional_arguments();
   route->add_flag("--global", ropt.global_route, "Global routing first: detailed search follows coarse corridors");
   route->add_flag("--global-confine", ropt.global_confine, "With --global: confine each connection's first search to its corridor (experimental)")->group("");
   route->add_flag("--global-corridor-only", ropt.global_strict_corridor_only, "With --global-confine: a corridor failure goes straight to negotiation (experimental)")->group("");
@@ -565,6 +571,11 @@ int main(int argc, char** argv) {
     if (*route) {
       ropt.pitch = static_cast<tmk::Coord>(r_pitch_um * 1000.0);
       ropt.pair_skew = static_cast<tmk::Coord>(r_pair_skew_mm * 1e6);
+      if (*keep_vias) {
+        if (!std::isfinite(r_keep_vias_off_pads_mm) || r_keep_vias_off_pads_mm > 1e9 || r_keep_vias_off_pads_mm < 0.000001)
+          throw std::invalid_argument("--keep-vias-off-pads requires a positive finite size of at least 1 nm");
+        ropt.keep_vias_off_pads = tmk::mm_to_nm(r_keep_vias_off_pads_mm);
+      }
       ropt.gpu_device = tmk::app::default_gpu_device(!r_nogpu);
       auto job = std::move(r_job);
       job.in = r_in;

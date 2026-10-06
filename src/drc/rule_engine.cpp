@@ -335,6 +335,8 @@ RuleEngine::RuleEngine(const model::Board& b, const model::DesignRules& r) : b_(
       std::string err;
       c.cond = Condition::parse(rule.condition, err);
       if (!c.cond) {
+        if (rule.origin == model::RuleOrigin::Synthetic)
+          throw std::runtime_error("synthetic rule '" + rule.name + "': cannot parse condition (" + err + ")");
         c.valid = false;
         warnings_.push_back("rule '" + rule.name + "': cannot parse condition (" + err + "); rule ignored");
       }
@@ -408,6 +410,7 @@ bool RuleEngine::layer_matches(const std::string& sel, int layer) const {
 
 std::optional<Coord> RuleEngine::custom_min(const char* type, const CopperItem* a, const CopperItem* b, int layer) const {
   std::optional<Coord> out;
+  std::optional<Coord> synthetic_min;
   for (const auto& c : rules_) {
     if (!c.valid || !layer_matches(c.rule->layer, layer)) continue;
     const model::Constraint* k = nullptr;
@@ -423,8 +426,15 @@ std::optional<Coord> RuleEngine::custom_min(const char* type, const CopperItem* 
         match = c.cond->eval(ctx2);
       }
     }
-    if (match) out = *k->min;  // later rules take precedence
+    if (match) {
+      if (c.rule->origin == model::RuleOrigin::Synthetic)
+        synthetic_min = std::max(synthetic_min.value_or(*k->min), *k->min);
+      else
+        out = *k->min;  // project rules retain KiCad's later-rule precedence
+    }
   }
+  // A route preference may strengthen, but never replace or weaken, the project's selected minimum.
+  if (synthetic_min) out = std::max(out.value_or(*synthetic_min), *synthetic_min);
   return out;
 }
 

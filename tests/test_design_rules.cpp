@@ -7,6 +7,7 @@
 #include <string>
 #include <tuple>
 
+#include "app/route_job.hpp"
 #include "drc/drc.hpp"
 #include "io/kicad/board_reader.hpp"
 #include "io/kicad/project_reader.hpp"
@@ -244,7 +245,7 @@ TEST_CASE("KiCad size conditions use local pad dimensions, relational operators 
   CHECK_FALSE(matches("B.Unknown < 2mm"));
   CHECK_FALSE(matches("B.Unknown == 'anything'"));
   CHECK_FALSE(matches("B.Unknown != 'anything'"));
-  CHECK_FALSE(matches("A.Size_X < 2mm"));
+  CHECK_FALSE(matches("A.Type == 'Via' && A.Size_X < 2mm"));
 }
 
 TEST_CASE("Width comparisons with explicit KiCad units retain their previous results", "[rules]") {
@@ -271,4 +272,107 @@ TEST_CASE("Width comparisons with explicit KiCad units retain their previous res
   CHECK_FALSE(matches("A.Width == 0.25mm"));
   CHECK(matches("A.Width == 200000"));
   CHECK_FALSE(matches("A.Width == 0.2"));
+}
+
+TEST_CASE("synthetic pad rules fail closed while project parse failures remain warnings", "[rules]") {
+  const Files f("origin", board_text(""), "");
+  const auto lb = io::read_board_file(f.pcb.string());
+  auto rules = io::read_design_rules(f.pcb.string());
+  auto rule = app::keep_vias_off_pads_rule(rules, 2'000'000);
+  CHECK(rule.origin == model::RuleOrigin::Synthetic);
+  CHECK(rule.constraints.front().min == 350'000);
+  auto bigger = rules.default_class();
+  bigger.via_diameter = 900'001;
+  bigger.via_drill = 400'000;
+  bigger.clearance = 250'000;
+  rules.classes.push_back(bigger);
+  CHECK(app::keep_vias_off_pads_rule(rules, 2'000'000).constraints.front().min == 500'001);
+  rule.condition = "B.Size_X <";
+  rules.custom.push_back(rule);
+  CHECK_THROWS_AS(drc::RuleEngine(lb.board, rules), std::runtime_error);
+  rules.custom.back().origin = model::RuleOrigin::Project;
+  const drc::RuleEngine re(lb.board, rules);
+  CHECK(re.warnings().size() == 1);
+  CHECK_THROWS_AS(app::keep_vias_off_pads_rule(rules, 0), std::invalid_argument);
+}
+
+TEST_CASE("synthetic pad rule clears whole via copper on cached and reference paths", "[rules][route]") {
+  const Files f("synthetic", board_text(""), "");
+  auto lb = io::read_board_file(f.pcb.string());
+  // Leave R1 small; R2 is an exposed pad, and an elongated pad is exempt if either axis reaches X.
+  lb.board.pads[2].size_x = lb.board.pads[2].size_y = 4'000'000;
+  lb.board.pads[3].size_x = 2'000'000;
+  auto rules = io::read_design_rules(f.pcb.string());
+  rules.custom.push_back(app::keep_vias_off_pads_rule(rules, 2'000'000));
+  route::Obstacles obs(lb.board, rules);
+  CHECK_FALSE(obs.needs_exact_routing());
+  for (model::NetId net : {1, 2}) {
+    CHECK(obs.via_state({4'000'000, 3'000'000}, 600'000, 300'000, net, 0, false) == 2);
+    CHECK(obs.via_state({4'800'000, 3'000'000}, 600'000, 300'000, net, 0, false) == 2);  // copper touches pad
+    CHECK(obs.via_state({4'999'999, 3'000'000}, 600'000, 300'000, net, 0, false) == 2);
+    CHECK(obs.via_state({5'000'000, 3'000'000}, 600'000, 300'000, net, 0, false) == 0);
+    CHECK(obs.via_state({5'000'001, 3'000'000}, 600'000, 300'000, net, 0, false) == 0);
+  }
+  CHECK(obs.via_state({16'000'000, 3'000'000}, 600'000, 300'000, 1, 0, false) == 0);
+  CHECK(obs.via_state({16'000'000, 7'000'000}, 600'000, 300'000, 2, 0, false) == 0);
+  for (Coord y = 2'000'000; y <= 8'000'000; y += 130'000)
+    for (Coord x = 3'000'000; x <= 18'000'000; x += 130'000)
+      for (model::NetId net : {1, 2})
+        for (const auto& [size, drill, margin] : {std::tuple<Coord, Coord, Coord>{600'000, 300'000, 0},
+                                                {450'000, 200'000, 36'000}})
+          REQUIRE(obs.fixed_via_code({x, y}, size, drill, margin, net) ==
+                  obs.fixed_via_code_reference({x, y}, size, drill, margin, net));
+  // The last synthetic minimum must not weaken a stricter project rule.
+  model::CustomRule strict;
+  strict.constraints.push_back({"physical_hole_clearance", 700'000, {}, {}, {}});
+  rules.custom.insert(rules.custom.begin(), strict);
+  route::Obstacles stronger(lb.board, rules);
+  CHECK(stronger.via_state({5'000'000, 3'000'000}, 600'000, 300'000, 1, 0, false) == 2);
+}
+
+TEST_CASE("a 0402 plane connection uses a dog-bone rather than via-in-pad", "[rules][route]") {
+  const std::string text =
+      "(kicad_pcb (version 20240108) (generator \"pcbnew\")"
+      " (layers (0 \"F.Cu\" signal) (31 \"B.Cu\" signal) (37 \"F.SilkS\" user) (44 \"Edge.Cuts\" user))"
+      " (net 0 \"\") (net 1 \"GND\")"
+      " (footprint \"0402\" (layer \"F.Cu\") (at 4 3)"
+      " (property \"Reference\" \"R1\" (at 0 0) (layer \"F.SilkS\"))"
+      " (pad \"1\" smd rect (at 0 0) (size 0.5 0.6) (layers \"F.Cu\") (net 1 \"GND\")))"
+      " (footprint \"plane-anchor\" (layer \"B.Cu\") (at 16 3)"
+      " (property \"Reference\" \"J1\" (at 0 0) (layer \"F.SilkS\"))"
+      " (pad \"1\" smd rect (at 0 0) (size 3 3) (layers \"B.Cu\") (net 1 \"GND\")))"
+      " (zone (net 1) (net_name \"GND\") (layer \"B.Cu\") (hatch edge 0.5) (connect_pads (clearance 0.2))"
+      " (min_thickness 0.25) (fill yes (thermal_gap 0.3) (thermal_bridge_width 0.3))"
+      " (polygon (pts (xy 1 1) (xy 19 1) (xy 19 9) (xy 1 9)))"
+      " (filled_polygon (layer \"B.Cu\") (pts (xy 1 1) (xy 19 1) (xy 19 9) (xy 1 9))))"
+      " (gr_rect (start 0 0) (end 20 10) (layer \"Edge.Cuts\") (stroke (width 0.1) (type solid))))";
+  const Files f("dogbone", text, "");
+  app::RouteJob job;
+  job.in = f.pcb.string();
+  job.threads = job.variants = 1;
+  job.opt.gpu_device = -1;
+  job.opt.work_budget = 1'000'000;
+  job.opt.time_limit_s = 600;
+  job.opt.pitch = 50'000;
+  const auto baseline = app::run_route_job(job);
+  REQUIRE(baseline.result.routed == 1);
+  REQUIRE(baseline.result.vias.size() == 1);
+  const auto lb = io::read_board_file(job.in);
+  const auto cm = drc::build_copper(lb.board);
+  const geom::Shape& pad = cm.items.front().shapes.front();
+  CHECK(geom::closer_than_disk(pad, baseline.result.vias.front().pos, baseline.result.vias.front().size / 2, 0));
+  job.opt.keep_vias_off_pads = 2'000'000;
+  job.out = (f.dir / "routed.kicad_pcb").string();
+  const auto dogbone = app::run_route_job(job);
+  REQUIRE(dogbone.result.routed == 1);
+  REQUIRE(dogbone.result.vias.size() == 1);
+  CHECK_FALSE(dogbone.result.tracks.empty());
+  for (const auto& v : dogbone.result.vias)
+    CHECK_FALSE(geom::closer_than_disk(pad, v.pos, v.size / 2, 200'000));
+  const auto routed = io::read_board_file(job.out);
+  const auto project_rules = io::read_design_rules(job.out);
+  CHECK(project_rules.custom.empty());  // route-only: never writes .kicad_dru or changes `tracemaker drc`
+  const auto report = drc::run_drc(routed.board, project_rules);
+  CHECK(report.violations.empty());
+  CHECK(report.unconnected.empty());
 }

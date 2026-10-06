@@ -49,6 +49,12 @@
   `A.intersectsArea(...)`, `A.isPlated()`, `A.Pad_Type`, `A.Reference`, boolean `&& || !`. Others later.
 - The router also enforces `disallow track/via` by net and layer, and `physical_hole_clearance` against fixed
   copper (doc 05 §16). Positional `disallow` rules are warned and left to the DRC.
+- Numeric conditions support `< <= > >=`, unit literals (`mm`, `mil`, `in`) and local pad copper dimensions
+  `Size_X` / `Size_Y`; rotation does not change these dimensions (doc 05 §19).
+- `route --keep-vias-off-pads [MM]` appends a synthetic, net-independent `physical_hole_clearance` rule to a
+  route-only rules copy. Project files, the output board's rules and `tracemaker drc` are unchanged.
+  Compilation failure of a synthetic rule is an error, not an ignored warning. KiCad checks this preference
+  only when the user adds the equivalent rule in doc 05 §19 to the board's `.kicad_dru`.
 
 ## 5. IPC plugin (`kicad_plugin/`)
 

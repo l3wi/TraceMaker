@@ -51,12 +51,15 @@ struct Constraint {
   std::vector<std::string> items;           // disallow item types, or other bare words
 };
 
+enum class RuleOrigin { Project, Synthetic };
+
 struct CustomRule {
   std::string name;
   std::string condition;                    // raw expression text, compiled by the rule engine
   std::string layer;                        // "", "outer", "inner", or a layer name
   std::string severity;
   std::vector<Constraint> constraints;
+  RuleOrigin origin = RuleOrigin::Project;  // synthetic rules exist only in the route job's private rules
 };
 
 struct DesignRules {

@@ -79,6 +79,10 @@ KiCad 10 plugin: `kicad_plugin/` (IPC action plugin; routes the open board in on
 Useful route options: `--threads N` (threads; also the portfolio size unless `--work` is given, when all eight variants
 run and the output is identical at any thread count), `--variants N` (portfolio size), `--no-gpu` (CPU cost-to-go fields, identical results),
 `--no-rip-up`, `--fast-bends`, `--kb FILE` / `--no-kb` (knowledge base of earlier runs).
+`--keep-vias-off-pads [MM]` keeps the whole via copper clear of small SMD pads (both local dimensions
+below MM; default 2 mm when present, off otherwise). Larger exposed/thermal pads stay via-capable.
+It is route-only: add the equivalent `.kicad_dru` rule from [doc 05 §19](docs/05-routing.md#19-keep-vias-off-small-pads-d62)
+if KiCad should enforce the preference too.
 
 ## Benchmark
 
