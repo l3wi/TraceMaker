@@ -65,16 +65,14 @@ def mst_length(pts):
     return total
 
 
-def geometry(d: dict, zone_nets: set | None = None) -> dict:
-    """zone_nets: nets carried partly by a pour; default every net with a conductive zone in `d` (teardrops
-    included, which inspect cannot tell apart: record() passes KiCad's list without them)."""
+def geometry(d: dict) -> dict:
     mm = 1e-6
     by_layer = defaultdict(float)
     net_len, net_vias = defaultdict(float), defaultdict(int)
     narrowed = 0.0
     widths = d.get("net_track_width", {})
-    if zone_nets is None:
-        zone_nets = {z["net"] for z in d.get("zones", []) if z.get("net") and not z.get("rule_area")}
+    # Nets carried partly by a pour (teardrops are track copper, not pours).
+    zone_nets = {z["net"] for z in d.get("zones", []) if z.get("net") and not z.get("rule_area") and not z.get("teardrop")}
     # Joints: endpoints shared by exactly two segments of the same net and layer.
     ends = defaultdict(list)
     for t in d["tracks"]:
@@ -236,7 +234,7 @@ def record(unrouted: pathlib.Path, pcb: pathlib.Path, label: str, hand: bool = F
     j = judge(before, after)
     bj = board_json(pcb)
     planes, planes_input = plane_metrics(pcb, small_pad_mm), plane_metrics(unrouted, small_pad_mm)
-    geo = geometry(bj, set(planes["zone_nets"]) if planes else None)
+    geo = geometry(bj)
     geo.update(coupling(bj))
     nets = geo.pop("nets")
     open_now, open_before = set(after["unconnected_nets"]), set(before["unconnected_nets"])

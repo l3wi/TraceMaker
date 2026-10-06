@@ -81,7 +81,10 @@ class Obstacles {
   mutable long rej_outside = 0, rej_copper = 0, rej_other = 0, checks = 0;
 
  private:
-  bool zone_is_soft(const drc::CopperItem& item) const { return soft_zones_ && item.kind == drc::ItemKind::Zone; }
+  // Teardrops are refilled from their tracks, not around new copper: they stay fixed like the track they belong to.
+  bool zone_is_soft(const drc::CopperItem& item) const {
+    return soft_zones_ && item.kind == drc::ItemKind::Zone && !b_.zones[static_cast<std::size_t>(item.index)].teardrop;
+  }
   bool soft_zones_ = false;
   int copper_state(const geom::Shape& s, const drc::CopperItem& probe, int layer, bool ignore_routed, std::vector<int>* owners) const;
   int holes_edges_state(const geom::Shape& s, model::NetId net, int layer, bool is_via_hole, Coord hole_r, bool ignore_routed,

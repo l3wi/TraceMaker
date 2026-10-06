@@ -86,6 +86,35 @@ TEST_CASE("soft zones target unused planes with legal vias but not already conne
   CHECK(route::Router(joined, rules, o).run().connections == 0);
 }
 
+TEST_CASE("teardrop zones stay fixed copper and never become plane targets", "[route][soft-zones]") {
+  // A teardrop left behind when routing is deleted, away from the pad (KiCad marks them (attr (teardrop ...))).
+  const auto pour = plane("In1.Cu", 2, "GND", "(xy 7 4) (xy 9 4) (xy 9 6) (xy 7 6)");
+  auto teardrop = pour;
+  teardrop.insert(teardrop.find("(hatch"), "(attr (teardrop (type padvia))) ");
+  const auto b_pour = parse(board_text(pour)), b_drop = parse(board_text(teardrop));
+  CHECK_FALSE(b_pour.zones[0].teardrop);
+  REQUIRE(b_drop.zones[0].teardrop);
+  model::DesignRules rules;
+  rules.classes.emplace_back();
+  route::RouterOptions o;
+  o.work_budget = 200'000;
+  o.gpu_device = -1;
+  o.optimize = false;
+  o.soft_zones = true;
+  CHECK(route::Router(b_pour, rules, o).run().connections == 1);
+  CHECK(route::Router(b_drop, rules, o).run().connections == 0);
+  auto wp = b_pour, wd = b_drop;
+  route::Obstacles soft_pour(wp, rules, true), soft_drop(wd, rules, true);
+  const geom::Point a{6'000'000, 5'000'000}, c{10'000'000, 5'000'000};
+  CHECK(soft_pour.segment_ok(a, c, 1, 200'000, 1));
+  CHECK_FALSE(soft_drop.segment_ok(a, c, 1, 200'000, 1));
+  for (int x = 12; x <= 20; ++x)
+    for (int y = 6; y <= 14; ++y) {
+      const geom::Point p{x * 500'000, y * 500'000};
+      CHECK(soft_drop.fixed_via_code(p, 600'000, 300'000, 0, 1) == soft_drop.fixed_via_code_reference(p, 600'000, 300'000, 0, 1));
+    }
+}
+
 TEST_CASE("plane target box and layer heuristic preserves zero-heuristic costs", "[route][soft-zones]") {
   model::DesignRules rules;
   rules.classes.emplace_back();

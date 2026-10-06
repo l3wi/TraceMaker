@@ -10,7 +10,7 @@ namespace tmk::route {
 namespace {
 
 bool conductive(const model::Zone& z) {
-  return !z.rule_area && z.net != 0 && z.copper != 0 && !z.outline.empty();
+  return !z.rule_area && !z.teardrop && z.net != 0 && z.copper != 0 && !z.outline.empty();
 }
 
 bool contains(const model::Zone& z, geom::Point p) {
