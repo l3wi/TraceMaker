@@ -88,7 +88,7 @@ TEST_CASE("plane map matches its reference with priorities and holes, without cl
   b.zones[1].priority = 1;
   b.zones[1].outline.push_back({{3'000'000, 3'000'000}, {5'000'000, 3'000'000}, {5'000'000, 6'000'000}, {3'000'000, 6'000'000}});
   route::PlaneMap map;
-  map.build(b, {0, 0}, 250'000, 49, 41);
+  REQUIRE(map.build(b, {0, 0}, 250'000, 49, 41));
   for (int l = 0; l < 4; ++l)
     for (int y = 0; y < 41; ++y)
       for (int x = 0; x < 49; ++x)
@@ -97,6 +97,58 @@ TEST_CASE("plane map matches its reference with priorities and holes, without cl
   CHECK(map.cost(1, 24, 20, 1, 500'000) == 0);
   CHECK(map.cost(1, 16, 20, 2, 500'000) == 0);
   CHECK(map.cost(1, 24, 20, 2, 0) == 0);
+}
+
+TEST_CASE("plane scanlines preserve concave lattice-aligned boundaries and holes", "[route][soft-zones]") {
+  const auto outline = "(xy 1 1) (xy 11 1) (xy 11 9) (xy 8 9) (xy 8 5) (xy 6 5) (xy 6 9) (xy 1 9)";
+  auto b = parse(board_text(plane("In1.Cu", 2, "GND", kPts) + plane("In1.Cu", 1, "SIG", outline)));
+  b.zones[1].priority = 2;
+  b.zones[1].outline.push_back({{2'000'000, 3'000'000}, {4'000'000, 3'000'000}, {4'000'000, 7'000'000}, {2'000'000, 7'000'000}});
+  // A diagonal outer boundary also crosses exact lattice points; reversed rings retain the same fill.
+  b.zones.push_back(b.zones[1]);
+  b.zones.back().copper = model::layer_bit(2);
+  b.zones.back().outline = {{{1'000'000, 1'000'000}, {11'000'000, 9'000'000}, {1'000'000, 9'000'000}},
+                          {{2'000'000, 5'000'000}, {4'000'000, 7'000'000}, {2'000'000, 7'000'000}}};
+  for (bool reverse : {false, true}) {
+    if (reverse) {
+      for (auto& zone : b.zones) {
+        for (auto& ring : zone.outline) std::reverse(ring.begin(), ring.end());
+      }
+    }
+    route::PlaneMap map;
+    const geom::Point origin{-500'000, -500'000};
+    REQUIRE(map.build(b, origin, 250'000, 53, 45));
+    for (int l = 0; l < 4; ++l) {
+      for (int y = 0; y < 45; ++y) {
+        for (int x = 0; x < 53; ++x) {
+          const geom::Point point{origin.x + x * 250'000, origin.y + y * 250'000};
+          CHECK(map.net_at(l, x, y) == route::PlaneMap::reference(b, point, l));
+        }
+      }
+    }
+    CHECK(map.net_at(1, 6, 6) == 1);   // outer vertex is inside
+    CHECK(map.net_at(1, 10, 14) == 2); // hole vertex falls back to the lower-priority zone
+    CHECK(map.net_at(1, 26, 26) == 1); // notch boundary is inside
+    CHECK(map.net_at(1, 30, 30) == 2); // notch interior is outside
+  }
+}
+
+TEST_CASE("plane map supports uint16 zone indices and falls back above its capacity", "[route][soft-zones]") {
+  auto b = parse(board_text(plane("In1.Cu", 2, "GND", kPts)));
+  const auto zone = b.zones.front();
+  b.zones.assign(65535, zone);
+  b.zones.back().net = 123456; // the table index, not the NetId, must fit uint16
+  b.zones.back().priority = 1;
+  route::PlaneMap map;
+  REQUIRE(map.build(b, {4'000'000, 5'000'000}, 250'000, 1, 1));
+  CHECK(map.net_at(1, 0, 0) == 123456);
+  b.zones.push_back(zone);
+  CHECK_FALSE(map.build(b, {4'000'000, 5'000'000}, 250'000, 1, 1));
+  CHECK(map.net_at(1, 0, 0) == 0);
+  CHECK(map.cost(1, 0, 0, 1, 500'000) == 0);
+  b.zones.clear();
+  REQUIRE(map.build(b, {4'000'000, 5'000'000}, 250'000, 1, 1));
+  CHECK(map.net_at(1, 0, 0) == 0);
 }
 
 TEST_CASE("plane penalty selects the equal-length route outside foreign copper", "[route][soft-zones]") {
