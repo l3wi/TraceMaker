@@ -84,6 +84,10 @@ run and the output is identical at any thread count), `--variants N` (portfolio 
 Soft-zone output strips fills only from zones cut by new foreign copper; the log reports zones needing refill.
 Sign off with `kicad-cli pcb drc --refill-zones --format json --output drc.json routed.kicad_pcb` and require
 zero unconnected items and no added errors ([doc 05 §18](docs/05-routing.md#18-refillable-planes-2026-10-06-d61)).
+`--keep-vias-off-pads [MM]` keeps the whole via copper clear of small SMD pads (both local dimensions
+below MM; default 2 mm when present, off otherwise). Larger exposed/thermal pads stay via-capable.
+It is route-only: add the equivalent `.kicad_dru` rule from [doc 05 §19](docs/05-routing.md#19-keep-vias-off-small-pads-d62)
+if KiCad should enforce the preference too.
 
 ## Benchmark
 

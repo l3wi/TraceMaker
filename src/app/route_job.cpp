@@ -11,6 +11,8 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <optional>
+#include <stdexcept>
 
 #include "crules/engine.hpp"
 #include "drc/copper.hpp"
@@ -91,6 +93,22 @@ int default_gpu_device(bool use_gpu) {
   return devs.empty() ? -1 : devs.front().index;
 }
 
+model::CustomRule keep_vias_off_pads_rule(const model::DesignRules& rules, Coord threshold) {
+  if (threshold <= 0) throw std::invalid_argument("keep-vias-off-pads size must be positive");
+  Coord margin = 0;
+  for (const auto& nc : rules.classes)
+    margin = std::max(margin, (std::max<Coord>(0, nc.via_diameter - nc.via_drill) + 1) / 2 + nc.clearance);
+  model::CustomRule rule;
+  rule.name = "TraceMaker keep vias off small SMD pads";
+  rule.origin = model::RuleOrigin::Synthetic;
+  // KiCad physical_hole_clearance measures from the drill, so include the copper annulus (rounded up).
+  // https://docs.kicad.org/10.0/en/pcbnew/pcbnew.html#custom-design-rules
+  rule.condition = "A.Type == 'Via' && B.Type == 'Pad' && B.Pad_Type == 'SMD' && B.Size_X < " +
+                   std::to_string(threshold) + " && B.Size_Y < " + std::to_string(threshold);
+  rule.constraints.push_back({"physical_hole_clearance", margin, {}, {}, {}});
+  return rule;
+}
+
 RouteJobResult run_route_job(RouteJob job) {
   auto log = [&](const std::string& line) {
     if (job.log) job.log(line);
@@ -98,6 +116,15 @@ RouteJobResult run_route_job(RouteJob job) {
   auto& opt = job.opt;
   auto lb = io::read_board_file(job.in);
   const auto rules = io::read_design_rules(job.in);
+  // No copy or extra rule-engine construction with the preference off; DRC and project files stay unchanged.
+  std::optional<model::DesignRules> route_rules;
+  if (opt.keep_vias_off_pads > 0) {
+    route_rules = rules;
+    route_rules->custom.push_back(keep_vias_off_pads_rule(rules, opt.keep_vias_off_pads));
+    log(fmt("keep vias off SMD pads smaller than %.6f mm; physical hole margin %.6f mm (route only)",
+            nm_to_mm(opt.keep_vias_off_pads), nm_to_mm(*route_rules->custom.back().constraints.front().min)));
+  }
+  const auto& routing_rules = route_rules ? *route_rules : rules;
   const std::string name = std::filesystem::path(job.in).filename().string();
   RouteJobResult out;
   std::unique_ptr<server::ViewerServer> server;
@@ -212,7 +239,7 @@ RouteJobResult run_route_job(RouteJob job) {
     std::vector<int> pick;
     if (kb && variants < route::portfolio_size()) pick = kb->choose_variants(feat, route::portfolio_size(), variants, opt.seed);
     log(fmt("portfolio: %d variants on %d thread%s", variants, std::min(threads, variants), std::min(threads, variants) == 1 ? "" : "s"));
-    auto pr = route::route_portfolio(*route_board, rules, opt, variants, pick, threads);
+    auto pr = route::route_portfolio(*route_board, routing_rules, opt, variants, pick, threads);
     for (std::size_t i = 0; i < pr.variants.size(); ++i)
       log(fmt("  variant %d %-30s routed %d in %.1f s%s", pr.indices[i], pr.variants[i].c_str(), pr.routed[i], pr.seconds[i],
               static_cast<int>(i) == pr.best_variant ? "  <- best" : ""));
@@ -221,7 +248,7 @@ RouteJobResult run_route_job(RouteJob job) {
     best_name = pr.variants[static_cast<std::size_t>(pr.best_variant)];
     res = std::move(pr.best);
   } else {
-    res = route::Router(*route_board, rules, opt).run();
+    res = route::Router(*route_board, routing_rules, opt).run();
     ran = {0};
   }
   if (kb) {

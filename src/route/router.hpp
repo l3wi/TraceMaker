@@ -48,6 +48,8 @@ struct RouterOptions {
   // Intra-pair skew limit for pairs routed coupled (0 = only KiCad custom `skew` rules): the shorter half gets meanders
   // in the clean-up until the halves differ by at most half of it (length tuning code, doc 05 §15).
   Coord pair_skew = 0;
+  // Route-job-only preference (doc 05 §19): 0 off; otherwise both SMD copper dimensions must be below this.
+  Coord keep_vias_off_pads = 0;
   bool global_route = false;    // plan every connection on a coarse tile graph first; detailed search follows the corridors
   // Global router v2 (M6): the first search of each connection is confined to its corridor (cells outside are
   // blocked, window cropped to the corridor); only if that fails do the usual unconfined windows run.

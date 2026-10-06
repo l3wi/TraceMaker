@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <cmath>
 #include <initializer_list>
 #include <string_view>
@@ -11,7 +12,7 @@ namespace tmk::drc {
 
 // ---------------------------------------------------------------------------------------------------------
 // Condition expressions: a small recursive-descent parser for the subset of KiCad's rule language used in
-// practice: A./B. properties, string/number literals, == != && || ! and parentheses, and a few functions.
+// practice: A./B. properties, string/number literals, comparisons, && || ! and parentheses, and a few functions.
 // ---------------------------------------------------------------------------------------------------------
 struct EvalCtx {
   const RuleEngine* eng;
@@ -32,7 +33,7 @@ struct Value {
 class Condition {
  public:
   struct Node {
-    enum class Op { Or, And, Not, Eq, Ne, Lit, Prop, Call } op;
+    enum class Op { Or, And, Not, Eq, Ne, Lt, Le, Gt, Ge, Lit, Prop, Call } op;
     std::vector<std::unique_ptr<Node>> kids;
     Value lit;
     char who = 'A';       // A or B
@@ -105,14 +106,11 @@ class Condition {
       return n;
     }
     auto l = parse_term();
-    if (eat("==")) {
-      auto n = make(Node::Op::Eq);
-      n->kids.push_back(std::move(l));
-      n->kids.push_back(parse_term());
-      return n;
-    }
-    if (eat("!=")) {
-      auto n = make(Node::Op::Ne);
+    for (const auto& [token, op] : {std::pair{"==", Node::Op::Eq}, {"!=", Node::Op::Ne},
+                                  {"<=", Node::Op::Le}, {">=", Node::Op::Ge},
+                                  {"<", Node::Op::Lt}, {">", Node::Op::Gt}}) {
+      if (!eat(token)) continue;
+      auto n = make(op);
       n->kids.push_back(std::move(l));
       n->kids.push_back(parse_term());
       return n;
@@ -143,12 +141,27 @@ class Condition {
       n->lit.s = read_string();
       return n;
     }
-    if (std::isdigit(static_cast<unsigned char>(c)) || c == '-' || c == '.') {
-      std::size_t b = pos_;
-      while (pos_ < src_.size() && (std::isalnum(static_cast<unsigned char>(src_[pos_])) || src_[pos_] == '.' || src_[pos_] == '-')) ++pos_;
+    if (std::isdigit(static_cast<unsigned char>(c)) || c == '-' || c == '+' || c == '.') {
+      char* end = nullptr;
+      const double number = std::strtod(src_.c_str() + pos_, &end);
+      if (end == src_.c_str() + pos_ || !std::isfinite(number)) throw std::runtime_error("invalid number");
+      pos_ = static_cast<std::size_t>(end - src_.c_str());
+      skip();
+      const std::size_t b = pos_;
+      while (pos_ < src_.size() && std::isalpha(static_cast<unsigned char>(src_[pos_]))) ++pos_;
+      const std::string_view unit(src_.data() + b, pos_ - b);
+      // KiCad 10 PCBEXPR_UNIT_RESOLVER: lengths use nm; bare numbers are unscaled.
+      // https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/pcbnew/pcbexpr_evaluator.cpp
+      double scale = 1;
+      if (unit == "mm") scale = 1'000'000;
+      else if (unit == "mil") scale = 25'400;
+      else if (unit == "in") scale = 25'400'000;
+      else if (unit == "ps") scale = 1'000;
+      else if (!unit.empty() && unit != "deg" && unit != "fs") throw std::runtime_error("unsupported unit");
       auto n = make(Node::Op::Lit);
       n->lit.k = Value::K::Num;
-      n->lit.n = std::atof(src_.substr(b, pos_ - b).c_str());
+      n->lit.n = number * scale;
+      if (!std::isfinite(n->lit.n)) throw std::runtime_error("invalid number");
       return n;
     }
     // Identifier: A.Prop, B.func(args), or a bare word (true/false).
@@ -220,9 +233,15 @@ class Condition {
     else if (n.name == "Pad_Type" && it->kind == ItemKind::Pad) {
       static const char* names[] = {"SMD", "Through-hole", "NPTH, mechanical", "Edge connector"};
       v.s = names[static_cast<int>(b.pads[static_cast<std::size_t>(it->index)].type)];
+    } else if ((n.name == "Size_X" || n.name == "Size_Y") && it->kind == ItemKind::Pad) {
+      // KiCad PAD::GetSizeX/GetSizeY return local padstack dimensions, independent of rotation.
+      // https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/pcbnew/pad.h
+      const auto& pad = b.pads[static_cast<std::size_t>(it->index)];
+      v.k = Value::K::Num;
+      v.n = static_cast<double>(n.name == "Size_X" ? pad.size_x : pad.size_y);
     } else if (n.name == "Width") {
       v.k = Value::K::Num;
-      v.n = static_cast<double>(it->width) / 1e6;
+      v.n = static_cast<double>(it->width);
     } else {
       ctx.unknown = true;
       v.k = Value::K::Undef;
@@ -279,8 +298,22 @@ class Condition {
       case Node::Op::Or: v.b = eval(*n.kids[0], ctx).truthy() || eval(*n.kids[1], ctx).truthy(); return v;
       case Node::Op::And: v.b = eval(*n.kids[0], ctx).truthy() && eval(*n.kids[1], ctx).truthy(); return v;
       case Node::Op::Not: v.b = !eval(*n.kids[0], ctx).truthy(); return v;
-      case Node::Op::Eq: v.b = str_eq(eval(*n.kids[0], ctx), eval(*n.kids[1], ctx)); return v;
-      case Node::Op::Ne: v.b = !str_eq(eval(*n.kids[0], ctx), eval(*n.kids[1], ctx)); return v;
+      case Node::Op::Eq:
+      case Node::Op::Ne:
+      case Node::Op::Lt:
+      case Node::Op::Le:
+      case Node::Op::Gt:
+      case Node::Op::Ge: {
+        const auto l = eval(*n.kids[0], ctx), r = eval(*n.kids[1], ctx);
+        if (l.k == Value::K::Undef || r.k == Value::K::Undef) return v;
+        if (n.op == Node::Op::Eq || n.op == Node::Op::Ne) {
+          v.b = n.op == Node::Op::Eq ? str_eq(l, r) : !str_eq(l, r);
+        } else if (l.k == Value::K::Num && r.k == Value::K::Num) {
+          v.b = n.op == Node::Op::Lt ? l.n < r.n : n.op == Node::Op::Le ? l.n <= r.n :
+                n.op == Node::Op::Gt ? l.n > r.n : l.n >= r.n;
+        }
+        return v;
+      }
       case Node::Op::Lit: return n.lit;
       case Node::Op::Prop: return prop(n, ctx);
       case Node::Op::Call: return call(n, ctx);
@@ -302,12 +335,14 @@ RuleEngine::RuleEngine(const model::Board& b, const model::DesignRules& r) : b_(
       std::string err;
       c.cond = Condition::parse(rule.condition, err);
       if (!c.cond) {
+        if (rule.origin == model::RuleOrigin::Synthetic)
+          throw std::runtime_error("synthetic rule '" + rule.name + "': cannot parse condition (" + err + ")");
         c.valid = false;
         warnings_.push_back("rule '" + rule.name + "': cannot parse condition (" + err + "); rule ignored");
       }
     }
     c.positional = c.cond && c.cond->references({"insideArea", "intersectsArea", "enclosedByArea", "memberOfFootprint",
-                                               "Reference", "Parent.Reference", "Pad_Type", "Width"});
+                                               "Reference", "Parent.Reference", "Pad_Type", "Width", "Size_X", "Size_Y"});
     const bool nets_seen = c.cond && c.cond->references({"NetName", "NetClass", "inDiffPair"});
     for (const auto& k : rule.constraints) {
       if (k.type == "clearance" && k.min) max_clearance_ = std::max(max_clearance_, *k.min);
@@ -375,6 +410,7 @@ bool RuleEngine::layer_matches(const std::string& sel, int layer) const {
 
 std::optional<Coord> RuleEngine::custom_min(const char* type, const CopperItem* a, const CopperItem* b, int layer) const {
   std::optional<Coord> out;
+  std::optional<Coord> synthetic_min;
   for (const auto& c : rules_) {
     if (!c.valid || !layer_matches(c.rule->layer, layer)) continue;
     const model::Constraint* k = nullptr;
@@ -390,8 +426,15 @@ std::optional<Coord> RuleEngine::custom_min(const char* type, const CopperItem* 
         match = c.cond->eval(ctx2);
       }
     }
-    if (match) out = *k->min;  // later rules take precedence
+    if (match) {
+      if (c.rule->origin == model::RuleOrigin::Synthetic)
+        synthetic_min = std::max(synthetic_min.value_or(*k->min), *k->min);
+      else
+        out = *k->min;  // project rules retain KiCad's later-rule precedence
+    }
   }
+  // A route preference may strengthen, but never replace or weaken, the project's selected minimum.
+  if (synthetic_min) out = std::max(out.value_or(*synthetic_min), *synthetic_min);
   return out;
 }
 
