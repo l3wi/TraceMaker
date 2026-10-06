@@ -549,7 +549,13 @@ after refill reported zero unconnected items and zero added errors. The test nee
 without `kicad-cli`. Off-mode outputs on `sbc_sbc` and `oskirby_logicbone` remain byte-identical at 1M work,
 seed 7, one variant/thread and CPU fields.
 
-Benchmarks: see PR
+On the KiCad demos (doc 10 §2 quality score, 10M work, judged after a refill) soft zones reduce open
+connections on the multilayer boards (CM5 118 → 82, StickHub 31 → 14, ColdFire 415 → 155, RoyalBlue
+112 → 87) and match or slightly trail off-mode on the two-layer ones (multichannel 11 → 13, pic_programmer
+10 → 12). The cheapest way into a plane is often a via in the pad: 0.16–0.78 per delivered connection land
+in SMD pads under 2 mm, so use soft zones with `--keep-vias-off-pads` (§19). Teardrop zones are ordinary
+zones to the engine, so a board that still has them gets one plane target per teardrop: RoyalBlue with
+its 612 teardrops left in had 288 connections instead of 161 and routed 26, every one a plane connection.
 
 ## 19. Keep vias off small pads (D62)
 

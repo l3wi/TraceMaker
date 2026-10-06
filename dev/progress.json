@@ -562,6 +562,10 @@
     {
      "text": "Held-out quality benchmark on tier C-like boards (heldC-1) and DAC2020",
      "done": true
+    },
+    {
+     "text": "Routing quality score: refill judge, lexicographic legality/completion tiers, plane and DFM terms against the refilled input, matched-net comparison, hand routing as a guide (bench/score.py, bench/planes_eval.py; 8 demos + 9 PCBench boards; D63)",
+     "done": true
     }
    ]
   },

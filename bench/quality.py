@@ -9,17 +9,21 @@ Per routed board:
   router_errors                 KiCad DRC errors involving routed copper that the input did not have
   length_mm (and per layer)     total track length
   vias                          via count
-  detour                        track length / sum over nets of the pad-centre minimum spanning tree
-                                (a lower-bound-like reference; < 1 is possible with shared trunks)
+  detour                        signal track length / pad-centre minimum spanning tree, over nets without a conductive
+                                zone (a zone carries part of a plane net, so its MST is no reference); < 1 is still
+                                possible with shared trunks
+  nets                          per net: length, vias, pad MST, pads, whether it owns a zone, and (record()) complete
   bends, sharp_bends            direction changes at joints; sharp = interior angle under 90 degrees at a joint outside
                                 pad copper (an acid trap); sharp_at_pads counts those inside a pad, where pad copper
                                 fills the angle
   narrowed_mm, narrowed_share   track length below the net's design width (net class or board minimum)
 """
 import argparse
+import hashlib
 import importlib.util
 import json
 import math
+import os
 import pathlib
 import subprocess
 from collections import defaultdict
@@ -29,6 +33,9 @@ TM = ROOT / "build/release/src/app/tracemaker"
 _spec = importlib.util.spec_from_file_location("bench_run", ROOT / "bench/run.py")
 bench_run = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(bench_run)
+_MAC_KICAD_PYTHON = "/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3"
+# A Python that can import pcbnew (KiCad's own on macOS; the system one where KiCad installs its module, e.g. Linux).
+KICAD_PYTHON = os.environ.get("TM_KICAD_PYTHON", _MAC_KICAD_PYTHON if pathlib.Path(_MAC_KICAD_PYTHON).exists() else "python3")
 
 
 def board_json(path: pathlib.Path) -> dict:
@@ -58,21 +65,29 @@ def mst_length(pts):
     return total
 
 
-def geometry(d: dict) -> dict:
+def geometry(d: dict, zone_nets: set | None = None) -> dict:
+    """zone_nets: nets carried partly by a pour; default every net with a conductive zone in `d` (teardrops
+    included, which inspect cannot tell apart: record() passes KiCad's list without them)."""
     mm = 1e-6
     by_layer = defaultdict(float)
+    net_len, net_vias = defaultdict(float), defaultdict(int)
     narrowed = 0.0
     widths = d.get("net_track_width", {})
+    if zone_nets is None:
+        zone_nets = {z["net"] for z in d.get("zones", []) if z.get("net") and not z.get("rule_area")}
     # Joints: endpoints shared by exactly two segments of the same net and layer.
     ends = defaultdict(list)
     for t in d["tracks"]:
         a, b = (t["sx"], t["sy"]), (t["ex"], t["ey"])
         L = math.dist(a, b) * mm
         by_layer[t["layer"]] += L
+        net_len[t["net"]] += L
         if t["net"] in widths and t["width"] < widths[t["net"]] - 1000:
             narrowed += L
         ends[(t["net"], t["layer"], a)].append(b)
         ends[(t["net"], t["layer"], b)].append(a)
+    for v in d["vias"]:
+        net_vias[v.get("net", "")] += 1
     # Pad copper per layer (rotated rectangles; round pads are covered by their bounding square, conservative).
     pad_rects = defaultdict(list)
     for pd in d["pads"]:
@@ -111,12 +126,20 @@ def geometry(d: dict) -> dict:
     for p in d["pads"]:
         if p.get("net"):
             pads_by_net[p["net"]].append((p["x"] * mm, p["y"] * mm))
-    ref = sum(mst_length(v) for v in pads_by_net.values() if 1 < len(v) <= 2000)
+    nets = {}
+    for net in sorted(set(pads_by_net) | set(net_len) | {n for n in net_vias if n}):
+        pts = pads_by_net.get(net, [])
+        nets[net] = {"plane": net in zone_nets, "length_mm": round(net_len[net], 3), "vias": net_vias[net], "pads": len(pts),
+                     "mst_mm": round(mst_length(pts), 3) if 1 < len(pts) <= 2000 else 0.0}
+    signal = [n for n in nets.values() if not n["plane"] and n["mst_mm"] > 0]
+    sig_len, sig_ref = sum(n["length_mm"] for n in signal), sum(n["mst_mm"] for n in signal)
     total = sum(by_layer.values())
     return {"length_mm": round(total, 1), "length_by_layer_mm": {k: round(v, 1) for k, v in sorted(by_layer.items())},
             "vias": len(d["vias"]), "segments": len(d["tracks"]), "bends": bends, "sharp_bends": sharp, "sharp_at_pads": sharp_pad,
             "narrowed_mm": round(narrowed, 1), "narrowed_share": round(narrowed / total, 4) if total else 0.0,
-            "pad_mst_mm": round(ref, 1), "detour": round(total / ref, 3) if ref else None}
+            "signal_length_mm": round(sig_len, 1), "signal_mst_mm": round(sig_ref, 1),
+            "detour": round(sig_len / sig_ref, 3) if sig_ref else None,
+            "plane_net_length_mm": round(sum(n["length_mm"] for n in nets.values() if n["plane"]), 1), "nets": nets}
 
 
 def pair_partner(name: str, names: set):
@@ -166,19 +189,63 @@ def coupling(d: dict) -> dict:
             "pair_coupled_share": round(coupled / total, 3) if total else None}
 
 
+def judge(before: dict, after: dict) -> dict:
+    """Completion and router-added errors of `after` against its unrouted input `before` (bench/run.py drc())."""
+    added = {t: n - before["routed_errors"].get(t, 0) for t, n in after["routed_errors"].items()
+             if t not in bench_run.NOT_ROUTING and n - before["routed_errors"].get(t, 0) > 0}
+    return {"connections": before["unconnected"], "unconnected": after["unconnected"], "router_errors": added,
+            "completion": 1.0 if before["unconnected"] == 0 else round(1 - after["unconnected"] / before["unconnected"], 4),
+            "clean": after["unconnected"] == 0 and not added}
+
+
 def metrics(unrouted: pathlib.Path, routed: pathlib.Path) -> dict:
     before, after = bench_run.drc(unrouted), bench_run.drc(routed)
     res = {"board": str(routed)}
     if before and after:
-        added = {t: n - before["routed_errors"].get(t, 0) for t, n in after["routed_errors"].items()
-                 if t not in bench_run.NOT_ROUTING and n - before["routed_errors"].get(t, 0) > 0}
-        res.update({"unconnected": after["unconnected"], "router_errors": added,
-                    "completion": 1.0 if before["unconnected"] == 0 else round(1 - after["unconnected"] / before["unconnected"], 4),
-                    "clean": after["unconnected"] == 0 and not added})
+        res.update(judge(before, after))
     bj = board_json(routed)
-    res.update(geometry(bj))
+    geo = geometry(bj)
+    geo.pop("nets")  # per-net detail is for record(); compare.py and the CLI keep totals
+    res.update(geo)
     res.update(coupling(bj))
     return res
+
+
+def plane_metrics(pcb: pathlib.Path, small_pad_mm: float = 2.0) -> dict | None:
+    """bench/plane_metrics_kicad.py (KiCad's refill, plane coverage/islands/gaps, small-pad vias); None without pcbnew."""
+    st, probe = pcb.stat(), ROOT / "bench/plane_metrics_kicad.py"
+    key = hashlib.sha1(f"{pcb.resolve()}:{st.st_mtime_ns}:{st.st_size}:{small_pad_mm}:{probe.stat().st_mtime_ns}".encode()).hexdigest()[:16]
+    out = ROOT / "build/quality" / f"planes-{key}.json"
+    if not out.exists():
+        p = subprocess.run([KICAD_PYTHON, str(ROOT / "bench/plane_metrics_kicad.py"), str(pcb), str(small_pad_mm)],
+                           capture_output=True, text=True)
+        if p.returncode != 0 or not p.stdout.strip():
+            return None
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(p.stdout.strip().splitlines()[-1])
+    return json.loads(out.read_text())
+
+
+def record(unrouted: pathlib.Path, pcb: pathlib.Path, label: str, hand: bool = False, small_pad_mm: float = 2.0) -> dict:
+    """Everything bench/score.py needs about one routed (or hand-routed) board, judged against its unrouted input
+    after a zone refill. Nets carry per-net length and vias, so two boards can be compared on the nets both
+    completed rather than on totals that reward routing less."""
+    before, after = bench_run.drc(unrouted), bench_run.drc(pcb)
+    if before is None or after is None:
+        return {"label": label, "board": unrouted.stem, "file": str(pcb), "hand": hand, "judge": "failed"}
+    j = judge(before, after)
+    bj = board_json(pcb)
+    planes, planes_input = plane_metrics(pcb, small_pad_mm), plane_metrics(unrouted, small_pad_mm)
+    geo = geometry(bj, set(planes["zone_nets"]) if planes else None)
+    geo.update(coupling(bj))
+    nets = geo.pop("nets")
+    open_now, open_before = set(after["unconnected_nets"]), set(before["unconnected_nets"])
+    for name, n in nets.items():
+        n["complete"] = name not in open_now
+        n["open_in_input"] = name in open_before
+    return {"label": label, "board": unrouted.stem, "file": str(pcb), "hand": hand,
+            "connections": j["connections"], "unconnected": j["unconnected"], "completion": j["completion"],
+            "added_errors": j["router_errors"], "nets": nets, "geometry": geo, "planes": planes, "planes_input": planes_input}
 
 
 def rescore(quality_json: pathlib.Path) -> None:
@@ -186,7 +253,9 @@ def rescore(quality_json: pathlib.Path) -> None:
     d = json.loads(quality_json.read_text())
     for r in d["runs"]:
         if r.get("file") and pathlib.Path(r["file"]).exists():
-            r.update(geometry(board_json(pathlib.Path(r["file"]))))
+            geo = geometry(board_json(pathlib.Path(r["file"])))
+            geo.pop("nets")
+            r.update(geo)
     quality_json.write_text(json.dumps(d, indent=1))
 
 

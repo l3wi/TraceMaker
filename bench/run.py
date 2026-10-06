@@ -65,11 +65,13 @@ def fr_baseline() -> dict[str, dict]:
 def drc(path: pathlib.Path, timeout: int = 600) -> dict | None:
     DRC_CACHE.mkdir(parents=True, exist_ok=True)
     st = path.stat()
-    key = hashlib.sha1(f"{path.resolve()}:{st.st_mtime_ns}:{st.st_size}".encode()).hexdigest()[:16]
+    # Zones are refilled first: fills saved in the file predate the routing (stale, or stripped with the tracks), so
+    # without a refill the judge sees the input's plane connectivity, not the routed board's (D63).
+    key = hashlib.sha1(f"refill:{path.resolve()}:{st.st_mtime_ns}:{st.st_size}".encode()).hexdigest()[:16]
     out = DRC_CACHE / f"{key}.json"
     if not out.exists():
         try:
-            subprocess.run(["kicad-cli", "pcb", "drc", "--format", "json", "--severity-all", "--all-track-errors", "-o", str(out), str(path)],
+            subprocess.run(["kicad-cli", "pcb", "drc", "--refill-zones", "--format", "json", "--severity-all", "--all-track-errors", "-o", str(out), str(path)],
                            capture_output=True, timeout=timeout)
         except subprocess.TimeoutExpired:
             return None
@@ -90,7 +92,11 @@ def drc(path: pathlib.Path, timeout: int = 600) -> dict | None:
         refs = [re.search(r" of ([^ ]+)(?: on [^ ]+)?$", i.get("description", "")) for i in v.get("items", [])]
         return bool(refs) and all(refs) and len({m.group(1) for m in refs}) == 1
     x = Counter(v["type"] for v in d.get("violations", []) if v.get("severity") == "error" and not own_footprint(v))
-    return {"errors": dict(c), "routed_errors": dict(r), "cross_errors": dict(x), "unconnected": len(d.get("unconnected_items", []))}
+    # Nets with a missing connection: item descriptions read "Pad 6 [NET] of U1 on F.Cu" / "Via [NET] on F.Cu - B.Cu".
+    open_nets = {m.group(1) for u in d.get("unconnected_items", []) for i in u.get("items", [])
+                 if (m := re.search(r"\[(.*)\] (?:of|on) ", i.get("description", "")))}
+    return {"errors": dict(c), "routed_errors": dict(r), "cross_errors": dict(x), "unconnected": len(d.get("unconnected_items", [])),
+            "unconnected_nets": sorted(open_nets)}
 
 
 PLACE = ROOT / "build/release/src/place/tracemaker-place"

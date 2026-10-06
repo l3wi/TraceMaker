@@ -18,7 +18,8 @@ OUT = ROOT / "bench/data/dac2020_prepared"
 
 
 def strip_routing(text: str) -> str:
-    """Remove top-level (segment ...), (arc ...) and (via ...) items, keeping everything else byte for byte."""
+    """Remove top-level (segment ...), (arc ...) and (via ...) items and teardrop zones (KiCad generates those from
+    the tracks; left behind they are stray copper on the pads), keeping everything else byte for byte."""
     out, i, n, depth = [], 0, len(text), 0
     start_keep = 0
     while i < n:
@@ -32,7 +33,7 @@ def strip_routing(text: str) -> str:
         if c == "(":
             if depth == 1:
                 head = text[i + 1:i + 12].split(None, 1)[0].rstrip(")")
-                if head in ("segment", "arc", "via"):
+                if head in ("segment", "arc", "via", "zone"):
                     # find the matching close paren
                     d, j = 0, i
                     while True:
@@ -45,6 +46,7 @@ def strip_routing(text: str) -> str:
                             if d == 0:
                                 break
                         j += 1
+                if head in ("segment", "arc", "via") or (head == "zone" and "(teardrop" in text[i:j]):
                     # drop the item and its leading indentation / trailing newline
                     k = i
                     while k > start_keep and text[k - 1] in " \t":
