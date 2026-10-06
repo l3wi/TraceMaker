@@ -483,3 +483,50 @@ physical-hole query gave −0.3%.
 **Remaining costs.** Open list ~16%, routed-copper queries ~17%, fixed-copper via checks ~16% (half rule
 evaluation), fields ~10%. Fixed-obstacle caches remain per variant: up to eight copies of the same lattice
 codes; sharing them needs a thread-safe cache.
+
+## 18. Refillable planes (2026-10-06, D61)
+
+`--soft-zones` is opt-in. Conductive zone fills cease to be fixed routing obstacles, while their original
+geometry remains in the copper model for initial connectivity and plane targets. Rule areas are never soft:
+their track/via flags remain independent, so a plane-layer area may forbid tracks but permit a connecting via.
+Holes, edges, locked copper and all non-zone rule checks are unchanged. The idea is credited to
+[@lucasbstn's upstream PR #1](https://github.com/DingoOz/TraceMaker/pull/1).
+
+**Verified switch-point deviation.** `Router::Impl::run` passes `Obstacles::grid()` to
+`drc::compute_connectivity`. Removing fills from that grid would lose already-connected pad/plane clusters.
+Instead, the grid retains all copper and one `zone_is_soft` predicate is shared by the track, fixed-disk,
+one-pass fixed-via and physical-hole queries. Via-hole/zone queries already skip zones; escape, global routing
+and class caches consume those same obstacle verdicts. Same-net pads already joined to a fill add no target.
+With the option on, filled zone-only clusters participate in the stable cluster MST; nets with no pad have
+no routable terminal and are left alone.
+
+**Plane-cut preference.** `PlaneMap` is built once per lattice, only in soft-zone mode and only allocates if
+conductive outlines exist. Each layer/cell holds the net of the highest-priority containing outline (holes
+excluded; document order breaks equal-priority ties). Its linear `reference` lookup is checked against the
+raster in unit tests. `--plane-cut-cost-mm` (default 0.5, nonnegative) becomes an int64 nanometre-equivalent
+penalty when a search cell belongs to a foreign plane; a via pays it for each plane layer in its physical
+span. Zero disables the preference, not soft-zone legality. Net comparison and penalties live in search
+costs only, outside class caches and CPU/GPU cost-to-go fields, retaining their lower-bound property.
+
+**Output contract.** The route summary reports `plane_connections` and `zones_needing_refill`. The writer
+removes all `filled_polygon` children only from zones whose original fills overlap/touch new foreign-net
+track or via copper. Other zones (including their fills and unknown children) are byte-identical. The log
+prints the count and `kicad-cli pcb drc --refill-zones` command. TraceMaker does not refill or prove final
+plane connectivity: KiCad refill plus zero unconnected items is required for sign-off (doc 08).
+
+**Coverage.** Inline unit boards exercise hard/soft foreign fills, track and via legality, one-pass/reference
+via parity on a point grid with same/foreign planes, rule areas, holes and edges, unused-plane via targets,
+already-joined pads, priority/hole raster parity, plane-avoiding search and selective writer invalidation.
+The `soft_zones` integration test generates an all-SMD four-layer board (0402s, a QFN-like package, inner
+GND/3V3 planes and via-permitting track rule areas) without pcbnew, routes it, and compares KiCad errors
+before/after refill with zero output unconnected items. It skips cleanly without `kicad-cli`.
+
+**Results.** The macOS implementation run passed 283,781 unit assertions (58 cases; CUDA-only Philox skipped).
+The generated board routed 16/16 connections, including 15 plane connections, with 15 vias; KiCad 10.0.3 after
+refill reported zero unconnected items and zero added errors. Off-mode A/B at 1M work, seed 7, one variant/thread,
+CPU fields was byte-identical on `sbc_sbc` (MD5 `bb509d0a543bbde8dfdb8f2802b89e1f`) and
+`oskirby_logicbone` (`9b7d269efff3869a7eb9b4068033863e`). Benchmark tiers run centrally.
+The full macOS ctest run passed 143 tests and skipped three; its only two failures were the pre-existing
+`kicad_drc_parity`/`kicad_drc_broken_parity` wrappers hard-coding the absent `build/release` binary.
+Those harness fixes belong to the macOS workstream; all soft-zone tests and the other integrations passed.
+

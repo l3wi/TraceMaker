@@ -79,6 +79,11 @@ KiCad 10 plugin: `kicad_plugin/` (IPC action plugin; routes the open board in on
 Useful route options: `--threads N` (threads; also the portfolio size unless `--work` is given, when all eight variants
 run and the output is identical at any thread count), `--variants N` (portfolio size), `--no-gpu` (CPU cost-to-go fields, identical results),
 `--no-rip-up`, `--fast-bends`, `--kb FILE` / `--no-kb` (knowledge base of earlier runs).
+`--soft-zones` (opt-in: refillable planes become routing targets, not fixed copper), `--plane-cut-cost-mm MM`
+(with soft zones: search penalty per foreign-plane cell, default 0.5; 0 disables the preference).
+Soft-zone output strips fills only from zones cut by new foreign copper; the log reports zones needing refill.
+Sign off with `kicad-cli pcb drc --refill-zones --format json --output drc.json routed.kicad_pcb` and require
+zero unconnected items and no added errors ([doc 05 §18](docs/05-routing.md#18-refillable-planes-2026-10-06-d61)).
 
 ## Benchmark
 

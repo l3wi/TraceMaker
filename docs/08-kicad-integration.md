@@ -101,6 +101,10 @@ kicad-cli pcb drc --format json --severity-all --all-track-errors --exit-code-vi
 - Footprint flips mirror pad layers and change rotation conventions; test flips against KiCad's output.
 - KiCad rotation is counter-clockwise in a y-down coordinate system (see `pcbgolf/placer.py` `rot_pt`).
 - Zones must be refilled after routing; never write stale fills (use `--refill-zones` for the judge).
+- With `route --soft-zones` (doc 05 §18, D61), only original fills intersected by new foreign-net copper lose
+  their `filled_polygon` nodes; every untouched zone remains byte-identical. The route log and JSON summary
+  report plane connections and zones needing refill. The engine's pre-refill connectivity is provisional:
+  run the command in §6 and require zero unconnected items and no added errors before accepting the result.
 - Net-class assignment can come from the schematic (directives), pattern rules in `.kicad_pro`, or the
   board; resolve in KiCad's priority order.
 - Locked items (`locked` flag) and user groups must never move or be ripped.
