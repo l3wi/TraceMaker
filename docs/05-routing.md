@@ -490,6 +490,9 @@ codes; sharing them needs a thread-safe cache.
 not routing targets. All-SMD power nets therefore needed explicit tracks even when an inner plane could
 connect them. The plane-aware routing idea is credited to
 [@lucasbstn's upstream PR #1](https://github.com/DingoOz/TraceMaker/pull/1).
+The first plane-cut preference charged 0.5 mm per lattice cell: at 0.1 mm pitch, crossing a board-wide pour
+made orthogonal steps six times their geometric cost. The unchanged lower-bound heuristic underestimated badly
+and exhausted the search budget on two-layer pour boards. The preference is now proportional to length.
 
 **What was built**
 
@@ -507,10 +510,13 @@ connect them. The plane-aware routing idea is credited to
   testing every cell against every outline vertex. Highest priority wins; document order breaks ties.
   Each layer/cell stores a uint16 index into a priority-ordered table of zone nets (0 = none). More than
   65,535 conductive zones disables the map with a warning; soft-zone legality and targets remain available.
-- `--plane-cut-cost-mm` (default 0.5, nonnegative) becomes an int64 nanometre-equivalent penalty for a
-  foreign-plane cell; vias pay for each plane layer in their physical span. Zero disables the preference,
-  not soft-zone legality. Net comparison and penalties stay in search costs, outside class caches and
-  CPU/GPU cost-to-go fields, so the fields remain lower bounds.
+- `--plane-cut-cost F` (dimensionless, default 0.5, nonnegative) adds F times a step's geometric length when
+  its destination cell belongs to a foreign plane: orthogonal and diagonal moves use their respective
+  integer lengths. The per-step penalties are converted once per search and truncated to nanometre-equivalent
+  integers. A via pays F times its current via cost for each foreign-plane layer in its physical span,
+  including the increased cost of blind/buried vias. Zero disables the preference and skips the map,
+  not soft-zone legality. Net comparison and penalties remain outside class caches and CPU/GPU fields,
+  so the fields stay lower bounds. The surcharge no longer grows when the lattice pitch shrinks.
 - The summary reports `plane_connections` and `zones_needing_refill`. The writer removes `filled_polygon`
   children only from zones whose original fills overlap/touch new foreign-net track or via copper. Other
   zones, including unknown children and fills, remain byte-identical. The log prints the count and refill
@@ -520,8 +526,9 @@ connect them. The plane-aware routing idea is credited to
 **Results.** The raster matches the per-point reference on priority overlaps, holes, concave notches, lattice
 vertices/edges and reversed rings; capacity tests cover the full uint16 table and overflow fallback.
 Obstacle parity tests cover hard/soft planes, rule areas, physical-hole rules, holes and edges. Routing
-tests cover plane targets, already-joined pads and equal-length plane-avoiding alternatives; writer tests
-cover selective track/via invalidation and untouched bytes.
+tests cover plane targets, already-joined pads and equal-length plane-avoiding alternatives. A long route
+across a board-wide foreign pour checks the (1 + F) cost bound and bounded search expansions against an
+unpenalized route; writer tests cover selective track/via invalidation and untouched bytes.
 
 The generated all-SMD four-layer integration board (0402s, a QFN-like package, inner GND/3V3 planes and
 via-permitting track rule areas) routed 16/16 connections, including 15 plane connections. KiCad 10.0.3

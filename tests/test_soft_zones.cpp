@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <catch2/catch_test_macros.hpp>
+#include <algorithm>
+#include <cmath>
+#include <numbers>
 
 #include "io/kicad/board_reader.hpp"
 #include "io/kicad/board_editor.hpp"
@@ -171,7 +174,7 @@ TEST_CASE("plane penalty selects the equal-length route outside foreign copper",
   o.soft_zones = true;
   o.optimize = false;
   o.allow_vias = false;
-  o.plane_cut_cost_mm = 0;
+  o.plane_cut_cost = 0;
   const auto zero = route::Router(b, rules, o).run();
   REQUIRE(zero.routed == 1);
   Coord side = 0;
@@ -186,7 +189,7 @@ TEST_CASE("plane penalty selects the equal-length route outside foreign copper",
   REQUIRE(std::any_of(zero.tracks.begin(), zero.tracks.end(), [&](const auto& t) {
     return geom::closer_than(geom::Shape::segment(t.a, t.b, t.width / 2), shape, 0);
   }));
-  o.plane_cut_cost_mm = 2;
+  o.plane_cut_cost = 2;
   const auto r = route::Router(b, rules, o).run();
   REQUIRE(r.routed == 1);
   for (const auto& t : r.tracks) CHECK_FALSE(geom::closer_than(geom::Shape::segment(t.a, t.b, t.width / 2), shape, 0));
@@ -229,4 +232,70 @@ TEST_CASE("soft zone writer strips only invalidated fills and preserves untouche
   CHECK(io::BoardEditor(via_lb).invalidate_zone_fills({}, {v}) == 1);
   CHECK(parse(via_lb.doc.write()).zones[0].fills == via_lb.board.zones[0].fills);
   CHECK(parse(via_lb.doc.write()).zones[1].fills.empty());
+}
+
+TEST_CASE("plane cost scales with route length without flooding a board-wide pour", "[route][soft-zones]") {
+  const auto text = std::string("(kicad_pcb (version 20240108) (generator \"pcbnew\")"
+      " (layers (0 \"F.Cu\" signal) (31 \"B.Cu\" signal) (44 \"Edge.Cuts\" user))"
+      " (net 0 \"\") (net 1 \"SIG\") (net 2 \"GND\")"
+      " (footprint \"R\" (layer \"F.Cu\") (at 3 6) (property \"Reference\" \"R1\" (at 0 0) (layer \"F.SilkS\"))"
+      " (pad \"1\" smd rect (at 0 0) (size 0.1 0.1) (layers \"F.Cu\") (net 1 \"SIG\")))"
+      " (footprint \"R\" (layer \"F.Cu\") (at 31 6) (property \"Reference\" \"R2\" (at 0 0) (layer \"F.SilkS\"))"
+      " (pad \"1\" smd rect (at 0 0) (size 0.1 0.1) (layers \"F.Cu\") (net 1 \"SIG\")))"
+      " (footprint \"H\" (layer \"F.Cu\") (at 17 6)"
+      " (pad \"\" np_thru_hole circle (at 0 0) (size 6 6) (drill 6) (layers \"*.Cu\" \"*.Mask\")))"
+      " (gr_rect (start 0 0) (end 34 12) (layer \"Edge.Cuts\") (stroke (width 0.1) (type solid))) ") +
+      plane("F.Cu", 2, "GND", "(xy 0 0) (xy 34 0) (xy 34 12) (xy 0 12)") + ")";
+  const auto b = parse(text);
+  model::DesignRules rules;
+  rules.classes.emplace_back();
+  route::RouterOptions o;
+  o.pitch = 100'000;
+  o.work_budget = 500'000;
+  o.gpu_device = -1;
+  o.field_heuristic = false;
+  o.soft_zones = true;
+  o.optimize = false;
+  o.allow_vias = false;
+  o.plane_cut_cost = 0;
+  const auto plain = route::Router(b, rules, o).run();
+  REQUIRE(plain.routed == 1);
+  o.plane_cut_cost = 0.5;
+  const auto penalized = route::Router(b, rules, o).run();
+  REQUIRE(penalized.routed == 1);
+  INFO("plain expansions " << plain.expansions << ", penalized expansions " << penalized.expansions);
+  // The old 0.5 mm per-cell charge at this 0.1 mm pitch made orthogonal steps cost 6x, not 1.5x.
+  // The heuristic deliberately ignores planes; cap its added work rather than changing the lower bound.
+  CHECK(penalized.expansions <= 5 * plain.expansions);
+
+  const Coord diag = static_cast<Coord>(std::llround(static_cast<double>(o.pitch) * std::numbers::sqrt2));
+  CHECK(route::PlaneMap::scaled_penalty(o.pitch, 0.5) == 50'000);
+  CHECK(route::PlaneMap::scaled_penalty(diag, 0.5) == 70'710);
+  CHECK(route::PlaneMap::scaled_penalty(3'000'000, 0.5) == 1'500'000); // per foreign layer crossed by a via
+  CHECK(route::PlaneMap::scaled_penalty(diag, 0) == 0);
+  auto cost = [&](const route::RouteResult& r, double factor) {
+    std::int64_t result = 0;
+    geom::Point previous;
+    for (const auto& t : r.tracks) {
+      const Coord dx = std::llabs(t.b.x - t.a.x), dy = std::llabs(t.b.y - t.a.y);
+      REQUIRE((dx == 0 || dy == 0 || dx == dy));
+      REQUIRE(std::max(dx, dy) % o.pitch == 0);
+      CHECK(geom::point_in_polygon(t.a, b.zones[0].outline[0]));
+      CHECK(geom::point_in_polygon(t.b, b.zones[0].outline[0]));
+      const auto steps = std::max(dx, dy) / o.pitch;
+      const auto length = dx && dy ? diag : o.pitch;
+      result += steps * (length + route::PlaneMap::scaled_penalty(length, factor));
+      const geom::Point direction{(t.b.x > t.a.x) - (t.b.x < t.a.x), (t.b.y > t.a.y) - (t.b.y < t.a.y)};
+      if (!(previous == geom::Point{}) && !(direction == previous)) {
+        const auto dot = previous.x * direction.x + previous.y * direction.y;
+        REQUIRE(dot >= 0);
+        result += dot > 0 ? o.pitch / 2 : 2 * o.pitch;
+      }
+      previous = direction;
+    }
+    return result;
+  };
+  // This sums the same integer step penalties as A*: a board-wide pour cannot charge more than F times
+  // the geometric path cost. Bend costs are unchanged, so the total retains the same upper bound.
+  CHECK(2 * cost(penalized, o.plane_cut_cost) <= 3 * cost(plain, 0));
 }
