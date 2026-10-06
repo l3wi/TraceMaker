@@ -502,3 +502,8 @@ The [`compiler`](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/common/libeva
 also diagnoses a lone numeric literal without units. Use explicit units for dimensions.
 See KiCad's [custom rules manual](https://docs.kicad.org/10.0/en/pcbnew/pcbnew.html#custom-design-rules)
 for `.kicad_dru` placement, conditions and the `physical_hole_clearance` constraint.
+
+**Width compatibility.** `Width` now evaluates in nm like KiCad's dimensional properties instead of mm.
+Explicit-unit conditions such as `A.Width == 0.2mm` and `A.Width != 0.25mm` retain their previous results:
+both sides now receive the same unit conversion. Bare `A.Width == 0.2` no longer means 0.2 mm; write
+`A.Width == 0.2mm` instead. Numeric literals use the [KiCad compiler's unscaled bare-number semantics](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/common/libeval_compiler/libeval_compiler.cpp).

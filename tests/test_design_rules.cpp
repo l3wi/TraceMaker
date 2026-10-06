@@ -246,3 +246,29 @@ TEST_CASE("KiCad size conditions use local pad dimensions, relational operators 
   CHECK_FALSE(matches("B.Unknown != 'anything'"));
   CHECK_FALSE(matches("A.Size_X < 2mm"));
 }
+
+TEST_CASE("Width comparisons with explicit KiCad units retain their previous results", "[rules]") {
+  const Files f("width_expr", board_text(""), "");
+  const auto lb = io::read_board_file(f.pcb.string());
+  drc::CopperItem track;
+  track.kind = drc::ItemKind::Track;
+  track.net = 1;
+  track.width = 200'000;
+  auto matches = [&](const std::string& expr) {
+    auto rules = io::read_design_rules(f.pcb.string());
+    model::CustomRule rule;
+    rule.condition = expr;
+    rule.constraints.push_back({"physical_hole_clearance", 50'000, {}, {}, {}});
+    rules.custom.push_back(rule);
+    const drc::RuleEngine re(lb.board, rules);
+    REQUIRE(re.warnings().empty());
+    return re.physical_hole_clearance(&track, track, 0) == 50'000;
+  };
+  // Before D62, atof("0.2mm") == 0.2 and Width was 0.2; explicit-unit equality stays true.
+  CHECK(matches("A.Width == 0.2mm"));
+  CHECK(matches("A.Width != 0.25mm"));
+  CHECK_FALSE(matches("A.Width != 0.2mm"));
+  CHECK_FALSE(matches("A.Width == 0.25mm"));
+  CHECK(matches("A.Width == 200000"));
+  CHECK_FALSE(matches("A.Width == 0.2"));
+}

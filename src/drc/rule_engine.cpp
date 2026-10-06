@@ -241,7 +241,7 @@ class Condition {
       v.n = static_cast<double>(n.name == "Size_X" ? pad.size_x : pad.size_y);
     } else if (n.name == "Width") {
       v.k = Value::K::Num;
-      v.n = static_cast<double>(it->width) / 1e6;
+      v.n = static_cast<double>(it->width);
     } else {
       ctx.unknown = true;
       v.k = Value::K::Undef;
