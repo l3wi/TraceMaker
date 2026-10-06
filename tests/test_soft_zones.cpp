@@ -96,6 +96,7 @@ TEST_CASE("plane target box and layer heuristic preserves zero-heuristic costs",
   o.field_min_cells = 1; // plane targets must still bypass cost-to-go fields
   o.soft_zones = true;
   o.plane_cut_cost = 0;
+  CHECK(route::RouterOptions{}.plane_cut_cost == 0);
   o.optimize = false;
   for (bool beside : {false, true}) {
     auto b = parse(board_text(plane("In1.Cu", 2, "GND",

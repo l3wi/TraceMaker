@@ -80,7 +80,7 @@ Useful route options: `--threads N` (threads; also the portfolio size unless `--
 run and the output is identical at any thread count), `--variants N` (portfolio size), `--no-gpu` (CPU cost-to-go fields, identical results),
 `--no-rip-up`, `--fast-bends`, `--kb FILE` / `--no-kb` (knowledge base of earlier runs).
 `--soft-zones` (opt-in: refillable planes become routing targets, not fixed copper), `--plane-cut-cost F`
-(dimensionless foreign-plane surcharge on step length and via cost, default 0.5; 0 disables the preference).
+(dimensionless foreign-plane surcharge on step length and via cost, default 0: the preference is disabled).
 Soft-zone output strips fills only from zones cut by new foreign copper; the log reports zones needing refill.
 Sign off with `kicad-cli pcb drc --refill-zones --format json --output drc.json routed.kicad_pcb` and require
 zero unconnected items and no added errors ([doc 05 §18](docs/05-routing.md#18-refillable-planes-2026-10-06-d61)).

@@ -493,8 +493,8 @@ connect them. The plane-aware routing idea is credited to
 The first plane-cut preference charged 0.5 mm per lattice cell: at 0.1 mm pitch, crossing a board-wide pour
 made orthogonal steps six times their geometric cost. The unchanged lower-bound heuristic underestimated badly
 and exhausted the search budget on two-layer pour boards. The preference is now proportional to length.
-Zone targets originally used a zero heuristic, flooding all cells cheaper than one via before reaching an
-inner plane. On fine lattices, these plane searches exhausted the work budget before pad pairs were attempted.
+Zone targets originally used a zero heuristic, flooding all cells cheaper than one via; on CM5_MINIMA_3,
+they consumed the whole budget before pad pairs were attempted.
 
 **What was built**
 
@@ -506,13 +506,13 @@ inner plane. On fine lattices, these plane searches exhausted the work budget be
   Zones cannot simply be removed from `Obstacles::grid()`: `drc::compute_connectivity` uses it too and must
   preserve existing pad/plane clusters. Via-hole/zone queries already skip zones; escape, global routing and
   class caches consume the same obstacle verdicts.
-- `PlaneMap` is built once per lattice, only in soft-zone mode when conductive outlines exist. A scanline
+- `PlaneMap` is built once per lattice only in soft-zone mode with a positive F and conductive outlines. A scanline
   intersects each row with all outline edges, sorts exact rational crossings and fills even-odd spans,
   including the outer boundary and excluding hole boundaries as the per-point reference does. This avoids
   testing every cell against every outline vertex. Highest priority wins; document order breaks ties.
   Each layer/cell stores a uint16 index into a priority-ordered table of zone nets (0 = none). More than
   65,535 conductive zones disables the map with a warning; soft-zone legality and targets remain available.
-- `--plane-cut-cost F` (dimensionless, default 0.5, nonnegative) adds F times a step's geometric length when
+- `--plane-cut-cost F` (dimensionless, default 0, nonnegative) adds F times a step's geometric length when
   its destination cell belongs to a foreign plane: orthogonal and diagonal moves use their respective
   integer lengths. The per-step penalties are converted once per search and truncated to nanometre-equivalent
   integers. A via pays F times its current via cost for each foreign-plane layer in its physical span,
@@ -549,5 +549,24 @@ after refill reported zero unconnected items and zero added errors. The test nee
 without `kicad-cli`. Off-mode outputs on `sbc_sbc` and `oskirby_logicbone` remain byte-identical at 1M work,
 seed 7, one variant/thread and CPU fields.
 
-Benchmarks: see PR
+**KiCad demo results.** KiCad demo projects, routing stripped, 2M work units, one variant;
+`bench/planes_eval.py` (CPU fields). Cells show unconnected items after `kicad-cli pcb drc --refill-zones`,
+followed by routed/connections in parentheses. Soft mode can add plane targets, so connection totals differ.
+
+| Board | No options | Soft F=0.5 | Soft F=0.2 | Soft F=0 |
+|---|---:|---:|---:|---:|
+| StickHub | 33 (100/133) | 25 (111/134) | 24 (112/134) | 23 (112/134) |
+| multichannel_mixer | 10 (166/177) | 37 (140/177) | 24 (153/177) | 5 (176/177) |
+| interf_u | 68 (101/169) | 74 (96/170) | 68 (102/170) | 62 (109/170) |
+| pic_programmer | 18 (68/86) | 21 (65/86) | 20 (66/86) | 15 (72/86) |
+| complex_hierarchy | 79 (29/84) | 78 (34/84) | 78 (35/84) | 78 (36/84) |
+| RoyalBlue54L-Feather | 146 (0/161) | 146 (25/288) | 146 (25/288) | 146 (25/288) |
+| CM5_MINIMA_3 | 124 (88/212) | 174 (42/222) | 133 (86/222) | 85 (136/222) |
+| kit-dev-coldfire-xilinx_5213 | 459 (18/479) | 379 (102/485) | 229 (256/485) | 164 (321/485) |
+
+F=0 gave the fewest or tied-fewest unconnected items on every board, so it is the default.
+Positive factors spent more search work because the surcharge is not in the heuristic, with no measured
+plane-integrity gain. Refilling did not expose a fragmentation regression on the tested two-layer pours:
+their unconnected-item counts fell. All runs added zero KiCad errors except interf_u at F=0.2, which added one.
+The preference remains available explicitly; these measurements do not establish a benefit for enabling it.
 

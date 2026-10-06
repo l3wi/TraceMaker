@@ -444,7 +444,7 @@ int main(int argc, char** argv) {
   route->add_option("--pitch-um", r_pitch_um, "Lattice pitch in micrometres (default: automatic)");
   route->add_option("--via-cost-mm", ropt.via_cost_mm, "Cost of a via as equivalent track length");
   route->add_flag("--soft-zones", ropt.soft_zones, "Route through refillable zone copper and connect SMD pads to planes (D61)");
-  route->add_option("--plane-cut-cost", ropt.plane_cut_cost, "With --soft-zones: foreign-plane cost factor (default 0.5)")
+  route->add_option("--plane-cut-cost", ropt.plane_cut_cost, "With --soft-zones: foreign-plane cost factor (default 0)")
       ->check(CLI::NonNegativeNumber);
   route->add_option("--seed", ropt.seed);
   route->add_option("--only-net", ropt.only_net, "Debugging: route only this net")->group("");
