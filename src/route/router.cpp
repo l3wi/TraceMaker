@@ -238,7 +238,11 @@ struct Router::Impl {
     nx = static_cast<int>((lat.x1 - lat.x0) / pitch) + 1;
     ny = static_cast<int>((lat.y1 - lat.y0) / pitch) + 1;
     if (opt.soft_zones) {
-      planes.build(b, {lat.x0, lat.y0}, pitch, nx, ny);
+      if (!planes.build(b, {lat.x0, lat.y0}, pitch, nx, ny)) {
+        std::fprintf(stderr, "warning: plane-cut preference disabled: more than 65535 conductive zones\n");
+        emit("{\"type\":\"stage\",\"name\":\"plane-map\",\"state\":\"end\","
+             "\"detail\":\"warning: plane-cut preference disabled: more than 65535 conductive zones\"}");
+      }
       plane_cut_penalty = mm_to_nm(std::max(0.0, opt.plane_cut_cost_mm));
     }
     // Near-routed raster: how many routed items could conflict with a probe centred on each lattice point.

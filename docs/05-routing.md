@@ -486,49 +486,50 @@ codes; sharing them needs a thread-safe cache.
 
 ## 18. Refillable planes (2026-10-06, D61)
 
-`--soft-zones` is opt-in. Conductive zone fills cease to be fixed routing obstacles, while their original
-geometry remains in the copper model for initial connectivity and plane targets. Rule areas are never soft:
-their track/via flags remain independent, so a plane-layer area may forbid tracks but permit a connecting via.
-Holes, edges, locked copper and all non-zone rule checks are unchanged. The idea is credited to
+**Before.** Zone fills were fixed copper: foreign planes blocked tracks and vias, and unused fills were
+not routing targets. All-SMD power nets therefore needed explicit tracks even when an inner plane could
+connect them. The plane-aware routing idea is credited to
 [@lucasbstn's upstream PR #1](https://github.com/DingoOz/TraceMaker/pull/1).
 
-**Verified switch-point deviation.** `Router::Impl::run` passes `Obstacles::grid()` to
-`drc::compute_connectivity`. Removing fills from that grid would lose already-connected pad/plane clusters.
-Instead, the grid retains all copper and one `zone_is_soft` predicate is shared by the track, fixed-disk,
-one-pass fixed-via and physical-hole queries. Via-hole/zone queries already skip zones; escape, global routing
-and class caches consume those same obstacle verdicts. Same-net pads already joined to a fill add no target.
-With the option on, filled zone-only clusters participate in the stable cluster MST; nets with no pad have
-no routable terminal and are left alone.
+**What was built**
 
-**Plane-cut preference.** `PlaneMap` is built once per lattice, only in soft-zone mode and only allocates if
-conductive outlines exist. Each layer/cell holds the net of the highest-priority containing outline (holes
-excluded; document order breaks equal-priority ties). Its linear `reference` lookup is checked against the
-raster in unit tests. `--plane-cut-cost-mm` (default 0.5, nonnegative) becomes an int64 nanometre-equivalent
-penalty when a search cell belongs to a foreign plane; a via pays it for each plane layer in its physical
-span. Zero disables the preference, not soft-zone legality. Net comparison and penalties live in search
-costs only, outside class caches and CPU/GPU cost-to-go fields, retaining their lower-bound property.
+- `--soft-zones` is opt-in. Conductive fills remain in the copper model for initial connectivity and
+  participate in the stable cluster MST as plane targets. A pad already joined to a fill adds no target;
+  nets without pads have no routable terminal. Rule areas keep their independent track/via flags, and holes,
+  edges, locked copper and non-zone checks remain hard.
+- One `zone_is_soft` predicate is shared by track, fixed-disk, one-pass fixed-via and physical-hole queries.
+  Zones cannot simply be removed from `Obstacles::grid()`: `drc::compute_connectivity` uses it too and must
+  preserve existing pad/plane clusters. Via-hole/zone queries already skip zones; escape, global routing and
+  class caches consume the same obstacle verdicts.
+- `PlaneMap` is built once per lattice, only in soft-zone mode when conductive outlines exist. A scanline
+  intersects each row with all outline edges, sorts exact rational crossings and fills even-odd spans,
+  including the outer boundary and excluding hole boundaries as the per-point reference does. This avoids
+  testing every cell against every outline vertex. Highest priority wins; document order breaks ties.
+  Each layer/cell stores a uint16 index into a priority-ordered table of zone nets (0 = none). More than
+  65,535 conductive zones disables the map with a warning; soft-zone legality and targets remain available.
+- `--plane-cut-cost-mm` (default 0.5, nonnegative) becomes an int64 nanometre-equivalent penalty for a
+  foreign-plane cell; vias pay for each plane layer in their physical span. Zero disables the preference,
+  not soft-zone legality. Net comparison and penalties stay in search costs, outside class caches and
+  CPU/GPU cost-to-go fields, so the fields remain lower bounds.
+- The summary reports `plane_connections` and `zones_needing_refill`. The writer removes `filled_polygon`
+  children only from zones whose original fills overlap/touch new foreign-net track or via copper. Other
+  zones, including unknown children and fills, remain byte-identical. The log prints the count and refill
+  command. TraceMaker does not refill or prove final plane connectivity; KiCad refill plus zero
+  unconnected items is required for sign-off (doc 08).
 
-**Output contract.** The route summary reports `plane_connections` and `zones_needing_refill`. The writer
-removes all `filled_polygon` children only from zones whose original fills overlap/touch new foreign-net
-track or via copper. Other zones (including their fills and unknown children) are byte-identical. The log
-prints the count and `kicad-cli pcb drc --refill-zones` command. TraceMaker does not refill or prove final
-plane connectivity: KiCad refill plus zero unconnected items is required for sign-off (doc 08).
+**Results.** The raster matches the per-point reference on priority overlaps, holes, concave notches, lattice
+vertices/edges and reversed rings; capacity tests cover the full uint16 table and overflow fallback.
+Obstacle parity tests cover hard/soft planes, rule areas, physical-hole rules, holes and edges. Routing
+tests cover plane targets, already-joined pads and equal-length plane-avoiding alternatives; writer tests
+cover selective track/via invalidation and untouched bytes.
 
-**Coverage.** Inline unit boards exercise hard/soft foreign fills, track and via legality, one-pass/reference
-via parity on a point grid with same/foreign planes, rule areas, holes and edges, unused-plane via targets,
-already-joined pads, priority/hole raster parity, plane-avoiding search and selective writer invalidation.
-The `soft_zones` integration test generates an all-SMD four-layer board (0402s, a QFN-like package, inner
-GND/3V3 planes and via-permitting track rule areas) without pcbnew, routes it, and compares KiCad errors
-before/after refill with zero output unconnected items. It skips cleanly without `kicad-cli`.
+The generated all-SMD four-layer integration board (0402s, a QFN-like package, inner GND/3V3 planes and
+via-permitting track rule areas) routed 16/16 connections, including 15 plane connections. KiCad 10.0.3
+after refill reported zero unconnected items and zero added errors. The test needs no pcbnew and skips
+without `kicad-cli`. Off-mode outputs on `sbc_sbc` and `oskirby_logicbone` remain byte-identical at 1M work,
+seed 7, one variant/thread and CPU fields.
 
-**Results.** The macOS implementation run passed 283,781 unit assertions (58 cases; CUDA-only Philox skipped).
-The generated board routed 16/16 connections, including 15 plane connections, with 15 vias; KiCad 10.0.3 after
-refill reported zero unconnected items and zero added errors. Off-mode A/B at 1M work, seed 7, one variant/thread,
-CPU fields was byte-identical on `sbc_sbc` (MD5 `bb509d0a543bbde8dfdb8f2802b89e1f`) and
-`oskirby_logicbone` (`9b7d269efff3869a7eb9b4068033863e`). Benchmark tiers run centrally.
-The full macOS ctest run passed 143 tests and skipped three; its only two failures were the pre-existing
-`kicad_drc_parity`/`kicad_drc_broken_parity` wrappers hard-coding the absent `build/release` binary.
-Those harness fixes belong to the macOS workstream; all soft-zone tests and the other integrations passed.
+Benchmarks: see PR
 
 ## 19. Keep vias off small pads (D62)
 
