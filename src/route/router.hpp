@@ -36,7 +36,7 @@ struct RouterOptions {
   double via_cost_mm = 3.0;     // equivalent track length of one via
   bool allow_vias = true;
   bool soft_zones = false;      // zone fills are refillable, not fixed routing obstacles (D61)
-  double plane_cut_cost_mm = 0.5;  // search-only cost per foreign-plane cell, equivalent track length
+  double plane_cut_cost = 0.5;  // dimensionless foreign-plane surcharge on geometric step/via costs
   bool rip_up = true;           // negotiated rip-up and reroute (design doc 05 §6 rung R2, doc 06 §3)
   int max_rips_per_connection = 8;
   int max_passes = 12;          // passes over still-unrouted connections

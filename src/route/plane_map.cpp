@@ -105,6 +105,10 @@ void raster_row(const model::Zone& z, geom::Point origin, Coord pitch, int y, st
 
 }  // namespace
 
+std::int64_t PlaneMap::scaled_penalty(std::int64_t geometric_cost, double factor) {
+  return factor > 0 ? static_cast<std::int64_t>(static_cast<double>(geometric_cost) * factor) : 0;
+}
+
 model::NetId PlaneMap::reference(const model::Board& b, geom::Point p, int layer) {
   model::NetId net = 0;
   int priority = 0;
