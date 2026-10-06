@@ -551,3 +551,9 @@ CPU fields, seed 7 and 1,000,000 work, outputs match the `mac-stack` binary byte
 `sbc_sbc` MD5 `bb509d0a543bbde8dfdb8f2802b89e1f`;
 `oskirby_logicbone` MD5 `9b7d269efff3869a7eb9b4068033863e`.
 The parent runs benchmark tiers centrally; none are run in this worktree.
+Final CTest acceptance (serial per shared-machine policy) passes 143 tests with 3 skips out of 146,
+including component-rule and differential-pair integrations. The first full 148-test run failed only the
+two legacy DRC parity wrappers because they hard-code the missing `build/release` executable. Those
+parent-owned harness fixes are outside D62; the final run excludes `kicad_drc_parity` and
+`kicad_drc_broken_parity` by agreement. Other skips: CUDA-only Philox, KiCad edit round-trip prerequisites,
+and the catalogue-sync dependency.
