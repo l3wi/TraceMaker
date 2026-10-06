@@ -533,29 +533,12 @@ Benchmarks: see PR
 
 ## 19. Keep vias off small pads (D62)
 
-The opt-in `--keep-vias-off-pads [MM]` preference is based on
+**Before.** A via could sit in its own SMD pad unless a project `physical_hole_clearance` rule forbade it.
+The condition language could not select small pads by their copper dimensions.
+
+**What was built.** The opt-in `--keep-vias-off-pads [MM]` preference is based on
 [@lucasbstn's upstream PR #1](https://github.com/DingoOz/TraceMaker/pull/1).
-
-**KiCad 10 source verification.** [`PAD` property registration](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/pcbnew/pad.cpp)
-registers “Size X” / “Size Y”; [`PCBEXPR_VAR_REF`](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/pcbnew/pcbexpr_evaluator.cpp)
-replaces underscores with spaces, so conditions use `Size_X` / `Size_Y`.
-[`PAD::GetSizeX/GetSizeY`](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/pcbnew/pad.h)
-return the padstack's own copper dimensions, not its rotated board-axis bounding box. Rotating a rectangular
-pad or its footprint therefore does not swap these properties.
-The [`condition grammar`](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/common/libeval_compiler/grammar.lemon)
-supports `<`, `<=`, `>`, `>=` and a number followed by a unit. The PCB unit resolver accepts `mm`, `mil`, `in`,
-`deg`, `fs` and `ps`. Lengths evaluate in internal nanometres; bare numbers are unscaled, **not millimetres**.
-The [`compiler`](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/common/libeval_compiler/libeval_compiler.cpp)
-also diagnoses a lone numeric literal without units. Use explicit units for dimensions.
-See KiCad's [custom rules manual](https://docs.kicad.org/10.0/en/pcbnew/pcbnew.html#custom-design-rules)
-for `.kicad_dru` placement, conditions and the `physical_hole_clearance` constraint.
-
-**Width compatibility.** `Width` now evaluates in nm like KiCad's dimensional properties instead of mm.
-Explicit-unit conditions such as `A.Width == 0.2mm` and `A.Width != 0.25mm` retain their previous results:
-both sides now receive the same unit conversion. Bare `A.Width == 0.2` no longer means 0.2 mm; write
-`A.Width == 0.2mm` instead. Numeric literals use the [KiCad compiler's unscaled bare-number semantics](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/common/libeval_compiler/libeval_compiler.cpp).
-
-**Routing.** Absent means off; present without a number uses X = 2 mm. A supplied positive `MM` changes X.
+Absent means off; present without a number uses X = 2 mm. A supplied positive `MM` changes X.
 Only SMD pads with **both** local copper dimensions strictly less than X match; equal-sized, elongated,
 exposed and thermal pads remain via-capable. The route job copies its project rules only when enabled and
 appends a synthetic `physical_hole_clearance` constraint. Its minimum is
@@ -566,6 +549,27 @@ cache paths enforce it against fixed copper of **any** net (same net included). 
 so this net-independent rule does not disable per-class caches. Nothing is added to the output board or
 project rules. `tracemaker drc` and KiCad remain unaware of the preference unless a project rule is installed.
 Unparseable synthetic conditions are hard errors.
+
+**Condition semantics.** [`PAD` property registration](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/pcbnew/pad.cpp)
+registers “Size X” / “Size Y”; [`PCBEXPR_VAR_REF`](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/pcbnew/pcbexpr_evaluator.cpp)
+replaces underscores with spaces, so conditions use `Size_X` / `Size_Y`.
+[`PAD::GetSizeX/GetSizeY`](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/pcbnew/pad.h)
+return the padstack's own copper dimensions, not its rotated board-axis bounding box. Rotating a rectangular
+pad or its footprint therefore does not swap these properties.
+The [`condition grammar`](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/common/libeval_compiler/grammar.lemon)
+supports `<`, `<=`, `>`, `>=` and a number followed by a unit. The PCB unit resolver accepts `mm`, `mil`, `in`,
+`deg`, `fs` and `ps`. Length literals (`mm`, `mil`, `in`) are rounded to the nearest integer nm at parse time,
+so decimal conversion cannot put a literal just below a pad or track of exactly the same size.
+Bare numbers are unscaled, **not millimetres**; `ps`, `fs` and `deg` retain their numeric conversions without
+length rounding. The [`compiler`](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/common/libeval_compiler/libeval_compiler.cpp)
+also diagnoses a lone numeric literal without units; TraceMaker accepts it as unscaled. Use explicit units
+for dimensions. See KiCad's [custom rules manual](https://docs.kicad.org/10.0/en/pcbnew/pcbnew.html#custom-design-rules)
+for `.kicad_dru` placement, conditions and the `physical_hole_clearance` constraint.
+
+**Width compatibility.** `Width` now evaluates in nm like KiCad's dimensional properties instead of mm.
+Explicit-unit conditions such as `A.Width == 0.2mm` and `A.Width != 0.25mm` retain their previous results:
+both sides now receive the same unit conversion. Bare `A.Width == 0.2` no longer means 0.2 mm; write
+`A.Width == 0.2mm` instead. Numeric literals use the KiCad compiler's unscaled bare-number semantics.
 
 **Equivalent KiCad rule.** For default 0.6 mm diameter / 0.3 mm drill / 0.2 mm clearance, M = 0.35 mm.
 Add this text to `<board>.kicad_dru` (one `(version 1)` header per file); replace 0.35 mm with your maximum
@@ -580,27 +584,15 @@ class margin and 2 mm with your selected threshold:
 
 KiCad's project-rule precedence still applies: place this rule before stricter matching rules. TraceMaker's
 synthetic rule instead takes the maximum with the project's selected minimum, so it can never weaken it.
-**Spec correction:** the pre-existing rule engine uses later-rule precedence, not max-of-minimums composition;
-the new max composition is restricted to synthetic origins. Rounding half-nm annuli upward is conservative.
-Bare numeric expressions remain accepted as unscaled values by TraceMaker; KiCad's additional diagnostic
-for one bare literal is not emulated. Explicit dimensional literals are recommended.
+The existing rule engine uses later-rule precedence; max composition is restricted to synthetic origins.
+Rounding half-nm annuli upward is conservative.
 
-**Coverage.** Unit tests cover numeric comparisons and units, rectangular rotated pads, undefined properties,
+**Tests.** Numeric comparisons and unit boundaries, rectangular rotated pads, undefined properties,
 Width compatibility, synthetic compilation failure, class-margin selection, same/foreign-net blocked and
 just-clear sites, exposed-pad exceptions, one-pass/reference parity, retained caches, stricter project
 minimums and a 0402 dog-bone into an anchored bottom plane. The generated integration fixture checks optional
 CLI values before positional and option arguments, project/DRC isolation, and KiCad enforcement of the
 equivalent rule; its KiCad portion skips cleanly without `kicad-cli`.
 
-**Verified results.** On macOS Metal, 58 `tm_tests` cases pass (295,102 assertions); the CUDA-only Philox case
-skips. The generated CLI/KiCad test passes on KiCad 10.0.3. With the option absent, one variant, one thread,
-CPU fields, seed 7 and 1,000,000 work, outputs match the `mac-stack` binary byte-for-byte:
-`sbc_sbc` MD5 `bb509d0a543bbde8dfdb8f2802b89e1f`;
-`oskirby_logicbone` MD5 `9b7d269efff3869a7eb9b4068033863e`.
-The parent runs benchmark tiers centrally; none are run in this worktree.
-Final CTest acceptance (serial per shared-machine policy) passes 143 tests with 3 skips out of 146,
-including component-rule and differential-pair integrations. The first full 148-test run failed only the
-two legacy DRC parity wrappers because they hard-code the missing `build/release` executable. Those
-parent-owned harness fixes are outside D62; the final run excludes `kicad_drc_parity` and
-`kicad_drc_broken_parity` by agreement. Other skips: CUDA-only Philox, KiCad edit round-trip prerequisites,
-and the catalogue-sync dependency.
+**Results.** Benchmarks: see PR.
+

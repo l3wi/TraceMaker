@@ -274,6 +274,51 @@ TEST_CASE("Width comparisons with explicit KiCad units retain their previous res
   CHECK_FALSE(matches("A.Width == 0.2"));
 }
 
+TEST_CASE("length literals round to integer nm at pad and Width comparison boundaries", "[rules]") {
+  const Files f("literal_rounding", board_text(""), "");
+  auto lb = io::read_board_file(f.pcb.string());
+  const auto base_rules = io::read_design_rules(f.pcb.string());
+  for (const auto& [size, literal] : {std::pair<Coord, const char*>{1'001'000, "1.001mm"},
+                                    {290'000, "0.29mm"}, {2'000'000, "2mm"}, {999'999'000, "999.999mm"},
+                                    {1'001'000, "39.40944881889764mil"}, {1'001'000, "0.03940944881889764in"},
+                                    {1'001'000, "1.0010004mm"}}) {
+    CAPTURE(size, literal);
+    lb.board.pads[0].size_x = lb.board.pads[0].size_y = size;
+    const auto copper = drc::build_copper(lb.board);
+    const drc::CopperItem* pad = nullptr;
+    for (const auto& it : copper.items)
+      if (it.kind == drc::ItemKind::Pad && it.index == 0) pad = &it;
+    REQUIRE(pad != nullptr);
+    drc::CopperItem track;
+    track.kind = drc::ItemKind::Track;
+    track.net = 1;
+    track.width = size;
+    auto matches = [&](const std::string& expr) {
+      auto rules = base_rules;
+      model::CustomRule rule;
+      rule.condition = "A.Type == 'Track' && B.Type == 'Pad' && (" + expr + ")";
+      rule.constraints.push_back({"physical_hole_clearance", 50'000, {}, {}, {}});
+      rules.custom.push_back(rule);
+      const drc::RuleEngine re(lb.board, rules);
+      REQUIRE(re.warnings().empty());
+      return re.physical_hole_clearance(&track, *pad, 0) == 50'000;
+    };
+    for (const std::string prop : {"B.Size_X", "B.Size_Y", "A.Width"}) {
+      CAPTURE(prop);
+      CHECK(matches(prop + " <= " + literal));
+      CHECK(matches(prop + " >= " + literal));
+      CHECK(matches(prop + " == " + literal));
+      CHECK_FALSE(matches(prop + " < " + literal));
+      CHECK_FALSE(matches(prop + " > " + literal));
+    }
+    CHECK(matches("0.0015ps == 1.5 && 1.5fs == 1.5 && 1.5deg == 1.5"));
+    if (size == 1'001'000) {
+      CHECK(matches("A.Width < 1001000.4"));
+      CHECK_FALSE(matches("A.Width == 1001000.4"));
+    }
+  }
+}
+
 TEST_CASE("synthetic pad rules fail closed while project parse failures remain warnings", "[rules]") {
   const Files f("origin", board_text(""), "");
   const auto lb = io::read_board_file(f.pcb.string());
