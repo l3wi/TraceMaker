@@ -14,7 +14,6 @@ Refills every zone with KiCad's own filler (in memory; the file is not written),
                     plane; a via of the plane's own net stitches it instead)
   small_pad_vias    vias touching an SMD pad smaller than SMALL_PAD_MM (default 2) in both dimensions: an untented
                     via there wicks solder away from the joint (IPC-4761 would fill and cap it)
-  zone_nets         nets owning a conductive zone other than a teardrop (a pour carries part of such a net)
 """
 import json
 import math
@@ -31,11 +30,9 @@ board_area = float(edge.GetWidth()) * float(edge.GetHeight())
 stack = list(board.GetEnabledLayers().CuStack())
 
 planes = []  # (zone, layer)
-zone_nets = set()
 for z in board.Zones():
     if z.GetIsRuleArea() or z.GetNetCode() <= 0 or z.IsTeardropArea():
         continue
-    zone_nets.add(z.GetNetname())
     for layer in z.GetLayerSet().CuStack():
         if z.Outline().Area() >= 0.25 * board_area:
             planes.append((z, layer))
@@ -86,4 +83,4 @@ for p in board.GetPads():
 small_pad_vias = sum(1 for v in vias if any(v.IsOnLayer(layer) and p.GetEffectiveShape(layer).Collide(v.GetEffectiveShape(layer), 0)
                                             for p, layer in small_pads))
 print(json.dumps({"planes": out_planes, "over_gap_mm": round(over_gap, 1), "plane_adjacent_mm": round(adjacent, 1),
-                  "vias": len(vias), "plane_vias": plane_vias, "small_pad_vias": small_pad_vias, "zone_nets": sorted(zone_nets)}))
+                  "vias": len(vias), "plane_vias": plane_vias, "small_pad_vias": small_pad_vias}))

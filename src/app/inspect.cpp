@@ -70,7 +70,8 @@ void write_truth_json(const model::Board& b, const std::string& out_path, const 
                          {"type", kVia[static_cast<int>(v.type)]}, {"net", net(v.net)}});
   d["zones"] = json::array();
   for (const auto& z : b.zones)
-    if (z.footprint < 0) d["zones"].push_back({{"net", net(z.net)}, {"rule_area", z.rule_area}, {"layers", z.layers}});
+    if (z.footprint < 0)
+      d["zones"].push_back({{"net", net(z.net)}, {"rule_area", z.rule_area}, {"teardrop", z.teardrop}, {"layers", z.layers}});
   std::ofstream(out_path) << d.dump();
 }
 

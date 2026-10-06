@@ -86,24 +86,25 @@ and an explicit status for zero hand denominators; similarity to the original is
 each file may hold one record or a list. `markdown(records, hand_label="original")` supplies the same
 report to callers and displays failed judges without fabricating metrics.
 
-**Results** (`bench/planes_eval.py`, 10M work units, one variant, 1 thread; 8 KiCad demos with their own
-rules and zones, and 9 PCBench quick-tier boards, whose fixtures have no zones, against `raw.kicad_pcb`).
-Open = unconnected after refill; Q = quality (higher is better, diagnostic within a tier); matched = track
-length on nets both boards completed, candidate / hand.
+**Results** (`bench/planes_eval.py`, 10M work units, one variant, 1 thread, soft zones at F=0; 8 KiCad demos
+with their own rules and zones, and 9 PCBench quick-tier boards, whose fixtures have no zones, against
+`raw.kicad_pcb`). Open = unconnected after refill; Q = quality (higher is better, diagnostic within a tier);
+matched = track length on nets both boards completed, candidate / hand.
 
 | Board | Hand: legal, Q | Best TraceMaker (open, Q) | Matched length | Verdict |
 |---|---|---|--:|---|
-| complex_hierarchy | yes, 39.6 | base 0 open, 50.3; soft 0, 48.7 | 0.92 / 0.80 | TraceMaker (plane cost 1.26 vs 2.34) |
-| multichannel_mixer | **24 clearance errors** | base 11, 55.8 | 0.98 | TraceMaker (hand illegal) |
-| RoyalBlue54L-Feather | **2 errors** | soft 87, 34.9; soft+vop 92, 48.7 | 0.92 | TraceMaker (hand illegal) |
-| pic_programmer, StickHub, interf_u, CM5, ColdFire | yes, 31–44 | 10–155 open | 0.85–1.27 | hand (complete) |
+| complex_hierarchy | yes, 39.6 | base 0 open, 50.3; soft 0, 47.0 | 0.92 / 0.78 | TraceMaker (plane cost 1.26 vs 2.34) |
+| multichannel_mixer | **24 clearance errors** | soft 4, 42.2; base 11, 55.8 | 0.92 | TraceMaker (hand illegal) |
+| RoyalBlue54L-Feather | **2 errors** | soft 87, 34.3; soft+vop 92, 49.7 | 0.92 | TraceMaker (hand illegal) |
+| pic_programmer, StickHub, interf_u, CM5, ColdFire | yes, 31–44 | 10–125 open | 0.84–1.12 | hand (complete) |
 | 9 PCBench boards | 7 legal; 2 with 9–10 errors | all 0 open, Q 52.7–64.8 | 0.68–1.00 | TraceMaker 8 (kika only with `--keep-vias-off-pads`), hand 1 (scimpy: no vias against TraceMaker's 0.10 per connection) |
 
-Soft zones cut open connections on the multilayer boards (CM5 118 → 82, StickHub 31 → 14, ColdFire
-415 → 155, RoyalBlue 112 → 87) but put 0.16–0.78 vias per delivered connection in small SMD pads (DFM cost
-1.1–5.7); `--keep-vias-off-pads` removes nearly all of them (DFM 0.01–0.5) for at most 10 more open
-connections. With the teardrop zones left in the demo inputs, complex_hierarchy routed 15–25 % under the
-same judge: a fixture artefact, not a router limit.
+Soft zones cut open connections on the multilayer boards (CM5 118 → 62, StickHub 31 → 10, ColdFire
+415 → 125, RoyalBlue 112 → 87) and on multichannel_mixer (11 → 4), but put 0.15–0.80 vias per delivered
+connection in small SMD pads (DFM cost 1.1–5.9). `--keep-vias-off-pads` removes nearly all of them
+(DFM 0.01–0.4) for 0–15 more open connections, and added one `solder_mask_bridge` on StickHub. With the
+teardrop zones left in the demo inputs, complex_hierarchy routed 15–25 % under the same judge: a fixture
+artefact, not a router limit.
 
 ## 3. Baselines
 

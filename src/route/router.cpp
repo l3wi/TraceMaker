@@ -298,7 +298,8 @@ struct Router::Impl {
       if (it.kind == drc::ItemKind::Pad) {
         pad_item[static_cast<std::size_t>(it.index)] = static_cast<int>(i);
         net_clusters[it.net][uf.find(static_cast<int>(i))].pads.push_back(it.index);
-      } else if (it.kind == drc::ItemKind::Zone && it.footprint < 0) {
+      } else if (it.kind == drc::ItemKind::Zone && it.footprint < 0 && !b.zones[static_cast<std::size_t>(it.index)].teardrop) {
+        // A teardrop is not a plane: one left behind by deleted routing must not become a target.
         net_clusters[it.net][uf.find(static_cast<int>(i))].zones.push_back(static_cast<int>(i));
       }
     }
