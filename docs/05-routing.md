@@ -549,8 +549,12 @@ Absent means off; present without a number uses X = 2 mm. A supplied positive `M
 Only SMD pads with **both** local copper dimensions strictly less than X match; equal-sized, elongated,
 exposed and thermal pads remain via-capable. The route job copies its project rules only when enabled and
 appends a synthetic `physical_hole_clearance` constraint. Its minimum is
-`M = max_classes(ceil((via_diameter - via_drill) / 2) + clearance)` in integer nm. Because KiCad measures
-this constraint from the drill edge, the margin keeps the whole class via copper clear by its clearance;
+`M = max_classes(ceil((effective_via_diameter - effective_via_drill) / 2) + clearance)` in integer nm.
+The effective drill is the larger of the class drill and the board's minimum through-hole diameter; the
+effective diameter is the maximum of the class diameter, the board's minimum via diameter, and the effective
+drill plus twice the board's minimum annular width. Routing and the preference share `route::class_via`,
+so the margin follows the via actually placed, not just the unadjusted net-class size. Because KiCad measures
+this constraint from the drill edge, the margin keeps the whole effective via copper clear by its clearance;
 smaller neck-down vias are protected too. The existing exact via checks, escape checks and one-pass/reference
 cache paths enforce it against fixed copper of **any** net (same net included). `Size_X/Y` are item-only,
 so this net-independent rule does not disable per-class caches. Nothing is added to the output board or

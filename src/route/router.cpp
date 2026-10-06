@@ -160,12 +160,8 @@ struct Router::Impl {
     const auto i = static_cast<std::size_t>(net);
     return i < net_class.size() ? *net_class[i] : rules.class_for(b.nets[i].name);
   }
-  // Via drill and diameter for a net: net-class values raised to the board minimums (drill, diameter and
-  // annular ring: d >= drill + 2 * min_annular).
-  Coord class_via_drill(NetId net) const { return std::max(netclass(net).via_drill, rules.minimums.through_hole_diameter); }
-  Coord class_via_diameter(NetId net) const {
-    return std::max({netclass(net).via_diameter, rules.minimums.via_diameter, class_via_drill(net) + 2 * rules.minimums.via_annular_width});
-  }
+  Coord class_via_drill(NetId net) const { return class_via(rules, netclass(net)).drill; }
+  Coord class_via_diameter(NetId net) const { return class_via(rules, netclass(net)).diameter; }
   // Via neck-down (M9 escalation rung, with the track neck-down): KiCad's DRC checks vias against the board
   // minimums only (via diameter, drill, annular ring), not the net class, so the smallest via they allow is
   // legal where the class via does not fit (e.g. between BGA balls or in a dense LED matrix). Only used when

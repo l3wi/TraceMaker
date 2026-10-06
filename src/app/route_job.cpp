@@ -96,8 +96,10 @@ int default_gpu_device(bool use_gpu) {
 model::CustomRule keep_vias_off_pads_rule(const model::DesignRules& rules, Coord threshold) {
   if (threshold <= 0) throw std::invalid_argument("keep-vias-off-pads size must be positive");
   Coord margin = 0;
-  for (const auto& nc : rules.classes)
-    margin = std::max(margin, (std::max<Coord>(0, nc.via_diameter - nc.via_drill) + 1) / 2 + nc.clearance);
+  for (const auto& nc : rules.classes) {
+    const auto via = route::class_via(rules, nc);
+    margin = std::max(margin, (std::max<Coord>(0, via.diameter - via.drill) + 1) / 2 + nc.clearance);
+  }
   model::CustomRule rule;
   rule.name = "TraceMaker keep vias off small SMD pads";
   rule.origin = model::RuleOrigin::Synthetic;

@@ -392,6 +392,17 @@ TEST_CASE("a 0402 plane connection uses a dog-bone rather than via-in-pad", "[ru
       " (filled_polygon (layer \"B.Cu\") (pts (xy 1 1) (xy 19 1) (xy 19 9) (xy 1 9))))"
       " (gr_rect (start 0 0) (end 20 10) (layer \"Edge.Cuts\") (stroke (width 0.1) (type solid))))";
   const Files f("dogbone", text, "");
+  bool raised_via = false;
+  SECTION("net-class via dimensions") {}
+  SECTION("board minimums raise the via diameter and annular ring") {
+    raised_via = true;
+    std::ofstream(f.dir / "b.kicad_pro") <<
+        R"({"board":{"design_settings":{"rules":{"min_via_diameter":1.5,"min_via_annular_width":0.3}}}})";
+    const auto rules = io::read_design_rules(f.pcb.string());
+    REQUIRE(rules.default_class().via_diameter == 600'000);
+    REQUIRE(rules.default_class().via_drill == 300'000);
+    CHECK(app::keep_vias_off_pads_rule(rules, 2'000'000).constraints.front().min == 800'000);
+  }
   app::RouteJob job;
   job.in = f.pcb.string();
   job.threads = job.variants = 1;
@@ -402,6 +413,8 @@ TEST_CASE("a 0402 plane connection uses a dog-bone rather than via-in-pad", "[ru
   const auto baseline = app::run_route_job(job);
   REQUIRE(baseline.result.routed == 1);
   REQUIRE(baseline.result.vias.size() == 1);
+  CHECK(baseline.result.vias.front().size == (raised_via ? 1'500'000 : 600'000));
+  CHECK(baseline.result.vias.front().drill == 300'000);
   const auto lb = io::read_board_file(job.in);
   const auto cm = drc::build_copper(lb.board);
   const geom::Shape& pad = cm.items.front().shapes.front();
@@ -411,6 +424,8 @@ TEST_CASE("a 0402 plane connection uses a dog-bone rather than via-in-pad", "[ru
   const auto dogbone = app::run_route_job(job);
   REQUIRE(dogbone.result.routed == 1);
   REQUIRE(dogbone.result.vias.size() == 1);
+  CHECK(dogbone.result.vias.front().size == (raised_via ? 1'500'000 : 600'000));
+  CHECK(dogbone.result.vias.front().drill == 300'000);
   CHECK_FALSE(dogbone.result.tracks.empty());
   for (const auto& v : dogbone.result.vias)
     CHECK_FALSE(geom::closer_than_disk(pad, v.pos, v.size / 2, 200'000));
@@ -420,4 +435,24 @@ TEST_CASE("a 0402 plane connection uses a dog-bone rather than via-in-pad", "[ru
   const auto report = drc::run_drc(routed.board, project_rules);
   CHECK(report.violations.empty());
   CHECK(report.unconnected.empty());
+}
+
+TEST_CASE("class via dimensions include board drill, diameter and annular minimums", "[rules][route]") {
+  const Files f("effective_via", board_text(""), "");
+  auto rules = io::read_design_rules(f.pcb.string());
+  auto check = [&](Coord diameter, Coord drill, Coord margin) {
+    const auto via = route::class_via(rules, rules.default_class());
+    CHECK(via.diameter == diameter);
+    CHECK(via.drill == drill);
+    CHECK(app::keep_vias_off_pads_rule(rules, 2'000'000).constraints.front().min == margin);
+  };
+  check(600'000, 300'000, 350'000);
+  rules.minimums.through_hole_diameter = 500'000;
+  check(700'000, 500'000, 300'000);  // the default board annular minimum is 0.1 mm
+  rules.minimums.via_annular_width = 300'000;
+  check(1'100'000, 500'000, 500'000);
+  rules.minimums.via_diameter = 1'500'000;
+  check(1'500'000, 500'000, 700'000);
+  rules.minimums.through_hole_diameter = 0;
+  check(1'500'000, 300'000, 800'000);
 }
