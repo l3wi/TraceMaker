@@ -4,6 +4,7 @@
 //
 // Octilinear A* on a fine lattice (optimal under its cost model), with legality decided lazily by exact
 // clearance tests against the DRC's rule engine, then exact verification of every committed segment and via.
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <string>
@@ -14,6 +15,17 @@
 #include "model/rules.hpp"
 
 namespace tmk::route {
+
+struct ClassVia {
+  Coord diameter, drill;
+};
+
+// KiCad's board minimums raise the class drill, diameter and annular ring together.
+// https://docs.kicad.org/10.0/en/pcbnew/pcbnew.html#configuring_design_rules
+inline ClassVia class_via(const model::DesignRules& rules, const model::NetClass& nc) {
+  const Coord drill = std::max(nc.via_drill, rules.minimums.through_hole_diameter);
+  return {std::max({nc.via_diameter, rules.minimums.via_diameter, drill + 2 * rules.minimums.via_annular_width}), drill};
+}
 
 struct RouterOptions {
   Coord pitch = 0;              // lattice pitch; 0 = automatic from net-class widths and clearances
