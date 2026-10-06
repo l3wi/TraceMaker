@@ -551,5 +551,29 @@ minimums and a 0402 dog-bone into an anchored bottom plane. The generated integr
 CLI values before positional and option arguments, project/DRC isolation, and KiCad enforcement of the
 equivalent rule; its KiCad portion skips cleanly without `kicad-cli`.
 
-**Results.** Benchmarks: see PR.
+**Results.** `bench/planes_eval.py`: eight KiCad demo projects with routing stripped, 2M work, one variant,
+CPU fields. “Small-pad vias” counts vias whose copper touches an SMD pad with both dimensions below 2 mm,
+using KiCad's own shapes. Unconnected items are counted after `kicad-cli pcb drc --refill-zones`.
+Soft-zone runs use zero plane-cut penalty (`--plane-cut-cost-mm 0`).
+
+| Board | No options: small-pad vias / unconnected | `--keep-vias-off-pads` | `--soft-zones` (F = 0) | `--soft-zones` (F = 0) + `--keep-vias-off-pads` |
+|---|---|---|---|---|
+| StickHub | 9 / 33 | 0 / 40 | 17 / 23 | 0 / 33 |
+| multichannel_mixer | 9 / 10 | 0 / 12 | 26 / 5 | 0 / 14 |
+| interf_u | 0 / 68 | 0 / 68 | 0 / 62 | 0 / 62 |
+| pic_programmer | 0 / 18 | 0 / 18 | 0 / 15 | 0 / 15 |
+| complex_hierarchy | 0 / 79 | 0 / 79 | 0 / 78 | 0 / 78 |
+| RoyalBlue54L-Feather | 0 / 146 | 0 / 146 | 23 / 146 | 2* / 146 |
+| CM5_MINIMA_3 | 0 / 124 | 0 / 124 | 48 / 85 | 0 / 88 |
+| kit-dev-coldfire-xilinx_5213 | 4 / 459 | 0 / 454 | 131 / 164 | 0 / 216 |
+
+*The two counted vias on RoyalBlue54L-Feather sit on U2's unnumbered, netless 0.57 mm custom sub-pads inside
+its exposed pad (thermal-via sites); the counter cannot distinguish them from separate small pads.
+
+The preference removes small-pad vias, but dog-bones need more space and can cost connections on dense
+boards: with soft zones, coldfire rises from 164 to 216 unconnected items. It stays opt-in rather than
+trading completion for pad clearance by default. KiCad added errors are zero in all runs except one
+`solder_mask_bridge` on StickHub with soft zones and the pad preference together.
+The benchmark also caught the need to use effective via sizes: before that fix, multichannel_mixer's
+1.5 mm board-minimum via diameter left 18 small-pad vias with the preference on.
 
