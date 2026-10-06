@@ -17,7 +17,7 @@ namespace tmk::route {
 class Obstacles {
  public:
   // `board` is the router's working copy; items added later must also be appended to it.
-  Obstacles(model::Board& board, const model::DesignRules& rules);
+  Obstacles(model::Board& board, const model::DesignRules& rules, bool soft_zones = false);
 
   // Legality of a probe shape. Result: 0 = free, 1 = only conflicts with rippable routed copper (owners are
   // appended to `owners` when given), 2 = blocked by fixed copper, holes, edges or keepouts.
@@ -81,6 +81,8 @@ class Obstacles {
   mutable long rej_outside = 0, rej_copper = 0, rej_other = 0, checks = 0;
 
  private:
+  bool zone_is_soft(const drc::CopperItem& item) const { return soft_zones_ && item.kind == drc::ItemKind::Zone; }
+  bool soft_zones_ = false;
   int copper_state(const geom::Shape& s, const drc::CopperItem& probe, int layer, bool ignore_routed, std::vector<int>* owners) const;
   int holes_edges_state(const geom::Shape& s, model::NetId net, int layer, bool is_via_hole, Coord hole_r, bool ignore_routed,
                         std::vector<int>* owners) const;

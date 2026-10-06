@@ -5,6 +5,7 @@
 #include "route/escape_flow.hpp"
 #include "route/heat_grid.hpp"
 #include "route/global_router.hpp"
+#include "route/plane_map.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -51,6 +52,14 @@ struct Router::Impl {
   Coord pitch = 0;
   geom::Box lat;  // lattice bounds (aligned to pitch)
   int nx = 0, ny = 0, nl = 0;
+  PlaneMap planes;
+  double plane_cut_factor = 0;
+  std::int64_t plane_via_cost(int gx, int gy, NetId net, int l0, int l1, std::int64_t penalty) const {
+    if (penalty == 0) return 0;
+    std::int64_t cost = 0;
+    for (int l = l0; l <= l1; ++l) cost += planes.cost(l, gx, gy, net, penalty);
+    return cost;
+  }
   drc::UnionFind* clusters = nullptr;
   std::vector<int> pad_item;  // board pad -> copper item index (or -1)
 
@@ -151,12 +160,8 @@ struct Router::Impl {
     const auto i = static_cast<std::size_t>(net);
     return i < net_class.size() ? *net_class[i] : rules.class_for(b.nets[i].name);
   }
-  // Via drill and diameter for a net: net-class values raised to the board minimums (drill, diameter and
-  // annular ring: d >= drill + 2 * min_annular).
-  Coord class_via_drill(NetId net) const { return std::max(netclass(net).via_drill, rules.minimums.through_hole_diameter); }
-  Coord class_via_diameter(NetId net) const {
-    return std::max({netclass(net).via_diameter, rules.minimums.via_diameter, class_via_drill(net) + 2 * rules.minimums.via_annular_width});
-  }
+  Coord class_via_drill(NetId net) const { return class_via(rules, netclass(net)).drill; }
+  Coord class_via_diameter(NetId net) const { return class_via(rules, netclass(net)).diameter; }
   // Via neck-down (M9 escalation rung, with the track neck-down): KiCad's DRC checks vias against the board
   // minimums only (via diameter, drill, annular ring), not the net class, so the smallest via they allow is
   // legal where the class via does not fit (e.g. between BGA balls or in a dense LED matrix). Only used when
@@ -197,7 +202,7 @@ struct Router::Impl {
   int to_iy(Coord y) const { return static_cast<int>(std::llround(static_cast<double>(y - lat.y0) / static_cast<double>(pitch))); }
 
   void setup() {
-    obs = std::make_unique<Obstacles>(b, rules);
+    obs = std::make_unique<Obstacles>(b, rules, opt.soft_zones);
     use_cache = !obs->needs_exact_routing();
     nl = b.copper_count();
     blind_ok = opt.blind_vias && rules.minimums.allow_blind_buried_vias && nl > 2;
@@ -228,6 +233,14 @@ struct Router::Impl {
     lat = geom::Box{bb.x0 / pitch * pitch, bb.y0 / pitch * pitch, bb.x1, bb.y1};
     nx = static_cast<int>((lat.x1 - lat.x0) / pitch) + 1;
     ny = static_cast<int>((lat.y1 - lat.y0) / pitch) + 1;
+    plane_cut_factor = opt.soft_zones ? std::max(0.0, opt.plane_cut_cost) : 0;
+    if (plane_cut_factor > 0) {
+      if (!planes.build(b, {lat.x0, lat.y0}, pitch, nx, ny)) {
+        std::fprintf(stderr, "warning: plane-cut preference disabled: more than 65535 conductive zones\n");
+        emit("{\"type\":\"stage\",\"name\":\"plane-map\",\"state\":\"end\","
+             "\"detail\":\"warning: plane-cut preference disabled: more than 65535 conductive zones\"}");
+      }
+    }
     // Near-routed raster: how many routed items could conflict with a probe centred on each lattice point.
     // Points with a zero count skip the routed-copper query (a third of the search time on large boards).
     Coord probe = 0;
@@ -294,8 +307,8 @@ struct Router::Impl {
       if (!opt.only_net.empty() && b.nets[static_cast<std::size_t>(net)].name != opt.only_net) continue;
       std::vector<Cluster> groups;
       for (auto& [r, c] : cl)
-        if (!c.pads.empty()) groups.push_back(c);  // zone-only clusters (unused fills) are not targets on their own
-      if (groups.size() < 2) continue;
+        if (!c.pads.empty() || (opt.soft_zones && !c.zones.empty())) groups.push_back(c);
+      if (groups.size() < 2 || std::none_of(groups.begin(), groups.end(), [](const Cluster& c) { return !c.pads.empty(); })) continue;
       // Prim over clusters; a pad may connect to another cluster's pad or into its zone fill (plane).
       const std::size_t k = groups.size();
       std::vector<std::uint8_t> in(k, 0);
@@ -721,11 +734,15 @@ struct Router::Impl {
     for (auto [l, ci] : dst.cells) is_target[static_cast<std::size_t>(l) * cells + static_cast<std::size_t>(ci)] = 1;
     // Zone target: any cell inside the fill on its layer, with room for the track (tested lazily when reached).
     int zone_layer = -1;
+    model::LayerMask zone_layers = 0;
+    geom::Box zone_box;
     const std::vector<Point>* zone_poly = nullptr;
     if (c.zone_b >= 0) {
       const auto& z = obs->copper().items[static_cast<std::size_t>(c.zone_b)];
       zone_layer = std::countr_zero(z.layers);
       zone_poly = &z.shapes.front().pts;
+      zone_layers = z.layers;
+      zone_box = z.box;
     }
     auto target = [&](int l, std::int64_t ci) -> bool {
       auto& t = is_target[static_cast<std::size_t>(l) * cells + static_cast<std::size_t>(ci)];
@@ -812,6 +829,19 @@ struct Router::Impl {
     }
     const std::int64_t step = pitch, diag = static_cast<std::int64_t>(std::llround(static_cast<double>(pitch) * std::numbers::sqrt2));
     const std::int64_t via_cost = static_cast<std::int64_t>(opt.via_cost_mm * via_cost_mult * 1e6);
+    // A length multiplier stays pitch-independent; the previous per-cell millimetre charge made fine
+    // lattices artificially expensive and exhausted A* work budgets on board-wide pours (D61).
+    const auto plane_step = PlaneMap::scaled_penalty(step, plane_cut_factor);
+    const auto plane_diag = PlaneMap::scaled_penalty(diag, plane_cut_factor);
+    const auto plane_via = PlaneMap::scaled_penalty(via_cost, plane_cut_factor);
+    const auto blind_via_cost = via_cost * 3 / 2;
+    const auto plane_blind_via = PlaneMap::scaled_penalty(blind_via_cost, plane_cut_factor);
+    const bool use_zone_bound = zone_target && opt.soft_zones && opt.zone_target_heuristic;
+    // Any usable layer change must pay at least the cheapest enabled via kind; blocked sites and
+    // foreign-plane penalties can only raise that cost. Blind/buried-only searches pay the 3/2 premium.
+    const std::int64_t zone_layer_cost = use_zone_bound && nl > 1 && vias_ok(net) && (opt.allow_vias || blind_ok)
+                                            ? (opt.allow_vias ? via_cost : blind_via_cost)
+                                            : 0;
     // Cost-to-go field (GPU) for large windows: exact distances to the targets through cells not known to be
     // blocked by fixed copper; a lower bound on the true cost, so A* stays optimal while expanding far less.
     const bool use_field = !zone_target && opt.field_heuristic && use_cache && !fields_off &&
@@ -833,7 +863,15 @@ struct Router::Impl {
         if (v < gpu::kFieldInf) return static_cast<std::int64_t>(static_cast<double>(v) * opt.heuristic_weight);
       }
       const Point p = at(gx, gy);
-      if (zone_target) return std::int64_t{0};  // plane anywhere nearby: no useful lower bound
+      if (zone_target) {
+        if (!use_zone_bound) return std::int64_t{0};
+        // Hart, Nilsson & Raphael (1968): relaxing the target polygon to its enclosing box and
+        // ignoring obstacles/bends gives an admissible A* bound. Do not weight the plane bound.
+        const Coord dx = std::max({zone_box.x0 - p.x, p.x - zone_box.x1, Coord{0}});
+        const Coord dy = std::max({zone_box.y0 - p.y, p.y - zone_box.y1, Coord{0}});
+        const Coord mn = std::min(dx, dy), mx = std::max(dx, dy);
+        return (mx - mn) + mn * diag / step + ((zone_layers & model::layer_bit(fl)) ? 0 : zone_layer_cost);
+      }
       const std::int64_t dx = std::llabs(p.x - tp.x), dy = std::llabs(p.y - tp.y);
       const std::int64_t mn = std::min(dx, dy), mx = std::max(dx, dy);
       return static_cast<std::int64_t>(static_cast<double>((mx - mn) + mn * diag / step) * opt.heuristic_weight);  // octile distance
@@ -901,6 +939,8 @@ struct Router::Impl {
           extra = cell_cost(w, l, ncx, ncy, net, hw);
           if (extra < 0) continue;
         }
+        const auto plane_penalty = (d & 1) ? plane_diag : plane_step;
+        if (plane_penalty != 0) extra += planes.cost(l, w.x0 + ncx, w.y0 + ncy, net, plane_penalty);
         std::int64_t cost = ((d & 1) ? diag : step) + extra;
         if (dir != kNoDir && d != dir) cost += ((std::min((d - dir + 8) % 8, (dir - d + 8) % 8) == 1) ? step / 2 : 2 * step);
         const std::size_t ns = sidx(l, nci, d);
@@ -930,7 +970,9 @@ struct Router::Impl {
           const int vs = obs->via_state_span(vp, vd, vdrill, net, vm, soft, nullptr, std::min(l, l2), std::max(l, l2));
           if (vs == 2) continue;
           const std::size_t ns = sidx(l2, ci, kNoDir);
-          const std::int64_t ng = gs + via_cost * 3 / 2 + (vs == 1 ? static_cast<std::int64_t>(opt.soft_cost_mm * 1e6) : 0);
+          const std::int64_t ng = gs + blind_via_cost +
+                                  plane_via_cost(w.x0 + cx, w.y0 + cy, net, std::min(l, l2), std::max(l, l2), plane_blind_via) +
+                                  (vs == 1 ? static_cast<std::int64_t>(opt.soft_cost_mm * 1e6) : 0);
           if ((sn[ns].tag & kGenMask) == gen && sn[ns].g <= ng) continue;
           const std::int64_t hn = h(l2, w.x0 + cx, w.y0 + cy);
           if (hn >= kUnreachable) continue;
@@ -939,10 +981,11 @@ struct Router::Impl {
         }
       }
       if (vextra >= 0) {
+        const auto plane_extra = plane_via_cost(w.x0 + cx, w.y0 + cy, net, 0, nl - 1, plane_via);
         for (int l2 = 0; l2 < nl; ++l2) {
           if (l2 == l || !layer_ok(net, l2)) continue;
           const std::size_t ns = sidx(l2, ci, kNoDir);
-          const std::int64_t ng = gs + via_cost + vextra;
+          const std::int64_t ng = gs + via_cost + vextra + plane_extra;
           if ((sn[ns].tag & kGenMask) == gen && sn[ns].g <= ng) continue;
           const std::int64_t hn = h(l2, w.x0 + cx, w.y0 + cy);
           if (hn >= kUnreachable) continue;
@@ -2972,6 +3015,9 @@ struct Router::Impl {
     res.routed = best_routed;
     res.tracks = std::move(best_tracks);
     res.vias = std::move(best_vias);
+    if (opt.soft_zones)
+      for (std::size_t ci = 0; ci < cs.size(); ++ci)
+        if (!best_unrouted[ci] && cs[ci].c.zone_b >= 0) ++res.plane_connections;
     // Failures relative to the best state are approximated by the connections unrouted at the end.
     for (std::size_t ci = 0; ci < cs.size(); ++ci) {
       const auto& st = cs[ci];

@@ -49,6 +49,12 @@
   `A.intersectsArea(...)`, `A.isPlated()`, `A.Pad_Type`, `A.Reference`, boolean `&& || !`. Others later.
 - The router also enforces `disallow track/via` by net and layer, and `physical_hole_clearance` against fixed
   copper (doc 05 §16). Positional `disallow` rules are warned and left to the DRC.
+- Numeric conditions support `< <= > >=`, unit literals (`mm`, `mil`, `in`) and local pad copper dimensions
+  `Size_X` / `Size_Y`; rotation does not change these dimensions (doc 05 §19).
+- `route --keep-vias-off-pads [MM]` appends a synthetic, net-independent `physical_hole_clearance` rule to a
+  route-only rules copy. Project files, the output board's rules and `tracemaker drc` are unchanged.
+  Compilation failure of a synthetic rule is an error, not an ignored warning. KiCad checks this preference
+  only when the user adds the equivalent rule in doc 05 §19 to the board's `.kicad_dru`.
 
 ## 5. IPC plugin (`kicad_plugin/`)
 
@@ -101,6 +107,10 @@ kicad-cli pcb drc --format json --severity-all --all-track-errors --exit-code-vi
 - Footprint flips mirror pad layers and change rotation conventions; test flips against KiCad's output.
 - KiCad rotation is counter-clockwise in a y-down coordinate system (see `pcbgolf/placer.py` `rot_pt`).
 - Zones must be refilled after routing; never write stale fills (use `--refill-zones` for the judge).
+- With `route --soft-zones` (doc 05 §18, D61), only original fills intersected by new foreign-net copper lose
+  their `filled_polygon` nodes; every untouched zone remains byte-identical. The route log and JSON summary
+  report plane connections and zones needing refill. The engine's pre-refill connectivity is provisional:
+  run the command in §6 and require zero unconnected items and no added errors before accepting the result.
 - Net-class assignment can come from the schematic (directives), pattern rules in `.kicad_pro`, or the
   board; resolve in KiCad's priority order.
 - Locked items (`locked` flag) and user groups must never move or be ripped.

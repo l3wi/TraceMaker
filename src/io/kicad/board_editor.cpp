@@ -6,6 +6,7 @@
 #include <cstdio>
 
 #include "core/rng.hpp"
+#include "geom/shape.hpp"
 
 namespace tmk::io {
 
@@ -67,6 +68,37 @@ void BoardEditor::add_via(const model::Via& v) {
 
 void BoardEditor::remove_track(std::size_t index) { lb_.doc.remove(lb_.board.tracks.at(index).node); }
 void BoardEditor::remove_via(std::size_t index) { lb_.doc.remove(lb_.board.vias.at(index).node); }
+
+int BoardEditor::invalidate_zone_fills(const std::vector<model::Track>& tracks, const std::vector<model::Via>& vias) {
+  struct NewCopper { model::NetId net; model::LayerMask layers; geom::Shape shape; };
+  std::vector<NewCopper> copper;
+  copper.reserve(tracks.size() + vias.size());
+  for (const auto& t : tracks) copper.push_back({t.net, model::layer_bit(t.layer), geom::Shape::segment(t.a, t.b, t.width / 2)});
+  for (const auto& v : vias) {
+    model::LayerMask layers = 0;
+    for (int l = v.layer_top; l <= v.layer_bottom; ++l) layers |= model::layer_bit(l);
+    copper.push_back({v.net, layers, geom::Shape::point(v.pos, v.size / 2)});
+  }
+  int invalidated = 0;
+  // KiCad pcb drc --refill-zones is the connectivity judge: never emit a stale polygon intersected by new
+  // foreign copper, but retain the complete original bytes of every other zone (doc 08, D61).
+  for (const auto& z : lb_.board.zones) {
+    if (z.rule_area || z.node == kNoNode) continue;
+    bool cut = false;
+    for (const auto& [layer, pts] : z.fills) {
+      const auto fill = geom::Shape::polygon(pts);
+      for (const auto& c : copper) {
+        if ((z.net != 0 && z.net == c.net) || !(c.layers & model::layer_bit(layer)) || !fill.box.intersects(c.shape.box)) continue;
+        if (geom::closer_than(fill, c.shape, 1)) { cut = true; break; }
+      }
+      if (cut) break;
+    }
+    if (!cut) continue;
+    for (const auto node : lb_.doc.find_all(z.node, "filled_polygon")) lb_.doc.remove(node);
+    ++invalidated;
+  }
+  return invalidated;
+}
 
 void BoardEditor::move_footprint(std::size_t index, model::Point pos, double angle) {
   auto& doc = lb_.doc;

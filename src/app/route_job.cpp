@@ -11,6 +11,8 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <optional>
+#include <stdexcept>
 
 #include "crules/engine.hpp"
 #include "drc/copper.hpp"
@@ -91,6 +93,24 @@ int default_gpu_device(bool use_gpu) {
   return devs.empty() ? -1 : devs.front().cuda_index;
 }
 
+model::CustomRule keep_vias_off_pads_rule(const model::DesignRules& rules, Coord threshold) {
+  if (threshold <= 0) throw std::invalid_argument("keep-vias-off-pads size must be positive");
+  Coord margin = 0;
+  for (const auto& nc : rules.classes) {
+    const auto via = route::class_via(rules, nc);
+    margin = std::max(margin, (std::max<Coord>(0, via.diameter - via.drill) + 1) / 2 + nc.clearance);
+  }
+  model::CustomRule rule;
+  rule.name = "TraceMaker keep vias off small SMD pads";
+  rule.origin = model::RuleOrigin::Synthetic;
+  // KiCad physical_hole_clearance measures from the drill, so include the copper annulus (rounded up).
+  // https://docs.kicad.org/10.0/en/pcbnew/pcbnew.html#custom-design-rules
+  rule.condition = "A.Type == 'Via' && B.Type == 'Pad' && B.Pad_Type == 'SMD' && B.Size_X < " +
+                   std::to_string(threshold) + " && B.Size_Y < " + std::to_string(threshold);
+  rule.constraints.push_back({"physical_hole_clearance", margin, {}, {}, {}});
+  return rule;
+}
+
 RouteJobResult run_route_job(RouteJob job) {
   auto log = [&](const std::string& line) {
     if (job.log) job.log(line);
@@ -98,6 +118,15 @@ RouteJobResult run_route_job(RouteJob job) {
   auto& opt = job.opt;
   auto lb = io::read_board_file(job.in);
   const auto rules = io::read_design_rules(job.in);
+  // No copy or extra rule-engine construction with the preference off; DRC and project files stay unchanged.
+  std::optional<model::DesignRules> route_rules;
+  if (opt.keep_vias_off_pads > 0) {
+    route_rules = rules;
+    route_rules->custom.push_back(keep_vias_off_pads_rule(rules, opt.keep_vias_off_pads));
+    log(fmt("keep vias off SMD pads smaller than %.6f mm; physical hole margin %.6f mm (route only)",
+            nm_to_mm(opt.keep_vias_off_pads), nm_to_mm(*route_rules->custom.back().constraints.front().min)));
+  }
+  const auto& routing_rules = route_rules ? *route_rules : rules;
   const std::string name = std::filesystem::path(job.in).filename().string();
   RouteJobResult out;
   std::unique_ptr<server::ViewerServer> server;
@@ -212,7 +241,7 @@ RouteJobResult run_route_job(RouteJob job) {
     std::vector<int> pick;
     if (kb && variants < route::portfolio_size()) pick = kb->choose_variants(feat, route::portfolio_size(), variants, opt.seed);
     log(fmt("portfolio: %d variants on %d thread%s", variants, std::min(threads, variants), std::min(threads, variants) == 1 ? "" : "s"));
-    auto pr = route::route_portfolio(*route_board, rules, opt, variants, pick, threads);
+    auto pr = route::route_portfolio(*route_board, routing_rules, opt, variants, pick, threads);
     for (std::size_t i = 0; i < pr.variants.size(); ++i)
       log(fmt("  variant %d %-30s routed %d in %.1f s%s", pr.indices[i], pr.variants[i].c_str(), pr.routed[i], pr.seconds[i],
               static_cast<int>(i) == pr.best_variant ? "  <- best" : ""));
@@ -221,7 +250,7 @@ RouteJobResult run_route_job(RouteJob job) {
     best_name = pr.variants[static_cast<std::size_t>(pr.best_variant)];
     res = std::move(pr.best);
   } else {
-    res = route::Router(*route_board, rules, opt).run();
+    res = route::Router(*route_board, routing_rules, opt).run();
     ran = {0};
   }
   if (kb) {
@@ -230,8 +259,13 @@ RouteJobResult run_route_job(RouteJob job) {
     for (const auto& u : res.unrouted) failed.push_back({u.net, u.a, u.b, 1});
     kb->record_failures(feat.hash, failed);
   }
+  io::BoardEditor ed(lb, opt.seed);
+  if (opt.soft_zones) {
+    res.zones_needing_refill = ed.invalidate_zone_fills(res.tracks, res.vias);
+    log(fmt("soft zones: %d plane connections, %d zones need refill", res.plane_connections, res.zones_needing_refill));
+    if (!job.out.empty()) log("refill and sign off: kicad-cli pcb drc --refill-zones --output drc.json \"" + job.out + "\"");
+  }
   if (!job.out.empty()) {
-    io::BoardEditor ed(lb, opt.seed);
     for (const auto& t : res.tracks) ed.add_track(t);
     for (const auto& v : res.vias) ed.add_via(v);
     ed.save(job.out);
@@ -247,6 +281,10 @@ RouteJobResult run_route_job(RouteJob job) {
                  {"vias", res.vias.size()},  {"seconds", res.seconds},         {"expansions", res.expansions},
                  {"pitch_mm", nm_to_mm(res.pitch)}, {"failures", res.failures}, {"variant", best_index}, {"variant_name", best_name},
                  {"escape_corridors", res.escape_corridors}};
+  if (opt.soft_zones) {
+    out.summary["plane_connections"] = res.plane_connections;
+    out.summary["zones_needing_refill"] = res.zones_needing_refill;
+  }
   // Differential pairs (doc 05 §15): how each wanted pair came out, measured on the new copper (only when pairs are on).
   if (opt.diff_pairs || !opt.pair_nets.empty()) {
     const auto cm = drc::build_copper(lb.board);

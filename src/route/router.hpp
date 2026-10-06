@@ -4,6 +4,7 @@
 //
 // Octilinear A* on a fine lattice (optimal under its cost model), with legality decided lazily by exact
 // clearance tests against the DRC's rule engine, then exact verification of every committed segment and via.
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <string>
@@ -14,6 +15,17 @@
 #include "model/rules.hpp"
 
 namespace tmk::route {
+
+struct ClassVia {
+  Coord diameter, drill;
+};
+
+// KiCad's board minimums raise the class drill, diameter and annular ring together.
+// https://docs.kicad.org/10.0/en/pcbnew/pcbnew.html#configuring_design_rules
+inline ClassVia class_via(const model::DesignRules& rules, const model::NetClass& nc) {
+  const Coord drill = std::max(nc.via_drill, rules.minimums.through_hole_diameter);
+  return {std::max({nc.via_diameter, rules.minimums.via_diameter, drill + 2 * rules.minimums.via_annular_width}), drill};
+}
 
 struct RouterOptions {
   Coord pitch = 0;              // lattice pitch; 0 = automatic from net-class widths and clearances
@@ -35,6 +47,9 @@ struct RouterOptions {
   int soft_attempts = 3;        // window sizes tried by negotiated searches
   double via_cost_mm = 3.0;     // equivalent track length of one via
   bool allow_vias = true;
+  bool soft_zones = false;      // zone fills are refillable, not fixed routing obstacles (D61)
+  double plane_cut_cost = 0;    // dimensionless foreign-plane surcharge on geometric step/via costs
+  bool zone_target_heuristic = true;  // false selects the zero-heuristic reference for soft plane targets
   bool rip_up = true;           // negotiated rip-up and reroute (design doc 05 §6 rung R2, doc 06 §3)
   int max_rips_per_connection = 8;
   int max_passes = 12;          // passes over still-unrouted connections
@@ -46,6 +61,8 @@ struct RouterOptions {
   // Intra-pair skew limit for pairs routed coupled (0 = only KiCad custom `skew` rules): the shorter half gets meanders
   // in the clean-up until the halves differ by at most half of it (length tuning code, doc 05 §15).
   Coord pair_skew = 0;
+  // Route-job-only preference (doc 05 §19): 0 off; otherwise both SMD copper dimensions must be below this.
+  Coord keep_vias_off_pads = 0;
   bool global_route = false;    // plan every connection on a coarse tile graph first; detailed search follows the corridors
   // Global router v2 (M6): the first search of each connection is confined to its corridor (cells outside are
   // blocked, window cropped to the corridor); only if that fails do the usual unconfined windows run.
@@ -88,6 +105,8 @@ struct RouteResult {
   std::vector<model::Track> tracks;  // new copper, in commit order
   std::vector<model::Via> vias;
   int connections = 0, routed = 0;
+  int plane_connections = 0;    // routed connections whose target is a zone fill
+  int zones_needing_refill = 0;
   long expansions = 0;
   int rips = 0, passes = 0;
   int enclosed = 0;             // searches that proved the source boxed in (no larger window tried)

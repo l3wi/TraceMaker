@@ -48,6 +48,9 @@ struct RouteJobResult {
 // Throws std::exception on unreadable input.
 RouteJobResult run_route_job(RouteJob job);
 
+// Route-only synthetic physical-hole constraint; threshold is the local SMD size limit in nm (D62).
+model::CustomRule keep_vias_off_pads_rule(const model::DesignRules& rules, Coord threshold);
+
 // The CUDA device the CLI uses for cost-to-go fields: the first listed device, or -1 (none, or `use_gpu` false).
 int default_gpu_device(bool use_gpu);
 
