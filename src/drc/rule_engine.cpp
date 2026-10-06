@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <initializer_list>
+#include <limits>
 #include <string_view>
 
 namespace tmk::drc {
@@ -162,6 +163,13 @@ class Condition {
       n->lit.k = Value::K::Num;
       n->lit.n = number * scale;
       if (!std::isfinite(n->lit.n)) throw std::runtime_error("invalid number");
+      if (unit == "mm" || unit == "mil" || unit == "in") {
+        if (n->lit.n < static_cast<double>(std::numeric_limits<Coord>::min()) ||
+            n->lit.n >= static_cast<double>(std::numeric_limits<Coord>::max()))
+          throw std::runtime_error("length literal out of range");
+        // Match integer-nm geometry at exact boundaries despite decimal-to-binary conversion error.
+        n->lit.n = static_cast<double>(std::llround(n->lit.n));
+      }
       return n;
     }
     // Identifier: A.Prop, B.func(args), or a bare word (true/false).
