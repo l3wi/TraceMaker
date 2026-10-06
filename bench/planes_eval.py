@@ -1,67 +1,43 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Plane-aware routing evaluation (doc 05 §18-19): KiCad demo projects routed without and with --soft-zones and
---keep-vias-off-pads, each judged by KiCad after a zone refill.
+--keep-vias-off-pads, judged by KiCad after a zone refill and scored against the demos' own hand routing.
 
-  bench/planes_eval.py TRACEMAKER_BINARY [--work 2000000] [--demos DIR/NAME ...] [--configs NAME=ARGS ...]
+  bench/planes_eval.py TRACEMAKER_BINARY [--work 2000000] [--demos DIR/NAME ...] [--pcbench NAME ...]
+                       [--configs NAME=ARGS ...] [--no-original] [--out build/planes_eval]
 
-Boards are the demos' own projects with tracks and vias removed (bench/speed_ab.py prepare_demo), so their net
-classes, custom rules and zones apply. Per board and configuration: routed connections, added vias, plane
-connections, zones needing refill, and from `kicad-cli pcb drc --refill-zones` the unconnected items and the
-errors added relative to the stripped input (unconnected items excluded). Vias touching an SMD pad smaller than
---small-pad-mm in both dimensions are counted with KiCad's own shapes when KiCad's Python (pcbnew) is available
-(TM_KICAD_PYTHON, or the macOS KiCad.app default).
+Demo boards are the demos' own projects with tracks and vias removed (bench/speed_ab.py prepare_demo), so their
+net classes, custom rules and zones apply. PCBench boards route the fixture's unrouted.kicad_pcb (zones already
+removed by PCBench, so they test signal routing only) against the human raw.kicad_pcb. The hand-routed original
+is scored the same way, labelled "original", as a guide: it is judged by the same rules and can lose. Each board
+becomes a metric record (bench/quality.py record(): KiCad DRC after a zone refill, per-net geometry, plane
+metrics before and after routing), written to OUT/records/BOARD.json and scored by bench/score.py. KiCad's
+Python (pcbnew) is needed for the plane and small-pad metrics (TM_KICAD_PYTHON, or the macOS KiCad.app
+default); without it those are null.
 """
 import argparse
-import collections
 import json
-import os
 import pathlib
+import shutil
 import subprocess
 
+import quality
+import score
 from speed_ab import prepare_demo
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+PCBENCH = ROOT / "bench/data/freerouting/scripts/benchmark/fixtures/PCBench"
 DEMOS = ["stickhub/StickHub", "multichannel/multichannel_mixer", "interf_u/interf_u", "pic_programmer/pic_programmer",
          "complex_hierarchy/complex_hierarchy", "royalblue54L_feather/RoyalBlue54L-Feather", "cm5_minima/CM5_MINIMA_3",
          "kit-dev-coldfire-xilinx_5213/kit-dev-coldfire-xilinx_5213"]
 CONFIGS = ["base=", "soft=--soft-zones", "soft+vop=--soft-zones --keep-vias-off-pads"]
-KICAD_PYTHON = os.environ.get("TM_KICAD_PYTHON",
-                              "/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3")
-SMALL_PAD_VIAS = """
-import sys, pcbnew
-b = pcbnew.LoadBoard(sys.argv[1])
-limit = int(float(sys.argv[2]) * 1e6)
-pads = [p for p in b.GetPads() if p.GetAttribute() == pcbnew.PAD_ATTRIB_SMD]
-n = 0
-for v in b.GetTracks():
-    if v.Type() != pcbnew.PCB_VIA_T:
-        continue
-    for p in pads:
-        layer = pcbnew.F_Cu if p.IsOnLayer(pcbnew.F_Cu) else pcbnew.B_Cu
-        size = p.GetSize(layer)
-        if size.x >= limit or size.y >= limit or not v.IsOnLayer(layer):
-            continue
-        if p.GetEffectiveShape(layer).Collide(v.GetEffectiveShape(layer), 0):
-            n += 1
-            break
-print(n)
-"""
 
 
-def kicad_drc(pcb: pathlib.Path) -> tuple[collections.Counter, int]:
-    out = pcb.with_suffix(".drc.json")
-    subprocess.run(["kicad-cli", "pcb", "drc", "--refill-zones", "--severity-error", "--format", "json", "--output", str(out),
-                    str(pcb)], capture_output=True, check=False)
-    rep = json.loads(out.read_text())
-    return collections.Counter(v["type"] for v in rep.get("violations", [])), len(rep.get("unconnected_items", []))
-
-
-def small_pad_vias(pcb: pathlib.Path, limit_mm: float) -> int | None:
-    if not pathlib.Path(KICAD_PYTHON).exists():
-        return None
-    p = subprocess.run([KICAD_PYTHON, "-c", SMALL_PAD_VIAS, str(pcb), str(limit_mm)], capture_output=True, text=True)
-    return int(p.stdout.strip()) if p.returncode == 0 and p.stdout.strip().isdigit() else None
+def copy_project(src: pathlib.Path, dst: pathlib.Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    for ext in (".kicad_pcb", ".kicad_pro", ".kicad_dru"):  # KiCad's DRC reads the rules next to the board
+        if src.with_suffix(ext).exists() and (ext != ".kicad_pcb" or src != dst):
+            shutil.copyfile(src.with_suffix(ext), dst.with_suffix(ext))
 
 
 def main() -> int:
@@ -69,42 +45,45 @@ def main() -> int:
     ap.add_argument("binary")
     ap.add_argument("--work", type=int, default=2_000_000)
     ap.add_argument("--demos", nargs="*", default=DEMOS)
+    ap.add_argument("--pcbench", nargs="*", default=[], help="PCBench fixture names")
     ap.add_argument("--small-pad-mm", type=float, default=2.0)
     ap.add_argument("--configs", nargs="*", default=CONFIGS, help="NAME=ARGS (args space-separated)")
+    ap.add_argument("--no-original", action="store_true", help="do not score the hand-routed originals")
     ap.add_argument("--out", default=str(ROOT / "build/planes_eval"))
     a = ap.parse_args()
+    quality.TM = pathlib.Path(a.binary)  # `tracemaker inspect` for the geometry metrics
     out = pathlib.Path(a.out)
-    rows = []
-    for demo in a.demos:
-        board = prepare_demo(demo, out)
-        base_errors, _ = kicad_drc(board)
+    (out / "records").mkdir(parents=True, exist_ok=True)
+    records = []
+    boards = [(prepare_demo(d, out), ROOT / "bench/data/kicad/demos" / f"{d}.kicad_pcb") for d in a.demos]
+    for name in a.pcbench:
+        inp = out / "pcbench" / f"{name}.kicad_pcb"
+        inp.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(PCBENCH / name / "unrouted.kicad_pcb", inp)
+        boards.append((inp, PCBENCH / name / "raw.kicad_pcb"))
+    for board, hand in boards:
+        recs = []
+        if not a.no_original:
+            orig = out / "original" / board.name
+            copy_project(hand, orig)
+            recs.append(quality.record(board, orig, "original", hand=True, small_pad_mm=a.small_pad_mm))
         for cfg, args in [(c.split("=", 1)[0], c.split("=", 1)[1].split() if "=" in c else []) for c in a.configs]:
             pcb, summary = out / cfg / board.name, out / cfg / f"{board.stem}.json"
-            pcb.parent.mkdir(parents=True, exist_ok=True)
-            for ext in (".kicad_pro", ".kicad_dru"):  # KiCad's DRC reads the rules next to the board
-                if board.with_suffix(ext).exists():
-                    pcb.with_suffix(ext).write_bytes(board.with_suffix(ext).read_bytes())
+            copy_project(board, pcb)
             subprocess.run([a.binary, "route", str(board), "-o", str(pcb), "--json", str(summary), "--work", str(a.work), "--time",
                             "3600", "--threads", "1", "--variants", "1", "--no-kb", "--no-gpu"] + args, capture_output=True, check=False)
             s = json.loads(summary.read_text())
-            errors, unconnected = kicad_drc(pcb)
-            added = sum(max(0, n - base_errors[t]) for t, n in errors.items())
-            rows.append({"board": board.stem, "config": cfg, "routed": s["routed"], "connections": s["connections"],
-                         "vias": s["vias"], "plane_connections": s.get("plane_connections", 0),
-                         "zones_needing_refill": s.get("zones_needing_refill", 0), "unconnected_after_refill": unconnected,
-                         "added_errors": added, "added_by_type": {t: n - base_errors[t] for t, n in errors.items() if n > base_errors[t]},
-                         "small_pad_vias": small_pad_vias(pcb, a.small_pad_mm)})
-            r = rows[-1]
-            print(f"{r['board']} {cfg}: routed {r['routed']}/{r['connections']}, vias {r['vias']}, unconnected after refill "
-                  f"{unconnected}, added errors {added}, small-pad vias {r['small_pad_vias']}", flush=True)
-    (out / "summary.json").write_text(json.dumps({"work": a.work, "rows": rows}, indent=1))
-    print("\n| Board | Config | Routed | Vias | Plane connections | Zones to refill | Unconnected after refill | Added errors | "
-          "Vias on small pads |")
-    print("|---|---|--:|--:|--:|--:|--:|--:|--:|")
-    for r in rows:
-        print(f"| {r['board']} | {r['config']} | {r['routed']}/{r['connections']} | {r['vias']} | {r['plane_connections']} | "
-              f"{r['zones_needing_refill']} | {r['unconnected_after_refill']} | {r['added_errors']} | "
-              f"{'–' if r['small_pad_vias'] is None else r['small_pad_vias']} |")
+            rec = quality.record(board, pcb, cfg, small_pad_mm=a.small_pad_mm)
+            rec["router"] = {k: s.get(k) for k in ("routed", "connections", "plane_connections", "zones_needing_refill", "seconds")}
+            rec["router"]["args"] = args
+            recs.append(rec)
+        for r in recs:
+            print(f"{r['board']} {r['label']}: unconnected {r.get('unconnected')}, added errors {r.get('added_errors')}", flush=True)
+        (out / "records" / f"{board.stem}.json").write_text(json.dumps(recs, indent=1))
+        records += recs
+    (out / "summary.json").write_text(json.dumps({"work": a.work, "configs": a.configs, "records": [r["file"] for r in records]}, indent=1))
+    print()
+    print(score.markdown(records, hand_label=None if a.no_original else "original"))
     return 0
 
 

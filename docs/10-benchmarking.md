@@ -21,21 +21,89 @@ and never redistributes them.
 
 ### Building unrouted fixtures
 
-`bench/tools/strip.py` removes `segment`/`arc`/`via` nodes (keeping locked ones and zones), and for the
-place-and-route set also resets unlocked footprint positions to a pile outside the outline (what KiCad's
-"Update PCB from Schematic" produces).
+`bench/prepare_dac2020.py` `strip_routing` removes top-level `segment`/`arc`/`via` items and teardrop zones
+(KiCad generates those from the tracks; left behind they are stray copper on the pads, and on the
+complex_hierarchy demo they cost 74 of 87 connections), keeping everything else, zones included, byte for
+byte. For the place-and-route set unlocked footprints are also reset to a pile outside the outline (what
+KiCad's "Update PCB from Schematic" produces).
 
 ## 2. Metrics per board
 
 | Metric | Definition |
 |---|---|
-| **Clean pass** | 100% connections routed **and** zero added KiCad DRC errors (input vs output, `kicad-cli pcb drc`) |
+| **Clean pass** | 100% connections routed **and** zero added KiCad DRC errors (input vs output, `kicad-cli pcb drc --refill-zones`: saved fills predate the routing, D63) |
 | Completion | routed connections / routable connections (excluding pins proved dead) |
 | Added DRC errors | by KiCad violation type |
 | Vias, wirelength, bends | totals; also normalised to the reference routing where it exists |
 | Wall time, work units | engine-reported, with hardware recorded |
 | Placement (P&R set) | HPWL, lower-bound gap, crossings, courtyard overlaps (must be 0), moved parts |
 | Determinism | output hash per board at 1 and N threads, GPU on/off |
+
+### Routing quality score
+
+**Before:** totals alone reward unfinished routing: less copper, fewer vias and undamaged planes.
+Hand routing is useful context, not an optimum or a guaranteed legal board.
+
+**What was built:** `bench/quality.py` supplies refilled metric records; `bench/score.py` scores them without
+running KiCad. Compare the lexicographic key `(added_errors > 0, added_errors, unconnected)` first (lower
+wins). Any added routing-relevant DRC error fails legality; among failures fewer errors wins. Completion
+comes next, so smaller geometry never compensates for a missing connection. Only equal tiers use quality.
+Let `C = connections - unconnected`, `positive(x) = max(0, x)`, and
+`P = sum(w * term / scale) / sum(available w)`. Quality is `Q = 100 / (1 + P)` (higher is better).
+Signal, plane and DFM sub-scores use the same formula on their own terms.
+
+| Term | Weight | Scale | Evidence / rationale |
+|---|--:|--:|---|
+| Signal length / pad-centre MST, on complete non-plane nets open in input | 25 | 1 | [ISPD 2018/19](https://ispd.cc/contests/19/metrics_and_ranking.pdf), [PCBench baseline metrics](https://raw.githubusercontent.com/PCBench/PCBench/main/Baselines/Results_all.csv): physical length cost; never include unfinished-net MST or plane paths |
+| Vias / C | 10 | 1 | Same sources: transition/fabrication cost per delivered connection |
+| Positive increase in over-gap length / plane-adjacent length | 20 | 0.1 | [TI SLLA414A §3.5](https://www.ti.com/document-viewer/lit/html/SLLA414A/GUID-8285BF1D-20A9-413F-8564-77FF08AAF484): return-path continuity |
+| Sum of positive plane coverage losses / sum of input coverage | 15 | 0.1 | [Plane design guidance](https://resources.altium.com/p/ground-plane-design-and-arrangement-high-performance-pcbs): preserve the input's own reference copper |
+| Positive added fill islands / C | 10 | 0.1 | Same guidance: fragmentation beyond existing geometry |
+| Positive added plane crossings by vias of another net / C | 5 | 1 | Coarse perforation-pressure proxy: each is an antipad; same-net stitching vias are not counted |
+| Small-SMD-pad vias / C | 10 | 0.1 | [IPC-4761 protection classes](https://www.electronics.org/TOC/IPC-4761.pdf), [solder wicking](https://www.eurocircuits.com/technical-guidelines/pcb-assembly-guidelines/solder-escape-wick/): assembly-risk/cost proxy, not proof that a protected via-in-pad is illegal |
+| (Sharp bends + sharp pad junctions) / C | 2 | 1 | [Acute-angle manufacturing check](https://www.altium.com/documentation/cstu/acute-angle): weak DFM proxy, not every right-angle corner is an acid trap |
+| Narrowed length / total track length | 2 | 0.1 | Length-normalised bottleneck/current/impedance proxy; allowed neckdowns are not added DRC errors |
+| 1 - differential-pair coupled share, where measured | 1 | 0.1 | [High-speed design checks](https://www.altium.com/documentation/altium-designer/pcb/high-speed-design): diagnostic, not impedance/skew sign-off |
+
+Weights/scales are **TraceMaker policy**, not IPC thresholds or transplanted VLSI contest coefficients.
+All plane deltas use the record's own refilled stripped-input `planes_input`; match by `(net, layer)`,
+with missing output planes treated as lost coverage. Existing plane damage earns no negative penalty.
+Duplicate plane keys use mean coverage and summed islands because the records lack polygon identities.
+An input with zero adjacent-track exposure and zero gap defines baseline gap share zero.
+
+No completed connection means quality is unavailable. Missing evidence and zero denominators remain null,
+never perfect; report `available_weight` and `missing_terms`. Scores with different measured-term sets are
+not directly comparable. `compare()` uses mutually available terms and matched nets open in input and
+complete in both outputs, excluding plane nets in either board, for length/via/detour ratios. Its matched
+via denominator is `sum(pads - 1)`,
+an explicit pad-tree connection proxy, not a KiCad missing-item count. Plane/DFM terms remain board-level.
+Pad-centre MST is a topology proxy, not a geometric lower bound; Steiner sharing and pad edges can yield
+detour below one. Rational arithmetic decides verdicts; `quality_milli` is half-up-rounded `1000 * Q`.
+
+Hand originals use the identical function and can lose. `versus_hand()` reports each term ratio, with null
+and an explicit status for zero hand denominators; similarity to the original is never rewarded.
+`python3 bench/score.py RECORD.json [RECORD.json ...] --hand original --md` prints a grouped table;
+each file may hold one record or a list. `markdown(records, hand_label="original")` supplies the same
+report to callers and displays failed judges without fabricating metrics.
+
+**Results** (`bench/planes_eval.py`, 10M work units, one variant, 1 thread; 8 KiCad demos with their own
+rules and zones, and 9 PCBench quick-tier boards, whose fixtures have no zones, against `raw.kicad_pcb`).
+Open = unconnected after refill; Q = quality (higher is better, diagnostic within a tier); matched = track
+length on nets both boards completed, candidate / hand.
+
+| Board | Hand: legal, Q | Best TraceMaker (open, Q) | Matched length | Verdict |
+|---|---|---|--:|---|
+| complex_hierarchy | yes, 39.6 | base 0 open, 50.3; soft 0, 48.7 | 0.92 / 0.80 | TraceMaker (plane cost 1.26 vs 2.34) |
+| multichannel_mixer | **24 clearance errors** | base 11, 55.8 | 0.98 | TraceMaker (hand illegal) |
+| RoyalBlue54L-Feather | **2 errors** | soft 87, 34.9; soft+vop 92, 48.7 | 0.92 | TraceMaker (hand illegal) |
+| pic_programmer, StickHub, interf_u, CM5, ColdFire | yes, 31–44 | 10–155 open | 0.85–1.27 | hand (complete) |
+| 9 PCBench boards | 7 legal; 2 with 9–10 errors | all 0 open, Q 52.7–64.8 | 0.68–1.00 | TraceMaker 8 (kika only with `--keep-vias-off-pads`), hand 1 (scimpy: no vias against TraceMaker's 0.10 per connection) |
+
+Soft zones cut open connections on the multilayer boards (CM5 118 → 82, StickHub 31 → 14, ColdFire
+415 → 155, RoyalBlue 112 → 87) but put 0.16–0.78 vias per delivered connection in small SMD pads (DFM cost
+1.1–5.7); `--keep-vias-off-pads` removes nearly all of them (DFM 0.01–0.5) for at most 10 more open
+connections. With the teardrop zones left in the demo inputs, complex_hierarchy routed 15–25 % under the
+same judge: a fixture artefact, not a router limit.
 
 ## 3. Baselines
 
