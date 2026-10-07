@@ -274,14 +274,20 @@ TEST_CASE("Width comparisons with explicit KiCad units retain their previous res
   CHECK_FALSE(matches("A.Width == 0.2"));
 }
 
-TEST_CASE("length literals round to integer nm at pad and Width comparison boundaries", "[rules]") {
-  const Files f("literal_rounding", board_text(""), "");
+TEST_CASE("project length literals retain KiCad doubles while synthetic literals use integer nm", "[rules]") {
+  const Files f("literal_boundaries", board_text(""), "");
   auto lb = io::read_board_file(f.pcb.string());
   const auto base_rules = io::read_design_rules(f.pcb.string());
-  for (const auto& [size, literal] : {std::pair<Coord, const char*>{1'001'000, "1.001mm"},
-                                    {290'000, "0.29mm"}, {2'000'000, "2mm"}, {999'999'000, "999.999mm"},
-                                    {1'001'000, "39.40944881889764mil"}, {1'001'000, "0.03940944881889764in"},
-                                    {1'001'000, "1.0010004mm"}}) {
+  // Comparison is size versus the unrounded KiCad double: -1 less, 0 equal, +1 greater.
+  for (const auto& [size, literal, comparison] : {std::tuple<Coord, const char*, int>{1'001'000, "1.001mm", 1},
+                                                {290'000, "0.29mm", 0}, {200'000, "0.2mm", 0},
+                                                {2'000'000, "2mm", 0}, {999'999'000, "999.999mm", 0},
+                                                {1'001'000, "39.40944881889764mil", 0},
+                                                {1'001'000, "0.03940944881889764in", 0},
+                                                {1'001'000, "1.0010004mm", -1},
+                                                {1'001'000, "39.40946456692913mil", -1},
+                                                {1'001'000, "0.039409464566929134in", -1},
+                                                {1'001'000, "1.0010000000000001mm", -1}}) {
     CAPTURE(size, literal);
     lb.board.pads[0].size_x = lb.board.pads[0].size_y = size;
     const auto copper = drc::build_copper(lb.board);
@@ -293,9 +299,10 @@ TEST_CASE("length literals round to integer nm at pad and Width comparison bound
     track.kind = drc::ItemKind::Track;
     track.net = 1;
     track.width = size;
-    auto matches = [&](const std::string& expr) {
+    auto matches = [&](const std::string& expr, model::RuleOrigin origin = model::RuleOrigin::Project) {
       auto rules = base_rules;
       model::CustomRule rule;
+      rule.origin = origin;
       rule.condition = "A.Type == 'Track' && B.Type == 'Pad' && (" + expr + ")";
       rule.constraints.push_back({"physical_hole_clearance", 50'000, {}, {}, {}});
       rules.custom.push_back(rule);
@@ -305,11 +312,15 @@ TEST_CASE("length literals round to integer nm at pad and Width comparison bound
     };
     for (const std::string prop : {"B.Size_X", "B.Size_Y", "A.Width"}) {
       CAPTURE(prop);
-      CHECK(matches(prop + " <= " + literal));
-      CHECK(matches(prop + " >= " + literal));
-      CHECK(matches(prop + " == " + literal));
-      CHECK_FALSE(matches(prop + " < " + literal));
-      CHECK_FALSE(matches(prop + " > " + literal));
+      CHECK(matches(prop + " <= " + literal) == (comparison <= 0));
+      CHECK(matches(prop + " >= " + literal) == (comparison >= 0));
+      CHECK(matches(prop + " == " + literal) == (comparison == 0));
+      CHECK(matches(prop + " != " + literal) == (comparison != 0));
+      CHECK(matches(prop + " < " + literal) == (comparison < 0));
+      CHECK(matches(prop + " > " + literal) == (comparison > 0));
+      CHECK(matches(prop + " == " + literal, model::RuleOrigin::Synthetic));
+      CHECK_FALSE(matches(prop + " < " + literal, model::RuleOrigin::Synthetic));
+      CHECK_FALSE(matches(prop + " > " + literal, model::RuleOrigin::Synthetic));
     }
     CHECK(matches("0.0015ps == 1.5 && 1.5fs == 1.5 && 1.5deg == 1.5"));
     if (size == 1'001'000) {
@@ -375,6 +386,39 @@ TEST_CASE("synthetic pad rule clears whole via copper on cached and reference pa
   CHECK(stronger.via_state({5'000'000, 3'000'000}, 600'000, 300'000, 1, 0, false) == 2);
 }
 
+TEST_CASE("synthetic pad margin covers the larger annulus of a neck-down via", "[rules][route]") {
+  const Files f("neck_via_margin", board_text(""), "");
+  auto lb = io::read_board_file(f.pcb.string());
+  auto rules = io::read_design_rules(f.pcb.string());
+  rules.classes.front().via_diameter = 1'000'000;
+  rules.classes.front().via_drill = 800'000;
+  rules.classes.front().clearance = 100'000;
+  rules.minimums.via_diameter = 800'000;
+  rules.minimums.through_hole_diameter = 200'000;
+  rules.minimums.via_annular_width = 100'000;
+  const auto normal = route::class_via(rules, rules.default_class());
+  CHECK(normal.diameter == 1'000'000);
+  CHECK(normal.drill == 800'000);
+  const auto neck = route::neck_down_via(rules, rules.default_class());
+  CHECK(neck.diameter == 800'000);
+  CHECK(neck.drill == 200'000);
+  route::Obstacles plain(lb.board, rules);
+  CHECK(plain.via_state({4'900'000, 3'000'000}, 800'000, 200'000, 1, 0, false) == 0);
+  rules.custom.push_back(app::keep_vias_off_pads_rule(rules, 2'000'000));
+  CHECK(rules.custom.back().constraints.front().min == 400'000);
+  route::Obstacles obs(lb.board, rules);
+  for (model::NetId net : {1, 2}) {
+    for (Coord x : {4'900'000, 4'999'999, 5'000'000}) {
+      CAPTURE(net, x);
+      const bool blocked = x < 5'000'000;
+      CHECK((obs.via_state({x, 3'000'000}, 800'000, 200'000, net, 0, false) == 2) == blocked);
+      CHECK((obs.fixed_via_code({x, 3'000'000}, 800'000, 200'000, 0, net) == route::Obstacles::kBlocked) == blocked);
+      CHECK(obs.fixed_via_code({x, 3'000'000}, 800'000, 200'000, 0, net) ==
+            obs.fixed_via_code_reference({x, 3'000'000}, 800'000, 200'000, 0, net));
+    }
+  }
+}
+
 TEST_CASE("a 0402 plane connection uses a dog-bone rather than via-in-pad", "[rules][route]") {
   const std::string text =
       "(kicad_pcb (version 20240108) (generator \"pcbnew\")"
@@ -401,7 +445,7 @@ TEST_CASE("a 0402 plane connection uses a dog-bone rather than via-in-pad", "[ru
     const auto rules = io::read_design_rules(f.pcb.string());
     REQUIRE(rules.default_class().via_diameter == 600'000);
     REQUIRE(rules.default_class().via_drill == 300'000);
-    CHECK(app::keep_vias_off_pads_rule(rules, 2'000'000).constraints.front().min == 800'000);
+    CHECK(app::keep_vias_off_pads_rule(rules, 2'000'000).constraints.front().min == 850'000);
   }
   app::RouteJob job;
   job.in = f.pcb.string();
@@ -454,5 +498,5 @@ TEST_CASE("class via dimensions include board drill, diameter and annular minimu
   rules.minimums.via_diameter = 1'500'000;
   check(1'500'000, 500'000, 700'000);
   rules.minimums.through_hole_diameter = 0;
-  check(1'500'000, 300'000, 800'000);
+  check(1'500'000, 300'000, 850'000);  // neck-down keeps this diameter but reduces the drill to 0.2 mm
 }
