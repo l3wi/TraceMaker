@@ -223,7 +223,7 @@ TEST_CASE("KiCad size conditions use local pad dimensions, relational operators 
   drc::CopperItem via;
   via.kind = drc::ItemKind::Via;
   via.net = 1;
-  auto matches = [&](const std::string& expr) {
+  auto matches = [&](const std::string& expr, bool unknown = false) {
     auto rules = io::read_design_rules(f.pcb.string());
     model::CustomRule rule;
     rule.name = "size";
@@ -231,8 +231,14 @@ TEST_CASE("KiCad size conditions use local pad dimensions, relational operators 
     rule.constraints.push_back({"physical_hole_clearance", 350'000, {}, {}, {}});
     rules.custom.push_back(rule);
     const drc::RuleEngine re(lb.board, rules);
-    REQUIRE(re.warnings().empty());
-    CHECK_FALSE(re.needs_exact_routing());
+    if (unknown) {
+      REQUIRE(re.warnings().size() == 1);
+      CHECK(re.warnings().front().find("B.Unknown") != std::string::npos);
+      CHECK(re.needs_exact_routing());
+    } else {
+      REQUIRE(re.warnings().empty());
+      CHECK_FALSE(re.needs_exact_routing());
+    }
     return re.physical_hole_clearance(&via, *pad, 0) == 350'000;
   };
   CHECK(matches("B.Size_X < 2mm && B.Size_Y <= 1mm"));
@@ -242,9 +248,9 @@ TEST_CASE("KiCad size conditions use local pad dimensions, relational operators 
   CHECK(matches("0.5mil < B.Size_X && B.Size_Y >= 39mil"));
   CHECK(matches("(A.Type == 'Via') && (B.Pad_Type == 'SMD') && B.Size_X < 2 mm"));
   CHECK_FALSE(matches("B.Size_X > 1mm || B.Size_Y < 0.5mm"));
-  CHECK_FALSE(matches("B.Unknown < 2mm"));
-  CHECK_FALSE(matches("B.Unknown == 'anything'"));
-  CHECK_FALSE(matches("B.Unknown != 'anything'"));
+  CHECK(matches("B.Unknown < 2mm", true));
+  CHECK(matches("B.Unknown == 'anything'", true));
+  CHECK(matches("B.Unknown != 'anything'", true));
   CHECK_FALSE(matches("A.Type == 'Via' && A.Size_X < 2mm"));
 }
 

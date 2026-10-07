@@ -70,6 +70,23 @@ The own DRC must match `kicad-cli pcb drc` (verified per KiCad version in CI on 
    (phase 3), dangling tracks/vias.
 5. **Both-sides rule**: any check triggered by new geometry also re-checks the other object of every pair.
 6. Output: markers with KiCad's violation type names, so reports compare 1:1 with `kicad-cli`.
+   Custom `disallow` markers retain the selected rule name. Route summaries expose
+   `rule_warnings` exactly as returned by the rule engine and separate `project_warnings`; the CLI
+   prints both to stderr before routing (D65).
+   Conditions are validated structurally against the supported property/function registry, including
+   unevaluated Boolean branches. Unknown/unparseable conditions conservatively match, but unknown
+   ignored rules cannot waive known earlier constraints and unknown numeric constraints cannot weaken
+   known floors/caps. This fallback is a diagnostic, not a claim of KiCad semantic support.
+   Track/via disallow uses actual candidate geometry, coordinates, width, type/span and item ownership.
+   Area intersection aliases and whole-shape enclosure use polygon geometry; courtyard predicates use
+   closed per-side footprint outlines, not placement's convex hull or invented pad-box courtyards.
+   Static net/class/type disallows retain class caches when every net of that class has identical
+   predicates. Item/geometry residuals, subtype spans and actual same-class net differences bypass
+   class caches and cost-to-go fields. Selector leaves bind immutable region IDs, with per-net/kind
+   partial evaluation and a plain AST/linear geometry reference.
+   `memberOfGroup` ancestry, `${Class:...}` selectors and `disallow hole/footprint/text` remain explicitly
+   unsupported coverage; free new tracks/vias have no footprint/group membership. Matching hole
+   predicates conservatively reject candidate vias because newly created holes lack exact coverage.
 7. **Broken boards** (KiCad 10 semantics, D51; regression test `drc_broken_parity`): the checks run on the nets
    KiCad assigns when it loads a board. KiCad links connectivity items of *any* nets whose copper touches (except
    two pads/zone fills of different nets) and propagates the pads' net to the tracks, vias and board graphics of

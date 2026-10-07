@@ -185,7 +185,7 @@ struct Router::Impl {
     const Coord w = mn > 0 ? std::max(mn, std::min<Coord>(class_width(net), 150'000)) : std::min<Coord>(class_width(net), 150'000);
     return w < class_width(net) ? w : 0;
   }
-  // Per-net track layers and via permission from custom disallow rules (doc 05 §16).
+  // Static disallow permissions are an optimization; residual rules use exact candidate checks instead.
   std::vector<model::LayerMask> net_layers;
   std::vector<std::uint8_t> net_vias;
   bool layer_ok(NetId net, int layer) const {
@@ -205,6 +205,7 @@ struct Router::Impl {
   void setup() {
     obs = std::make_unique<Obstacles>(b, rules, opt.soft_zones);
     if (opt.soft_zones) soft_fills = std::make_unique<drc::ZoneFills>(obs->copper());
+    // Representative-net caches and static per-net permissions have independent capability requirements.
     use_cache = !obs->needs_exact_routing();
     nl = b.copper_count();
     blind_ok = opt.blind_vias && rules.minimums.allow_blind_buried_vias && nl > 2;

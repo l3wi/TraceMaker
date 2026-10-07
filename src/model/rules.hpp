@@ -70,6 +70,7 @@ struct DesignRules {
   std::vector<CustomRule> custom;
   std::map<std::string, std::string> severities;  // KiCad violation type -> error | warning | ignore
   std::vector<std::string> warnings;        // anything that could not be interpreted
+  bool unreadable_custom_rules = false;  // routing must not mutate a board whose custom rules could not be read
 
   const NetClass& default_class() const { return classes.front(); }
   // Effective net class for a net name (explicit assignment, then the first matching pattern, else Default).

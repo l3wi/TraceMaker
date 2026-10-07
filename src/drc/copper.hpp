@@ -25,6 +25,8 @@ struct CopperItem {
   int owner = -1;                 // router connection that created this item (-1 = fixed copper)
   bool removed = false;           // ripped up (router working model only)
   bool free_via = false;          // via marked (free yes): its net is fixed for KiCad's net propagation
+  model::ViaType via_type = model::ViaType::Through;  // actual candidate subtype, also for items not in Board
+  int anchor_layer = -1;          // KiCad item Layer property; distinct from the evaluation context layer
 };
 
 struct Hole {

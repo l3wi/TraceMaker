@@ -173,6 +173,10 @@ int cmd_route(tmk::app::RouteJob job) {
     std::printf("%s\n", line.c_str());
     std::fflush(stdout);
   };
+  job.warning = [](const std::string& line) {
+    std::fprintf(stderr, "warning: %s\n", line.c_str());
+    std::fflush(stderr);
+  };
   return tmk::app::run_route_job(std::move(job)).exit_code();
 }
 

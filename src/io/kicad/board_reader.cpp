@@ -414,6 +414,7 @@ class Reader {
     auto tf = [&](Point p) { return local ? origin + geom::rotate(p, angle) : p; };
     if (NodeId s = d_.find(g, "stroke"); s != kNoNode) gr.width = child_nm(s, "width");
     else gr.width = child_nm(g, "width");
+    gr.corner_radius = child_nm(g, "radius");
     if (NodeId fl = d_.find(g, "fill"); fl != kNoNode) {
       const std::string v = d_.str_at(fl, 1);
       gr.filled = v == "solid" || v == "yes";
@@ -576,6 +577,8 @@ class Reader {
     if (NodeId l = d_.find(z, "layer"); l != kNoNode) zone.copper |= layers_mask(l, &zone.layers);
     if (NodeId l = d_.find(z, "layers"); l != kNoNode) zone.copper |= layers_mask(l, &zone.layers);
     if (NodeId n = d_.find(z, "name"); n != kNoNode) zone.name = d_.str_at(n, 1);
+    if (NodeId u = d_.find(z, "uuid"); u != kNoNode) zone.uuid = d_.str_at(u, 1);
+    else if (NodeId stamp = d_.find(z, "tstamp"); stamp != kNoNode) zone.uuid = d_.str_at(stamp, 1);
     if (NodeId p = d_.find(z, "priority"); p != kNoNode) zone.priority = static_cast<int>(d_.number_at(p, 1).value_or(0));
     if (NodeId cp = d_.find(z, "connect_pads"); cp != kNoNode)
       if (NodeId c = d_.find(cp, "clearance"); c != kNoNode) zone.clearance = d_.nm_at(c, 1).value_or(-1);
@@ -594,6 +597,7 @@ class Reader {
     }
     for (NodeId poly : d_.find_all(z, "polygon")) {
       std::vector<Point> pts;
+      // Footprint zones, unlike footprint graphics, are stored in board coordinates.
       if (NodeId p = d_.find(poly, "pts"); p != kNoNode) read_pts(p, pts, Point{}, 0);
       zone.outline.push_back(std::move(pts));
     }

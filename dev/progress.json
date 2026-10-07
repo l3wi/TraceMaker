@@ -178,6 +178,10 @@
     {
      "text": "Router hot paths: per-net class resolved once, pooled rule probes, lazy and merged via checks; 20M route check on a private board's 0.05 mm lattice ~140 s -> ~10 s, outputs unchanged (D57)",
      "done": true
+    },
+    {
+     "text": "D65: structural custom-rule capability diagnostics, prepared area/per-side courtyard predicates, exact positional disallow for new copper, conservative unsupported rules; StickHub 0 added disallow, quick 30/30 baseline-identical",
+     "done": true
     }
    ]
   },

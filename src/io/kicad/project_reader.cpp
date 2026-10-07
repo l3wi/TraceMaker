@@ -144,6 +144,7 @@ void read_dru(const fs::path& p, model::DesignRules& r) {
     d = sexpr::Document::parse("(rules\n" + text + "\n)");
   } catch (const sexpr::ParseError& e) {
     r.warnings.push_back("cannot parse " + p.string() + ": " + e.what());
+    r.unreadable_custom_rules = true;
     return;
   }
   for (sexpr::NodeId rule : d.find_all(d.root(), "rule")) {
@@ -165,6 +166,7 @@ void read_dru(const fs::path& p, model::DesignRules& r) {
         const auto v = parse_length(d.str_at(x, 1));
         if (!v) {
           r.warnings.push_back("rule '" + cr.name + "': cannot read value of " + std::string(h));
+          r.unreadable_custom_rules = true;
           continue;
         }
         if (h == "min") k.min = v;

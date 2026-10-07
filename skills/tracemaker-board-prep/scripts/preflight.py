@@ -181,10 +181,33 @@ def pitch(width, clearance):
     return min(100000, max(25000, ((nm(width) + nm(clearance)) // 6 // 5000) * 5000)) / 1000000
 
 
+# Keep this structural registry aligned with drc::Condition: validate every leaf,
+# including branches that a sample evaluation would short-circuit.
+CONDITION_PROPERTIES = frozenset({
+    'NetClass', 'NetName', 'Type', 'Layer', 'Reference', 'Parent.Reference',
+    'Pad_Type', 'Size_X', 'Size_Y', 'Width', 'Position_X', 'Position_Y',
+})
+COURTYARD_FUNCTIONS = frozenset({
+    'intersectsCourtyard', 'intersectsFrontCourtyard', 'intersectsBackCourtyard',
+    'insideCourtyard', 'insideFrontCourtyard', 'insideBackCourtyard',
+})
+CONDITION_FUNCTIONS = {
+    'isPlated': 0, 'existsOnLayer': 1, 'insideArea': 1, 'intersectsArea': 1,
+    'enclosedByArea': 1, 'inDiffPair': 1, 'memberOfFootprint': 1,
+    **{name: 1 for name in COURTYARD_FUNCTIONS},
+}
+RESIDUAL_TERMS = frozenset({
+    'insideArea', 'intersectsArea', 'enclosedByArea', 'memberOfFootprint',
+    'Reference', 'Parent.Reference', 'Pad_Type', 'Width', 'Size_X', 'Size_Y',
+    'Position_X', 'Position_Y', 'Layer', 'existsOnLayer',
+}) | COURTYARD_FUNCTIONS
+
+
 class Condition:
     """Parse the engine's small condition grammar, not KiCad's full evaluator."""
     def __init__(self, text):
         self.text, self.i, self.refs = text, 0, set()
+        self.unsupported = set()
 
     def skip(self):
         while self.i < len(self.text) and self.text[self.i].isspace():
@@ -198,12 +221,14 @@ class Condition:
         return False
 
     def string(self):
+        start = self.i + 1
         quote = self.text[self.i]
         self.i += 1
         end = self.text.find(quote, self.i)
         if end < 0:
             raise ValueError('unterminated condition string')
         self.i = end + 1
+        return self.text[start:end]
 
     def term(self):
         self.skip()
@@ -219,12 +244,16 @@ class Condition:
             m = re.match(r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?', self.text[self.i:])
             if not m:
                 raise ValueError('invalid condition number')
+            number = float(m[0])
             self.i += len(m[0])
             self.skip()
             unit = re.match(r'[A-Za-z]*', self.text[self.i:])[0]
             if unit not in ('', 'mm', 'mil', 'in', 'ps', 'deg', 'fs'):
                 raise ValueError('unsupported condition unit ' + unit)
             self.i += len(unit)
+            scale = {'mm': 1000000, 'mil': 25400, 'in': 25400000, 'ps': 1000}.get(unit, 1)
+            if not math.isfinite(number * scale):
+                raise ValueError('invalid condition number')
         else:
             m = re.match(r'[A-Za-z_][A-Za-z_0-9.]*', self.text[self.i:])
             if not m:
@@ -232,14 +261,34 @@ class Condition:
             name = m[0]
             self.i += len(name)
             if name not in ('true', 'false'):
-                self.refs.add(name[2:] if name.startswith(('A.', 'B.')) else name)
+                bound = name.startswith(('A.', 'B.'))
+                symbol = name[2:] if name.startswith(('A.', 'B.')) else name
+                self.refs.add(symbol)
                 if self.eat('('):
+                    arguments = []
                     while not self.eat(')'):
                         self.skip()
                         if self.i == len(self.text) or self.text[self.i] not in "'\"":
                             raise ValueError('function arguments must be strings')
-                        self.string()
+                        arguments.append(self.string())
                         self.eat(',')
+                    if not bound or symbol not in CONDITION_FUNCTIONS:
+                        self.unsupported.add(symbol)
+                    elif len(arguments) != CONDITION_FUNCTIONS[symbol]:
+                        self.unsupported.add(symbol + ' (wrong argument count)')
+                    if arguments:
+                        if any('${Class:' in argument for argument in arguments):
+                            self.unsupported.add(symbol + ' (${Class:...} metadata)')
+                    if len(arguments) == 1:
+                        selector = arguments[0]
+                        if symbol in COURTYARD_FUNCTIONS:
+                            if not selector or selector in ('A', 'B') or selector.startswith('$'):
+                                self.unsupported.add(symbol + ' (unavailable footprint selector)')
+                        elif symbol in {'insideArea', 'intersectsArea', 'enclosedByArea'}:
+                            if not selector or selector == 'B':
+                                self.unsupported.add(symbol + ' (unavailable area selector)')
+                elif name != 'L' and (not bound or symbol not in CONDITION_PROPERTIES):
+                    self.unsupported.add(symbol)
 
     def unary(self):
         self.skip()
@@ -432,26 +481,38 @@ def main():
             try:
                 rules = children(sexprs(rules_path.read_text()), 'rule')
             except ValueError as exc:
-                finding('Custom rules', 'block', f'Cannot parse {rules_path}: {exc}; custom rules would be ignored.')
+                finding('Custom rules', 'block', f'Cannot parse {rules_path}: {exc}; routing must stop rather than drop custom constraints.')
         if not rules:
             finding('Custom rules', 'info', 'No parsed custom rules.')
         allowed = {'track', 'via', 'through_via', 'micro_via', 'buried_via', 'blind_via', 'pad', 'zone', 'graphic'}
-        positional = {'insideArea', 'intersectsArea', 'enclosedByArea', 'memberOfFootprint', 'Reference',
-                      'Parent.Reference', 'Pad_Type', 'Width', 'Size_X', 'Size_Y'}
-        # Mirrors drc::RuleEngine's evaluator: any other name evaluates as unknown, and an unknown condition never
-        # makes a rule fire, so the rule is silently skipped by both the router and `tracemaker drc`.
-        evaluated = positional | {'NetClass', 'NetName', 'Type', 'Layer', 'isPlated', 'existsOnLayer', 'inDiffPair'}
+        # Unknown conditions match conservatively at runtime, but cannot prove
+        # KiCad parity. Preflight blocks them rather than calling that fallback support.
         caches_disabled = False
         for rule in rules:
             name, condition = rule[1], val(rule, 'condition', '')
             constraints = children(rule, 'constraint')
             kinds = [c[1] for c in constraints]
             reasons, refs = [], set()
+            parsed = Condition(condition)
+            condition_valid = True
             try:
-                refs = Condition(condition).parse()
+                refs = parsed.parse()
             except ValueError as exc:
+                condition_valid = False
                 reasons.append('unparseable condition: ' + str(exc))
-                finding('Custom rules', 'block', f"Rule '{name}' is ignored: {exc}.")
+                finding('Custom rules', 'block', f"Rule '{name}': {exc}; the engine conservatively matches unreadable conditions, and ignored rules cannot waive known prior constraints. Fix the condition before routing.")
+            missing = sorted(parsed.unsupported)
+            if missing:
+                reasons.append('unsupported condition terms: ' + ', '.join(missing))
+                finding('Custom rules', 'block', f"Rule '{name}': unsupported condition terms: {', '.join(missing)}. Conditions are checked structurally, including short-circuited branches; the runtime fallback conservatively matches rather than silently skipping. memberOfGroup has no existing-item coverage; component-class selector metadata is unavailable.")
+            residual = 'disallow' in kinds and bool(refs & RESIDUAL_TERMS)
+            if residual:
+                reasons.append('disallow has residual geometry/item predicates')
+            if any(c[1] == 'disallow' and any(w in ('through_via', 'blind_via', 'buried_via', 'micro_via', 'hole') for w in c[2:])
+                   for c in constraints):
+                reasons.append('disallow requires actual via subtype/span checks')
+            if 'disallow' in kinds and refs & {'NetName', 'inDiffPair'} and not residual:
+                finding('Custom rules', 'info', f"Rule '{name}': static net predicates retain caches only when uniform within each class; engine metadata below reports the actual decision.")
             for kind in kinds:
                 if kind not in ('disallow', 'physical_hole_clearance'):
                     reasons.append('constraint ' + kind)
@@ -460,18 +521,15 @@ def main():
             caches_disabled |= bool(reasons)
             finding('Custom rules', 'slow' if reasons else 'info',
                     f"Rule '{name}': {', '.join(kinds) or 'no constraints'}; condition `{condition or 'true'}`; "
-                    + ('disables caches board-wide (' + '; '.join(reasons) + ')' if reasons else 'cache-ok'))
-            missing = sorted(refs - evaluated)
-            if missing:
-                finding('Custom rules', 'block', f"Rule '{name}': TraceMaker cannot evaluate {', '.join(missing)}, so the router and `tracemaker drc` both skip this rule; only KiCad DRC checks it. Rewrite it with supported terms (a rule area instead of a courtyard), or route and fix its violations by hand.")
-            elif 'disallow' in kinds and refs & positional:
-                finding('Custom rules', 'quality', f"Rule '{name}': position/footprint disallow is not avoided by the router; KiCad DRC still enforces it, so routes may need fixing there. Prefer a rule area."
-                        + (' TraceMaker DRC treats insideArea/enclosedByArea as whole-item containment (KiCad: insideArea = intersectsArea), so it can under-report.' if refs & {'insideArea', 'enclosedByArea'} else ''))
+                    + ('bypasses per-class obstacle caches and cost-to-go fields (' + '; '.join(reasons) + ')' if reasons else 'cache-ok'))
+            if 'disallow' in kinds and condition_valid and not missing:
+                finding('Custom rules', 'info', f"Rule '{name}': track/via disallow is enforced on actual candidate geometry, including final segments and via type/span; "
+                        + ('position/footprint/dimension predicates use the residual exact evaluator, not class-wide cached permission.' if residual else 'static net/type/layer predicates can be pre-evaluated, with exact candidate checks authoritative.'))
             for c in constraints:
                 if c[1] == 'disallow':
                     unsupported = [w for w in c[2:] if isinstance(w, str) and w not in allowed]
                     if unsupported:
-                        finding('Custom rules', 'info', f"Rule '{name}': disallow {', '.join(unsupported)} is not checked by TraceMaker; KiCad DRC still reports it.")
+                        finding('Custom rules', 'block', f"Rule '{name}': disallow {', '.join(unsupported)} lacks exact item coverage; KiCad DRC is still required. Matching hole predicates conservatively reject new vias. Rewrite only if equivalent design intent can be preserved.")
         report['caches_disabled'] = caches_disabled
 
         for c in classes:
@@ -612,13 +670,27 @@ def main():
             finding('Escape and engine warnings', 'info', 'TraceMaker not found: skipping engine DRC warnings and escape checks; set --tracemaker or TRACEMAKER. This is not routing clearance sign-off.')
         else:
             try:
-                p = subprocess.run([binary, 'drc', str(args.board)], capture_output=True, text=True, timeout=55)
+                with tempfile.TemporaryDirectory(prefix='tracemaker-preflight-drc-') as drc_tmp:
+                    drc_path = Path(drc_tmp) / 'drc.json'
+                    p = subprocess.run([binary, 'drc', str(args.board), '--json', str(drc_path)],
+                                       capture_output=True, text=True, timeout=55)
+                    if drc_path.exists():
+                        engine_drc = json.loads(drc_path.read_text())
+                        if 'needs_exact_routing' in engine_drc:
+                            report['caches_disabled'] = engine_drc['needs_exact_routing']
+                            finding('Custom rules', 'slow' if report['caches_disabled'] else 'info',
+                                    'Engine capability metadata: class caches/fields '
+                                    + ('bypassed for item residuals or differing class predicates.' if report['caches_disabled'] else 'remain enabled.'))
                 text = p.stdout + '\n' + p.stderr
                 warnings = [line for line in text.splitlines() if 'warning:' in line]
                 report['drc_warnings'] = warnings
                 # Rule warnings repeat the custom-rule findings above; keep them verbatim for the user.
                 for line in warnings:
-                    finding('Escape and engine warnings', 'info', line)
+                    coverage_gap = any(term in line for term in (
+                        'unsupported symbol', 'unsupported disallow item', 'cannot parse condition',
+                        'custom rules could not be read',
+                    ))
+                    finding('Escape and engine warnings', 'block' if coverage_gap else 'info', line)
                 if not warnings:
                     finding('Escape and engine warnings', 'info', 'TraceMaker DRC emitted no rule warnings.')
                 if p.returncode not in (0, 5):

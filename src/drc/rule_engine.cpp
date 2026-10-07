@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "drc/rule_engine.hpp"
+#include "drc/rule_geometry.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <cmath>
-#include <initializer_list>
+#include <bit>
 #include <limits>
 #include <string_view>
 
@@ -21,12 +22,13 @@ struct EvalCtx {
   const CopperItem* b;
   int layer;
   bool unknown = false;  // set when an unsupported property or function is evaluated
+  bool reference = false;
 };
 
 struct Value {
   enum class K { Undef, Bool, Str, Num } k = K::Undef;
   bool b = false;
-  std::string s;
+  std::string_view s;  // borrowed from immutable board/AST strings
   double n = 0;
   bool truthy() const { return k == K::Bool ? b : k == K::Num ? n != 0 : k == K::Str ? !s.empty() : false; }
 };
@@ -37,9 +39,11 @@ class Condition {
     enum class Op { Or, And, Not, Eq, Ne, Lt, Le, Gt, Ge, Lit, Prop, Call } op;
     std::vector<std::unique_ptr<Node>> kids;
     Value lit;
+    std::string text;  // owns literal string storage
     char who = 'A';       // A or B
     std::string name;     // property or function name
     std::vector<std::string> args;
+    std::vector<std::size_t> regions;  // bound geometric leaves; no selector work in the routing hot path
   };
 
   static std::unique_ptr<Condition> parse(const std::string& text, model::RuleOrigin origin, std::string& err) {
@@ -59,8 +63,39 @@ class Condition {
   }
 
   bool eval(EvalCtx& ctx) const { return eval(*root_, ctx).truthy(); }
-  // Property or function names used by either item.
-  bool references(std::initializer_list<std::string_view> names) const { return references(*root_, names); }
+  enum Dependency : unsigned { Static = 0, Net = 1, Item = 2, Spatial = 4, Anchor = 8, Membership = 16 };
+  struct Symbol { std::string_view name; bool call; unsigned dependencies; int arity; };
+  // One structural registry: capability checking must visit even short-circuited branches.
+  static constexpr Symbol symbols[] = {
+      {"NetClass", false, Net, 0}, {"NetName", false, Net, 0}, {"Type", false, Static, 0},
+      {"Layer", false, Item, 0}, {"L", false, Static, 0}, {"Reference", false, Item, 0},
+      {"Parent.Reference", false, Item, 0}, {"Pad_Type", false, Item, 0},
+      {"Size_X", false, Item, 0}, {"Size_Y", false, Item, 0}, {"Width", false, Item, 0},
+      {"Position_X", false, Item | Anchor, 0}, {"Position_Y", false, Item | Anchor, 0},
+      {"isPlated", true, Static, 0}, {"existsOnLayer", true, Item, 1},
+      {"insideArea", true, Item | Spatial, 1}, {"intersectsArea", true, Item | Spatial, 1},
+      {"enclosedByArea", true, Item | Spatial | Anchor, 1},
+      {"insideCourtyard", true, Item | Spatial, 1}, {"intersectsCourtyard", true, Item | Spatial, 1},
+      {"insideFrontCourtyard", true, Item | Spatial, 1}, {"intersectsFrontCourtyard", true, Item | Spatial, 1},
+      {"insideBackCourtyard", true, Item | Spatial, 1}, {"intersectsBackCourtyard", true, Item | Spatial, 1},
+      {"inDiffPair", true, Net, 1}, {"memberOfFootprint", true, Item | Membership, 1}};
+  struct Capabilities {
+    unsigned dependencies = Static;
+    std::vector<std::string> unsupported;
+    bool non_monotone = false;
+    bool unknown_except_membership = false;
+  };
+  Capabilities capabilities() const {
+    Capabilities out;
+    collect(*root_, out);
+    out.non_monotone = non_monotone(*root_);
+    return out;
+  }
+  void validate_geometry(const RuleGeometry& geometry, Capabilities& capabilities) const {
+    validate_geometry(*root_, geometry, capabilities);
+  }
+  void bind_geometry(const RuleGeometry& geometry) { bind_geometry(*root_, geometry); }
+  std::optional<bool> static_result(EvalCtx& ctx) const { return static_result(*root_, ctx); }
 
  private:
   void skip() {
@@ -140,7 +175,8 @@ class Condition {
     if (c == '\'' || c == '"') {
       auto n = make(Node::Op::Lit);
       n->lit.k = Value::K::Str;
-      n->lit.s = read_string();
+      n->text = read_string();
+      n->lit.s = n->text;
       return n;
     }
     if (std::isdigit(static_cast<unsigned char>(c)) || c == '-' || c == '+' || c == '.') {
@@ -185,6 +221,7 @@ class Condition {
       return n;
     }
     auto n = make(Node::Op::Prop);
+    n->who = '\0';
     if (id.size() > 2 && (id[0] == 'A' || id[0] == 'B') && id[1] == '.') {
       n->who = id[0];
       n->name = id.substr(2);
@@ -204,41 +241,159 @@ class Condition {
     return n;
   }
 
-  static bool references(const Node& n, std::initializer_list<std::string_view> names) {
-    if ((n.op == Node::Op::Prop || n.op == Node::Op::Call) && std::find(names.begin(), names.end(), n.name) != names.end()) return true;
+  static bool spatial(const Node& n) {
+    if (n.op == Node::Op::Prop && n.name == "Width") return true;
+    if (n.op == Node::Op::Call)
+      for (const auto& s : symbols)
+        if (s.name == n.name && (s.dependencies & Spatial)) return true;
     for (const auto& k : n.kids)
-      if (references(*k, names)) return true;
+      if (spatial(*k)) return true;
     return false;
   }
+  static bool non_monotone(const Node& n) {
+    // Odd track widths round down in search disks. Increasing width predicates stay monotone.
+    if (n.kids.size() == 2) {
+      const auto width = [](const Node& node) { return node.op == Node::Op::Prop && node.name == "Width"; };
+      const auto number = [](const Node& node) { return node.op == Node::Op::Lit && node.lit.k == Value::K::Num; };
+      if (((n.op == Node::Op::Gt || n.op == Node::Op::Ge) && width(*n.kids[0]) && number(*n.kids[1])) ||
+          ((n.op == Node::Op::Lt || n.op == Node::Op::Le) && number(*n.kids[0]) && width(*n.kids[1]))) return false;
+    }
+    // Arbitrary Boolean comparison/negation of an intersection is not a forbidden-region leaf.
+    if (n.op != Node::Op::Or && n.op != Node::Op::And && n.op != Node::Op::Call && spatial(n)) return true;
+    for (const auto& k : n.kids)
+      if (non_monotone(*k)) return true;
+    return false;
+  }
+  static void collect(const Node& n, Capabilities& out) {
+    if (n.op == Node::Op::Prop || n.op == Node::Op::Call) {
+      const bool call = n.op == Node::Op::Call;
+      const auto* found = std::find_if(std::begin(symbols), std::end(symbols), [&](const Symbol& s) {
+        return s.name == n.name && s.call == call && (n.who != '\0' || n.name == "L") &&
+               (n.name != "L" || n.who == '\0') && static_cast<int>(n.args.size()) == s.arity;
+      });
+      if (found != std::end(symbols)) out.dependencies |= found->dependencies;
+      else {
+        const std::string symbol = (n.who ? std::string(1, n.who) + "." : "") + n.name;
+        if (std::find(out.unsupported.begin(), out.unsupported.end(), symbol) == out.unsupported.end())
+          out.unsupported.push_back(symbol);
+        out.dependencies |= Item;
+        if (n.name != "memberOfGroup" || !call || n.args.size() != 1) out.unknown_except_membership = true;
+      }
+      if (call && !n.args.empty() && n.args.front().find("${Class:") != std::string::npos) {
+        out.unsupported.push_back(n.name + " selector " + n.args.front());
+        if (n.name != "memberOfFootprint") out.unknown_except_membership = true;
+      }
+    }
+    for (const auto& k : n.kids) collect(*k, out);
+  }
+  static void validate_geometry(const Node& n, const RuleGeometry& geometry, Capabilities& capabilities) {
+    if (n.op == Node::Op::Call && n.args.size() == 1) {
+      std::vector<std::string> diagnostics;
+      if (n.name == "insideArea" || n.name == "intersectsArea" || n.name == "enclosedByArea")
+        diagnostics = geometry.validate_area(n.args[0]);
+      else if (n.name.find("Courtyard") != std::string::npos)
+        diagnostics = geometry.validate_courtyard(n.args[0]);
+      for (const auto& diagnostic : diagnostics) {
+        capabilities.unsupported.push_back(n.name + ": " + diagnostic);
+        capabilities.unknown_except_membership = true;
+      }
+    }
+    for (const auto& k : n.kids) validate_geometry(*k, geometry, capabilities);
+  }
+  static void bind_geometry(Node& n, const RuleGeometry& geometry) {
+    if (n.op == Node::Op::Call && n.args.size() == 1) {
+      if (n.name == "insideArea" || n.name == "intersectsArea" || n.name == "enclosedByArea")
+        n.regions = geometry.area_regions(n.args[0]);
+      else if (n.name.find("Courtyard") != std::string::npos) {
+        const int side = n.name.find("Front") != std::string::npos ? 1 : n.name.find("Back") != std::string::npos ? 2 : 0;
+        n.regions = geometry.courtyard_regions(n.args[0], side);
+      }
+    }
+    for (auto& k : n.kids) bind_geometry(*k, geometry);
+  }
+  static bool fully_static(const Node& n) {
+    if (n.op == Node::Op::Prop)
+      return n.who == 'B' || n.name == "NetName" || n.name == "NetClass" || n.name == "Type" ||
+             n.name == "L" || n.name == "Reference" || n.name == "Parent.Reference" ||
+             n.name == "Pad_Type" || n.name == "Size_X" || n.name == "Size_Y";
+    if (n.op == Node::Op::Call)
+      return n.who == 'B' || n.name == "inDiffPair" || n.name == "isPlated" ||
+             n.name == "memberOfFootprint" || n.name == "memberOfGroup";
+    return std::all_of(n.kids.begin(), n.kids.end(), [](const auto& k) { return fully_static(*k); });
+  }
+  std::optional<bool> static_result(const Node& n, EvalCtx& ctx) const {
+    if (n.op == Node::Op::And || n.op == Node::Op::Or) {
+      const auto a = static_result(*n.kids[0], ctx), b = static_result(*n.kids[1], ctx);
+      if (n.op == Node::Op::And) {
+        if ((a && !*a) || (b && !*b)) return false;
+        if (a && b) return true;
+      } else {
+        if ((a && *a) || (b && *b)) return true;
+        if (a && b) return false;
+      }
+      return std::nullopt;
+    }
+    if (n.op == Node::Op::Not) {
+      const auto a = static_result(*n.kids[0], ctx);
+      return a ? std::optional<bool>(!*a) : std::nullopt;
+    }
+    return fully_static(n) ? std::optional<bool>(eval(n, ctx).truthy()) : std::nullopt;
+  }
+
 
   static bool str_eq(const Value& l, const Value& r) {
     if (l.k == Value::K::Num || r.k == Value::K::Num) {
-      const double a = l.k == Value::K::Num ? l.n : std::atof(l.s.c_str());
-      const double b = r.k == Value::K::Num ? r.n : std::atof(r.s.c_str());
+      const double a = l.k == Value::K::Num ? l.n : l.s.empty() ? 0 : std::atof(l.s.data());
+      const double b = r.k == Value::K::Num ? r.n : r.s.empty() ? 0 : std::atof(r.s.data());
       return a == b;  // KiCad VALUE::EqualTo compares numeric doubles without a tolerance.
     }
     if (l.k == Value::K::Bool || r.k == Value::K::Bool) return l.truthy() == r.truthy();
     // KiCad compares strings case-insensitively with wildcard support on either side.
-    auto low = [](std::string s) {
-      for (auto& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-      return s;
+    auto match = [](std::string_view pattern, std::string_view text) {
+      auto lower = [](char ch) { return std::tolower(static_cast<unsigned char>(ch)); };
+      std::size_t pi = 0, ti = 0, star = std::string_view::npos, mark = 0;
+      while (ti < text.size()) {
+        if (pi < pattern.size() && (pattern[pi] == '?' || lower(pattern[pi]) == lower(text[ti]))) {
+          ++pi; ++ti;
+        } else if (pi < pattern.size() && pattern[pi] == '*') {
+          star = pi++; mark = ti;
+        } else if (star != std::string_view::npos) {
+          pi = star + 1; ti = ++mark;
+        } else return false;
+      }
+      while (pi < pattern.size() && pattern[pi] == '*') ++pi;
+      return pi == pattern.size();
     };
-    const std::string a = low(l.s), b = low(r.s);
-    return model::wildcard_match(b, a) || model::wildcard_match(a, b);
+    return match(l.s, r.s) || match(r.s, l.s);
   }
 
   Value prop(const Node& n, EvalCtx& ctx) const {
     const CopperItem* it = n.who == 'A' ? ctx.a : ctx.b;
     Value v;
+    if (n.name == "L" && n.who == '\0') {
+      v.k = Value::K::Str;
+      if (ctx.layer >= 0) v.s = ctx.eng->b_.copper_name(ctx.layer);
+      return v;
+    }
     if (!it) return v;  // B absent (single-item constraint): undefined → false
+    // A supported property absent on this item is undefined, not an unknown capability.
+    if (((n.name == "Pad_Type" || n.name == "Size_X" || n.name == "Size_Y") && it->kind != ItemKind::Pad) ||
+        ((n.name == "Reference" || n.name == "Parent.Reference") && it->footprint < 0) ||
+        (n.name == "Width" && (it->kind == ItemKind::Pad || it->kind == ItemKind::Zone))) return v;
     const auto& b = ctx.eng->b_;
     v.k = Value::K::Str;
     if (n.name == "NetClass") v.s = ctx.eng->netclass(*it).name;
     else if (n.name == "NetName") v.s = b.nets[static_cast<std::size_t>(it->net)].name;
     else if (n.name == "Type") v.s = it->kind == ItemKind::Arc ? "Track" : kind_name(it->kind);
-    else if (n.name == "Layer") v.s = ctx.layer >= 0 ? b.copper_name(ctx.layer) : "";
+    else if (n.name == "Layer") {
+      // BOARD_ITEM's Layer property is GetLayer(), not PCBEXPR_CONTEXT::GetLayer() (bare L).
+      // KiCad 10.0.3 pcbexpr_evaluator.cpp and board_item.cpp property registration.
+      const int l = it->anchor_layer >= 0 ? it->anchor_layer :
+                    it->layers ? std::countr_zero(it->layers) : -1;
+      if (l >= 0) v.s = b.copper_name(l);
+    }
     else if (n.name == "Reference" || n.name == "Parent.Reference")
-      v.s = it->footprint >= 0 ? b.footprints[static_cast<std::size_t>(it->footprint)].reference : "";
+      v.s = b.footprints[static_cast<std::size_t>(it->footprint)].reference;
     else if (n.name == "Pad_Type" && it->kind == ItemKind::Pad) {
       static const char* names[] = {"SMD", "Through-hole", "NPTH, mechanical", "Edge connector"};
       v.s = names[static_cast<int>(b.pads[static_cast<std::size_t>(it->index)].type)];
@@ -251,6 +406,9 @@ class Condition {
     } else if (n.name == "Width") {
       v.k = Value::K::Num;
       v.n = static_cast<double>(it->width);
+    } else if (n.name == "Position_X" || n.name == "Position_Y") {
+      v.k = Value::K::Num;
+      v.n = static_cast<double>(n.name == "Position_X" ? it->pos.x : it->pos.y);
     } else {
       ctx.unknown = true;
       v.k = Value::K::Undef;
@@ -269,30 +427,31 @@ class Condition {
     } else if (n.name == "existsOnLayer" && !n.args.empty()) {
       const int l = b.copper_index(n.args[0]);
       v.b = l >= 0 && (it->layers & model::layer_bit(l));
-    } else if ((n.name == "insideArea" || n.name == "intersectsArea" || n.name == "enclosedByArea") && !n.args.empty()) {
-      for (const auto& z : b.zones) {
-        if (!model::wildcard_match(n.args[0], z.name) || z.outline.empty()) continue;
-        const auto& poly = z.outline.front();
-        const bool all_in = geom::point_in_polygon({it->box.x0, it->box.y0}, poly) && geom::point_in_polygon({it->box.x1, it->box.y1}, poly) &&
-                            geom::point_in_polygon({it->box.x0, it->box.y1}, poly) && geom::point_in_polygon({it->box.x1, it->box.y0}, poly);
-        bool any = geom::point_in_polygon(it->pos, poly);
-        if (!any) {
-          const geom::Shape area = geom::Shape::polygon(poly, 0);
-          for (const auto& s : it->shapes)
-            if (geom::closer_than(s, area, 1)) { any = true; break; }
-        }
-        if (n.name == "intersectsArea" ? any : all_in) { v.b = true; break; }
-      }
+    } else if ((n.name == "insideArea" || n.name == "intersectsArea" || n.name == "enclosedByArea") && n.args.size() == 1) {
+      v.b = ctx.reference ? ctx.eng->geometry_->area_reference(*it, n.args[0], n.name == "enclosedByArea") :
+                            ctx.eng->geometry_->area(*it, n.regions, n.name == "enclosedByArea");
+    } else if ((n.name == "intersectsCourtyard" || n.name == "insideCourtyard" ||
+                n.name == "intersectsFrontCourtyard" || n.name == "insideFrontCourtyard" ||
+                n.name == "intersectsBackCourtyard" || n.name == "insideBackCourtyard") && n.args.size() == 1) {
+      const int side = n.name.find("Front") != std::string::npos ? 1 : n.name.find("Back") != std::string::npos ? 2 : 0;
+      v.b = ctx.reference ? ctx.eng->geometry_->courtyard_reference(*it, n.args[0], side) :
+                            ctx.eng->geometry_->courtyard(*it, n.regions);
     } else if (n.name == "inDiffPair" && !n.args.empty()) {
       // KiCad: true when the item's net is one half of a differential pair whose base name (without the final
       // P/N or +/-) matches the pattern.
       const auto net = static_cast<std::size_t>(it->net);
       if (it->net != 0 && net < ctx.eng->dp_partner_.size() && ctx.eng->dp_partner_[net] != 0) {
         const std::string& name = b.nets[net].name;
-        v.b = model::wildcard_match(n.args[0], name.substr(0, name.size() - 1)) || model::wildcard_match(n.args[0], name);
+        v.b = model::wildcard_match(n.args[0], std::string_view(name).substr(0, name.size() - 1)) || model::wildcard_match(n.args[0], name);
       }
     } else if (n.name == "memberOfFootprint" && !n.args.empty()) {
-      v.b = it->footprint >= 0 && model::wildcard_match(n.args[0], b.footprints[static_cast<std::size_t>(it->footprint)].reference);
+      if (it->footprint >= 0) {
+        const auto& fp = b.footprints[static_cast<std::size_t>(it->footprint)];
+        v.b = model::wildcard_match(n.args[0], n.args[0].find(':') != std::string::npos ? fp.lib_id : fp.reference);
+      }
+    } else if (n.name == "memberOfGroup" && n.args.size() == 1 && it->index < 0 &&
+               (it->kind == ItemKind::Track || it->kind == ItemKind::Arc || it->kind == ItemKind::Via)) {
+      v.b = false;  // Free router-created copper has neither a footprint nor group parent (KiCad 10.0.3).
     } else {
       ctx.unknown = true;
       v.k = Value::K::Undef;
@@ -338,9 +497,15 @@ class Condition {
 
 // ---------------------------------------------------------------------------------------------------------
 
-RuleEngine::RuleEngine(const model::Board& b, const model::DesignRules& r) : b_(b), r_(r) {
+RuleEngine::RuleEngine(const model::Board& b, const model::DesignRules& r)
+    : b_(b), r_(r) {
+  if (r_.unreadable_custom_rules) {
+    needs_exact_ = true;
+    warnings_.push_back("custom rules could not be read; routing is disabled until the rule file is repaired");
+  }
   for (const auto& rule : r_.custom) {
-    Compiled c{&rule, nullptr, true};
+    Compiled c;
+    c.rule = &rule;
     if (!rule.condition.empty()) {
       std::string err;
       c.cond = Condition::parse(rule.condition, rule.origin, err);
@@ -348,25 +513,40 @@ RuleEngine::RuleEngine(const model::Board& b, const model::DesignRules& r) : b_(
         if (rule.origin == model::RuleOrigin::Synthetic)
           throw std::runtime_error("synthetic rule '" + rule.name + "': cannot parse condition (" + err + ")");
         c.valid = false;
-        warnings_.push_back("rule '" + rule.name + "': cannot parse condition (" + err + "); rule ignored");
+        warnings_.push_back("rule '" + rule.name + "': cannot parse condition (" + err + "); conservatively assumed to match");
       }
     }
-    c.positional = c.cond && c.cond->references({"insideArea", "intersectsArea", "enclosedByArea", "memberOfFootprint",
-                                               "Reference", "Parent.Reference", "Pad_Type", "Width", "Size_X", "Size_Y"});
-    const bool nets_seen = c.cond && c.cond->references({"NetName", "NetClass", "inDiffPair"});
+    Condition::Capabilities capabilities;
+    if (c.cond) {
+      capabilities = c.cond->capabilities();
+      if (capabilities.dependencies & Condition::Spatial) {
+        if (!geometry_) geometry_ = std::make_unique<RuleGeometry>(b);
+        c.cond->validate_geometry(*geometry_, capabilities);
+        c.cond->bind_geometry(*geometry_);
+      }
+    }
+    c.item_dependent = capabilities.dependencies & Condition::Item;
+    c.non_monotone = capabilities.non_monotone || (capabilities.dependencies & Condition::Anchor);
+    c.unsupported = !capabilities.unsupported.empty();
+    c.unknown_except_membership = capabilities.unknown_except_membership;
+    for (const auto& symbol : capabilities.unsupported)
+      warnings_.push_back("rule '" + rule.name + "': unsupported symbol " + symbol + "; conservatively assumed to match where unknown");
+    const bool nets_seen = capabilities.dependencies & Condition::Net;
     for (const auto& k : rule.constraints) {
       if (k.type == "clearance" && k.min) max_clearance_ = std::max(max_clearance_, *k.min);
-      if (k.type == "physical_hole_clearance" && k.min && c.valid) max_physical_hole_ = std::max(max_physical_hole_, *k.min);
-      // Rules outside the per-class cache need exact checks, including unreadable conditions.
-      if (!c.valid || (k.type != "disallow" && !(k.type == "physical_hole_clearance" && !nets_seen))) needs_exact_ = true;
-      if (k.type != "disallow" || !c.valid) continue;
+      if (k.type == "physical_hole_clearance" && k.min) max_physical_hole_ = std::max(max_physical_hole_, *k.min);
+      // Static class-uniform disallows retain the existing caches. Item residuals and subtype spans do not.
+      const bool subtype = k.type == "disallow" && std::any_of(k.items.begin(), k.items.end(), [](const auto& w) {
+        return w == "through_via" || w == "blind_via" || w == "buried_via" || w == "micro_via" || w == "hole";
+      });
+      if (!c.valid || c.unsupported || (k.type == "disallow" ? c.item_dependent || subtype :
+          !(k.type == "physical_hole_clearance" && !nets_seen))) needs_exact_ = true;
+      if (k.type != "disallow") continue;
       for (const auto& w : k.items)
         if (w != "track" && w != "via" && w != "through_via" && w != "micro_via" && w != "buried_via" && w != "blind_via" && w != "pad" &&
             w != "zone" && w != "graphic")
-          warnings_.push_back("rule '" + rule.name + "': disallow " + w + " is not checked by TraceMaker (KiCad's DRC still reports it)");
-      if (c.positional)
-        warnings_.push_back("rule '" + rule.name +
-                            "': disallow condition depends on position or footprint; the router does not avoid it, the DRC reports it");
+          warnings_.push_back("rule '" + rule.name + "': unsupported disallow item " + w +
+                              "; existing-item DRC coverage unavailable; hole predicates conservatively block new vias");
     }
     rules_.push_back(std::move(c));
   }
@@ -387,6 +567,31 @@ RuleEngine::RuleEngine(const model::Board& b, const model::DesignRules& r) : b_(
     else if (last == '-') last = '+';
     else continue;
     if (auto it = by_name.find(other); it != by_name.end()) dp_partner_[static_cast<std::size_t>(n.id)] = it->second;
+  }
+  // Partial evaluation is per net and actual candidate kind, never a net-class representative.
+  for (auto& c : rules_) {
+    const bool disallow = std::any_of(c.rule->constraints.begin(), c.rule->constraints.end(),
+                                     [](const auto& k) { return k.type == "disallow"; });
+    if (!disallow || !c.valid || c.unknown_except_membership) continue;
+    c.track_static.resize(b_.nets.size(), 2);
+    c.via_static.resize(b_.nets.size(), 2);
+    for (const auto& net : b_.nets)
+      for (const auto kind : {ItemKind::Track, ItemKind::Via}) {
+        CopperItem probe;
+        probe.kind = kind;
+        probe.net = net.id;
+        EvalCtx context{this, &probe, nullptr, -1};
+        const auto verdict = c.cond ? c.cond->static_result(context) : std::optional<bool>(true);
+        auto& cache = kind == ItemKind::Track ? c.track_static : c.via_static;
+        if (verdict) cache[static_cast<std::size_t>(net.id)] = *verdict ? 1 : 0;
+      }
+    std::map<std::string, std::pair<std::uint8_t, std::uint8_t>> class_verdicts;
+    for (const auto& net : b_.nets) {
+      const auto id = static_cast<std::size_t>(net.id);
+      const auto verdict = std::pair{c.track_static[id], c.via_static[id]};
+      const auto [previous, inserted] = class_verdicts.emplace(net_class_[id]->name, verdict);
+      if (!inserted && previous->second != verdict) needs_exact_ = true;
+    }
   }
   for (const auto& rule : r_.custom)
     for (const auto& k : rule.constraints)
@@ -417,96 +622,96 @@ bool RuleEngine::layer_matches(const std::string& sel, int layer) const {
   if (sel == "inner") return layer > 0 && layer < last;
   return b_.copper_index(sel) == layer;
 }
+bool RuleEngine::condition_matches(const Compiled& c, const CopperItem* a, const CopperItem* b, int layer, bool reference) const {
+  // An unreadable exception cannot relax a known prohibition or minimum.
+  if (!c.valid || (c.unsupported && (c.unknown_except_membership || !a || a->index >= 0)))
+    return c.rule->severity != "ignore";
+  if (!c.cond) return true;
+  EvalCtx ctx{this, a, b, layer, false, reference};
+  const bool match = c.cond->eval(ctx);
+  return ctx.unknown ? c.rule->severity != "ignore" : match;
+}
+
 
 std::optional<Coord> RuleEngine::custom_min(const char* type, const CopperItem* a, const CopperItem* b, int layer) const {
   std::optional<Coord> out;
+  std::optional<Coord> conservative_min;
   std::optional<Coord> synthetic_min;
   for (const auto& c : rules_) {
-    if (!c.valid || !layer_matches(c.rule->layer, layer)) continue;
+    if (!layer_matches(c.rule->layer, layer)) continue;
     const model::Constraint* k = nullptr;
     for (const auto& x : c.rule->constraints)
       if (x.type == type && x.min) k = &x;
     if (!k) continue;
-    bool match = true;
-    if (c.cond) {
-      EvalCtx ctx{this, a, b, layer};
-      match = c.cond->eval(ctx);
-      if (!match && b) {
-        EvalCtx ctx2{this, b, a, layer};
-        match = c.cond->eval(ctx2);
-      }
-    }
+    const bool uncertain = !c.valid || c.unsupported;
+    const bool match = condition_matches(c, a, b, layer) || (b && condition_matches(c, b, a, layer));
     if (match) {
-      if (c.rule->origin == model::RuleOrigin::Synthetic)
+      if (uncertain)
+        conservative_min = std::max(conservative_min.value_or(*k->min), *k->min);
+      else if (c.rule->origin == model::RuleOrigin::Synthetic)
         synthetic_min = std::max(synthetic_min.value_or(*k->min), *k->min);
       else
-        out = *k->min;  // project rules retain KiCad's later-rule precedence
+        out = c.rule->severity == "ignore" ? 0 : *k->min;
     }
   }
   // A route preference may strengthen, but never replace or weaken, the project's selected minimum.
   if (synthetic_min) out = std::max(out.value_or(*synthetic_min), *synthetic_min);
+  if (conservative_min) out = std::max(out.value_or(*conservative_min), *conservative_min);
+  return out;
+}
+
+std::optional<Coord> RuleEngine::custom_max(const char* type, const CopperItem* a, const CopperItem* b, int layer) const {
+  std::optional<Coord> out, conservative;
+  for (const auto& c : rules_) {
+    if (!layer_matches(c.rule->layer, layer)) continue;
+    const model::Constraint* k = nullptr;
+    for (const auto& x : c.rule->constraints)
+      if (x.type == type && x.max) k = &x;
+    if (!k || !condition_matches(c, a, b, layer)) continue;
+    if (!c.valid || c.unsupported || c.rule->origin == model::RuleOrigin::Synthetic)
+      conservative = std::min(conservative.value_or(*k->max), *k->max);
+    else
+      out = c.rule->severity == "ignore" ? std::nullopt : k->max;
+  }
+  if (conservative) out = std::min(out.value_or(*conservative), *conservative);
   return out;
 }
 
 std::pair<std::optional<Coord>, std::optional<Coord>> RuleEngine::length_constraint(model::NetId net) const {
-  std::pair<std::optional<Coord>, std::optional<Coord>> out;
-  CopperItem probe;
-  probe.kind = ItemKind::Track;
-  probe.net = net;
-  probe.layers = ~model::LayerMask{0};
-  for (const auto& c : rules_) {
-    if (!c.valid) continue;
-    const model::Constraint* k = nullptr;
-    for (const auto& x : c.rule->constraints)
-      if (x.type == "length") k = &x;
-    if (!k) continue;
-    if (c.cond) {
-      EvalCtx ctx{this, &probe, nullptr, -1};
-      if (!c.cond->eval(ctx)) continue;
-    }
-    out = {k->min, k->max};  // later rules take precedence
-  }
-  return out;
+  const auto constraint = net_constraint(net, "length");
+  return constraint ? std::pair{constraint->min, constraint->max} :
+                      std::pair<std::optional<Coord>, std::optional<Coord>>{};
 }
 
 std::optional<Coord> RuleEngine::skew_constraint(model::NetId net) const {
-  std::optional<Coord> out;
-  CopperItem probe;
-  probe.kind = ItemKind::Track;
-  probe.net = net;
-  probe.layers = ~model::LayerMask{0};
-  for (const auto& c : rules_) {
-    if (!c.valid) continue;
-    const model::Constraint* k = nullptr;
-    for (const auto& x : c.rule->constraints)
-      if (x.type == "skew" && x.max) k = &x;
-    if (!k) continue;
-    if (c.cond) {
-      EvalCtx ctx{this, &probe, nullptr, -1};
-      if (!c.cond->eval(ctx)) continue;
-    }
-    out = k->max;
-  }
-  return out;
+  const auto constraint = net_constraint(net, "skew");
+  return constraint ? constraint->max : std::nullopt;
 }
 
 std::optional<model::Constraint> RuleEngine::net_constraint(model::NetId net, const std::string& type) const {
   std::optional<model::Constraint> out;
+  model::Constraint conservative;
   CopperItem probe;
   probe.kind = ItemKind::Track;
   probe.net = net;
   probe.layers = ~model::LayerMask{0};
   for (const auto& c : rules_) {
-    if (!c.valid) continue;
     const model::Constraint* k = nullptr;
     for (const auto& x : c.rule->constraints)
       if (x.type == type) k = &x;
     if (!k) continue;
-    if (c.cond) {
-      EvalCtx ctx{this, &probe, nullptr, -1};
-      if (!c.cond->eval(ctx)) continue;
+    if (!condition_matches(c, &probe, nullptr, -1)) continue;
+    if (!c.valid || c.unsupported) {
+      if (k->min) conservative.min = std::max(conservative.min.value_or(*k->min), *k->min);
+      if (k->max) conservative.max = std::min(conservative.max.value_or(*k->max), *k->max);
+      continue;
     }
     out = *k;  // later rules take precedence
+  }
+  if (conservative.min || conservative.max) {
+    if (!out) { out.emplace(); out->type = type; }
+    if (conservative.min) out->min = std::max(out->min.value_or(*conservative.min), *conservative.min);
+    if (conservative.max) out->max = std::min(out->max.value_or(*conservative.max), *conservative.max);
   }
   return out;
 }
@@ -522,53 +727,106 @@ bool disallow_word_matches(const std::string& w, const CopperItem& it, const mod
     case ItemKind::Graphic: return w == "graphic";
     case ItemKind::Via: {
       if (w == "via") return true;
-      const auto type = it.index >= 0 ? b.vias[static_cast<std::size_t>(it.index)].type : model::ViaType::Through;
+      const auto type = it.index >= 0 ? b.vias[static_cast<std::size_t>(it.index)].type : it.via_type;
+      const auto outer = model::layer_bit(0) | model::layer_bit(b.copper_count() - 1);
+      const bool blind = type == model::ViaType::Blind && (it.layers & outer);
+      const bool buried = type == model::ViaType::Blind && !(it.layers & outer);
       return (w == "through_via" && type == model::ViaType::Through) || (w == "micro_via" && type == model::ViaType::Micro) ||
-             ((w == "buried_via" || w == "blind_via") && type == model::ViaType::Blind);
+             (w == "buried_via" && buried) || (w == "blind_via" && blind) ||
+             (w == "hole" && it.index < 0);  // unsupported hole predicates must not admit newly created holes
     }
   }
   return false;
 }
 }  // namespace
 
-bool RuleEngine::disallow_hit(const Compiled& c, const CopperItem& it, int layer) const {
-  if (!c.valid || !layer_matches(c.rule->layer, layer)) return false;
+bool RuleEngine::disallow_hit(const Compiled& c, const CopperItem& it, int layer, bool reference) const {
+  if (!c.rule->layer.empty()) {
+    bool shared = false;
+    for (auto mask = it.layers; mask; mask &= mask - 1)
+      shared = shared || layer_matches(c.rule->layer, std::countr_zero(mask));
+    if (!shared) return false;
+  }
   bool typed = false;
   for (const auto& k : c.rule->constraints)
     if (k.type == "disallow")
       for (const auto& w : k.items) typed = typed || disallow_word_matches(w, it, b_);
   if (!typed) return false;
-  if (!c.cond) return true;
-  EvalCtx ctx{this, &it, nullptr, layer};
-  return c.cond->eval(ctx) && !ctx.unknown;  // an unsupported property never makes a rule fire
+  if (!reference && it.index < 0 && (it.kind == ItemKind::Track || it.kind == ItemKind::Arc || it.kind == ItemKind::Via)) {
+    const auto& cache = it.kind == ItemKind::Via ? c.via_static : c.track_static;
+    const auto net = static_cast<std::size_t>(it.net);
+    if (net < cache.size() && cache[net] < 2) return cache[net] != 0;
+  }
+  (void) layer;
+  // KiCad's disallow provider evaluates unary constraints with UNDEFINED_LAYER, then filters item layers.
+  return condition_matches(c, &it, nullptr, -1, reference);
 }
 
-std::optional<std::string> RuleEngine::disallowed(const CopperItem& it, int layer) const {
-  std::optional<std::string> out;
-  for (const auto& c : rules_)
-    if (disallow_hit(c, it, layer)) out = c.rule->name;
+const RuleEngine::Compiled* RuleEngine::disallow_rule(const CopperItem& it, int layer, bool search, bool reference) const {
+  const Compiled* out = nullptr;
+  if (search)
+    for (const auto& c : rules_)
+      if (c.valid && !c.unsupported && c.item_dependent && c.rule->severity == "ignore" &&
+          std::any_of(c.rule->constraints.begin(), c.rule->constraints.end(), [](const auto& k) { return k.type == "disallow"; }))
+        return nullptr;  // a whole-item spatial exception may rescue the geometry-less probe
+  for (const auto& c : rules_) {
+    if (search && c.item_dependent) continue;
+    if (disallow_hit(c, it, layer, reference))
+      out = c.rule->severity == "ignore" ? nullptr : &c;
+  }
   return out;
 }
 
+std::optional<std::string> RuleEngine::disallowed(const CopperItem& it, int layer) const {
+  const auto* c = disallow_rule(it, layer, false);
+  return c ? std::optional<std::string>(c->rule->name) : std::nullopt;
+}
+std::string_view RuleEngine::disallow_severity(const CopperItem& it, int layer) const {
+  const auto* c = disallow_rule(it, layer, false);
+  return c && !c->rule->severity.empty() ? std::string_view(c->rule->severity) : std::string_view("error");
+}
+
+
+bool RuleEngine::candidate_allowed(const CopperItem& it, int layer) const {
+  return !r_.unreadable_custom_rules && !disallow_rule(it, layer, false);
+}
+bool RuleEngine::candidate_allowed_reference(const CopperItem& it, int layer) const {
+  return !r_.unreadable_custom_rules && !disallow_rule(it, layer, false, true);
+}
+
+
+bool RuleEngine::candidate_search_allowed(const CopperItem& it, int layer) const {
+  if (r_.unreadable_custom_rules) return false;
+  // Disk rejection is valid only for monotone prohibitions; an ignored spatial exception may rescue a
+  // whole segment even when its endpoint disk is forbidden by an earlier rule.
+  for (const auto& c : rules_)
+    if (c.non_monotone || (c.item_dependent && c.rule->severity == "ignore")) return true;
+  return !disallow_rule(it, layer, false);
+}
+
 bool RuleEngine::track_allowed(model::NetId net, int layer) const {
+  if (r_.unreadable_custom_rules) return false;
   CopperItem probe;
   probe.kind = ItemKind::Track;
   probe.net = net;
   probe.layers = model::layer_bit(layer);
-  for (const auto& c : rules_)
-    if (!c.positional && disallow_hit(c, probe, layer)) return false;
-  return true;
+  probe.anchor_layer = layer;
+  return !disallow_rule(probe, layer, true);
 }
 
 bool RuleEngine::via_allowed(model::NetId net) const {
-  CopperItem probe;  // a through via: on every copper layer
+  if (r_.unreadable_custom_rules) return false;
+  for (const auto& c : rules_)
+    for (const auto& k : c.rule->constraints)
+      if (k.type == "disallow" && std::any_of(k.items.begin(), k.items.end(), [](const auto& word) {
+            return word == "through_via" || word == "blind_via" || word == "buried_via" || word == "micro_via";
+          })) return true;  // through-via permission alone cannot rule out every possible span/type
+  CopperItem probe;
   probe.kind = ItemKind::Via;
   probe.net = net;
+  probe.anchor_layer = 0;
   for (int l = 0; l < b_.copper_count(); ++l) probe.layers |= model::layer_bit(l);
-  for (const auto& c : rules_)
-    for (int l = 0; l < b_.copper_count(); ++l)
-      if (!c.positional && disallow_hit(c, probe, l)) return false;
-  return true;
+  return !disallow_rule(probe, -1, true);
 }
 
 Coord RuleEngine::physical_hole_clearance(const CopperItem* hole_owner, const CopperItem& other, int layer) const {
@@ -636,11 +894,12 @@ Coord RuleEngine::edge_clearance(const CopperItem& a, int layer) const {
 std::pair<Coord, Coord> RuleEngine::track_width(const CopperItem& t, int layer) const {
   Coord mn = r_.minimums.track_width, mx = 0;
   if (auto c = custom_min("track_width", &t, nullptr, layer)) mn = *c;
+  if (auto c = custom_max("track_width", &t, nullptr, layer)) mx = *c;
   return {mn, mx};
 }
 
 Coord RuleEngine::via_diameter_min(const CopperItem& v) const {
-  Coord req = r_.minimums.via_diameter;
+  Coord req = v.via_type == model::ViaType::Micro ? r_.minimums.microvia_diameter : r_.minimums.via_diameter;
   if (auto c = custom_min("via_diameter", &v, nullptr, -1)) req = *c;
   return req;
 }
@@ -652,7 +911,8 @@ Coord RuleEngine::annular_width_min(const CopperItem& v) const {
 }
 
 Coord RuleEngine::hole_size_min(const CopperItem* owner) const {
-  Coord req = r_.minimums.through_hole_diameter;
+  Coord req = owner && owner->kind == ItemKind::Via && owner->via_type == model::ViaType::Micro ?
+                  r_.minimums.microvia_drill : r_.minimums.through_hole_diameter;
   if (auto c = custom_min("hole_size", owner, nullptr, -1)) req = *c;
   return req;
 }

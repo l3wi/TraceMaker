@@ -20,6 +20,7 @@ struct Violation {
   std::string type;
   std::string severity = "error";
   std::string description;
+  std::string rule;  // selected custom-rule name, empty for built-in constraints
   std::vector<ViolationItem> items;
   Coord actual = -1, required = -1;
   int layer = -1;
@@ -35,6 +36,7 @@ struct DrcReport {
   std::vector<Violation> violations;
   std::vector<Violation> unconnected;
   std::vector<std::string> warnings;
+  bool needs_exact_routing = false;  // capability metadata for board preparation, not a DRC verdict
   std::map<std::string, int> counts() const;
 };
 

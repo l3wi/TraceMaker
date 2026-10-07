@@ -28,6 +28,12 @@ fields; A* and exact legality checks stay on the CPU. Kernels are embedded, so n
 needed. `gpu-info` reports working-set headroom, not system-wide free memory. See
 [docs/07-gpu.md](docs/07-gpu.md) for scope and verification.
 
+Area/courtyard rule geometry also requires Clipper2 (1.5.x or newer). CMake prefers an installed
+`Clipper2Config.cmake` (set `CMAKE_PREFIX_PATH` or `Clipper2_DIR` for a local installation); otherwise it
+fetches the pinned 1.5.4 source. For an offline build, install Clipper2 first or provide its already
+downloaded source via `FETCHCONTENT_SOURCE_DIR_TM_CLIPPER2`. Dependency headers are treated as system
+headers so TraceMaker's `-Werror` does not promote upstream header diagnostics.
+
 Install KiCad separately and put `kicad-cli` on `PATH` for external DRC. The route command does not run that
 check automatically. Build the browser viewer with the `viewer/` command below.
 

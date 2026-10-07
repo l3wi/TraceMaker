@@ -73,6 +73,7 @@ struct Graphic {
   Point a, b, c;             // line: a→b; arc: start a, mid c, end b; circle: centre a, point b; rect: a,b corners
   std::vector<Point> pts;    // poly / curve control points
   Coord width = 0;
+  Coord corner_radius = 0;   // KiCad rounded rectangle (radius); retained for exact courtyard geometry
   bool filled = false;
   NetId net = 0;             // KiCad 8+ copper graphics can belong to a net
   int footprint = -1;        // owning footprint, -1 for board graphics
@@ -147,6 +148,7 @@ struct Zone {
   LayerMask copper = 0;
   std::vector<std::string> layers;
   std::string name;
+  std::string uuid;          // selector identity for custom-rule area predicates
   int priority = 0;
   Coord clearance = -1;      // (connect_pads (clearance x)): the zone's local clearance override, -1 = none
   bool rule_area = false;

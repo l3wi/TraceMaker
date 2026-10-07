@@ -228,3 +228,29 @@ plane test. The esp `base` result ties under the 2% cost floor; `vop` wins there
 - Results go to `bench/results/<run>/` and the progress site's benchmark panel.
 - Latest (`final8`): tier A 100% clean, B 65.0%, C 56.7%, D 50.0% (Freerouting 2.5.0-RC12: 100%, 50.0%, 46.7%,
   36.4%); no router-introduced DRC errors on any board.
+
+## 7. Positional disallow regression (D65, 2026-10-07)
+
+- The 30-board quick selection from `wave2-quick` was rerun as `d65-quick`, paired with the
+  assigned previous engine executable in `d65-baseline`: 1,000,000 work units, one variant,
+  one routing thread, 60 s safety limit, two benchmark jobs. KiCad 10.0.3 refilled both boards.
+  All 30 final-engine board files were byte-identical to the assigned baseline; clean pass
+  remained 13/30 (43.3%), mean completion 89.3%, and added routing errors/judge failures were zero.
+  Aggregate reported routing time was 8.3 s versus 8.1 s; this is not evidence of a speed gain.
+  Comparing with the older saved `wave2-quick` files changes only generated UUIDs; the paired
+  executable comparison, not those older hashes, is the regression oracle.
+- StickHub was stripped of 1,380 unlocked tracks/arcs/vias and given `no_vias_under_u1`
+  (`A.insideCourtyard('U1')`, disallow via) and `no_tracks_in_analysis_area`
+  (`A.intersectsArea('analysis_area')`, disallow track). At 2,000,000 work units,
+  one variant and two threads, D65 routed 36/133 connections in 2.90 s, with 107 tracks and
+  10 vias. Both KiCad and TraceMaker reported **0 input / 0 output** `items_not_allowed`
+  violations. This intentionally restrictive board is not a completion benchmark.
+  The pre-D65 output had 173 KiCad disallow violations: the new engine now also finds exactly
+  173 (168 tracks from the area rule and five vias from the courtyard rule), rather than
+  overlooking the courtyard violations.
+- Applicable CTest coverage passed: 197 tests plus three skips; two KiCad 10.0.6-specific parity
+  oracles were excluded on the installed 10.0.3. Added coverage includes 37 C++ cases
+  (bound/linear predicates, holes/concavity, flipped per-side courtyards, rule identity,
+  precedence, unknown branches, exact candidate legality) and an eight-case preflight/route
+  integration check. GPU Philox, KiCad edit-roundtrip and catalogue sync retained their skips.
+

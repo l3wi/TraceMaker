@@ -42,17 +42,36 @@ and why.
 | No `.kicad_pro` beside the board | Net classes and board minimums are missing; the router warns and uses zeros | Keep the project files with the board |
 | Unfilled zones (no `filled_polygon`) | Connectivity is computed from fills; the router sees planes as absent | Refill all zones (`B` in KiCad, or `kicad-cli pcb drc --refill-zones --save-board`) and save |
 | Teardrop zones | Teardrops are track copper KiCad generates; left behind after deleting tracks they are stray pad copper. On one demo they cost 74 of the input's 87 connections | Remove teardrops before routing; regenerate them after |
-| Unparseable custom rule | The router ignores it (KiCad still enforces it) and it disables caches | Fix the condition syntax |
+| Unparseable custom rule or unsupported condition term | Whole unreadable rule files stop routing; unreadable/unknown conditions match conservatively and bypass caches, not as proven KiCad-equivalent rules | Fix syntax and unsupported terms before routing |
 | Open Edge.Cuts outline | Board area and edge clearance are undefined | Close the outline |
 
 Also check, though they are graded `quality`: **dead escape pins** from `tracemaker escape` (pins of dense
 packages with no way out on the router's lattice under the board's rules; usually a real placement or
 fan-out problem, occasionally routable off-lattice, and the router still tries them). The analysis treats
 existing tracks and zone fills as fixed obstacles and does not skip connected pins, so run it on the
-stripped board and read it with `--soft-zones` in mind. **Position or footprint `disallow` rules** are
-not avoided by the router; KiCad still enforces them, so prefer rule areas. A rule using a term TraceMaker
-cannot evaluate at all (courtyard functions, `memberOfGroup`, `Position_X/Y`) is `block`: neither the
-router nor `tracemaker drc` applies it.
+stripped board and read it with `--soft-zones` in mind.
+
+**Position/footprint `disallow track/via` rules are enforced before insertion**, including final track
+segments and actual via types/spans. Area, courtyard, coordinate and item-dimension predicates use the
+residual exact evaluator and bypass per-class obstacle caches/cost-to-go fields; they are speed findings,
+not “router ignores it” quality findings. `insideArea` aliases `intersectsArea`; `enclosedByArea` tests
+whole-item enclosure. Courtyard `inside...` names alias intersection, including front/back variants.
+
+The preflight structurally checks every condition term, even in a short-circuited branch. Supported
+properties are `NetClass`, `NetName`, `Type`, `Layer`, `Reference`, `Parent.Reference`, `Pad_Type`,
+`Size_X`, `Size_Y`, `Width`, `Position_X`, `Position_Y`, plus bare `L` (context layer, not `A.Layer`).
+Supported calls are `isPlated`, `existsOnLayer`, `insideArea`, `intersectsArea`, `enclosedByArea`,
+`inDiffPair`, `memberOfFootprint`, and generic/front/back courtyard intersection and inside aliases.
+Bind item properties/calls to `A.` or `B.`; only `L` is an unbound context symbol.
+Arbitrary names, `memberOfGroup` (existing group ancestry is unavailable), component-class selectors
+(`${Class:...}`), and unsupported disallow types such as `hole`, `footprint` and `text` are **block**.
+Free new tracks/vias have no footprint/group membership; membership is not physical overlap.
+Unknown/unparseable conditions conservatively match, but an ignored rule with an unknown condition
+cannot waive a known earlier constraint. This fallback is not proof of rule coverage.
+
+`tracemaker route` prints project and rule warnings to stderr before routing; its `--json` summary
+retains `project_warnings` and `rule_warnings` (the latter exactly the rule engine's diagnostics).
+Keep them with the baseline and still use KiCad's refilled DRC for sign-off.
 
 ### 3. Fix speed findings
 
@@ -61,9 +80,10 @@ Details and measurements: [references/rules-and-speed.md](references/rules-and-s
 - **Finest net class sets the grid for the whole board.** The routing pitch is (track + clearance) / 6
   of the finest class, between 25 and 100 µm. Delete unused classes; keep fine classes only for the
   nets that need them, assigned by pattern.
-- **Custom rules other than `disallow` and net-independent `physical_hole_clearance` turn off the
-  per-class caches for every net.** One custom `clearance` rule made a demo board route 2.15× slower.
-  Express clearances as net-class clearances where possible.
+- **All `disallow` rules, other custom constraints, and net-dependent `physical_hole_clearance`
+  bypass per-class obstacle caches and fields.** Prepared selector polygons are still cached. One custom
+  `clearance` rule made a demo board route 2.15× slower. Express clearances as net-class clearances where possible; retain
+  supported geometric disallows when they are design intent rather than replacing them with broader areas.
 - **Net-class name patterns are fine.** They are resolved once per net (this was the large speed-up on
   a private 4-layer board: 20M-work route 140 s → 10 s); use them freely.
 

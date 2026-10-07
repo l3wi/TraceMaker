@@ -38,6 +38,7 @@ class Checker {
 
   DrcReport run() {
     rep_.warnings = r_.warnings;
+    rep_.needs_exact_routing = re_.needs_exact_routing();
     for (const auto& w : re_.warnings()) rep_.warnings.push_back(w);
     build_grid();
     graph_ = item_graph(b_, cm_, *grid_);
@@ -483,8 +484,11 @@ class Checker {
       if (it.kind == ItemKind::Zone && zones_done.count(it.index)) continue;
       for (model::LayerMask m = it.layers; m; m &= m - 1) {
         const int l = std::countr_zero(m);
-        if (!re_.disallowed(it, l)) continue;
-        add("items_not_allowed", &it, nullptr, -1, -1, l);
+        const auto rule = re_.disallowed(it, l);
+        if (!rule) continue;
+        add("items_not_allowed", &it, nullptr, -1, -1, l, std::string(re_.disallow_severity(it, l)));
+        rep_.violations.back().rule = *rule;
+        rep_.violations.back().description = "Item not allowed by rule '" + *rule + "'";
         if (it.kind == ItemKind::Zone) zones_done.insert(it.index);
         break;
       }
@@ -664,6 +668,7 @@ void write_drc_json(const DrcReport& rep, const std::string& path) {
     json items = json::array();
     for (const auto& it : v.items) items.push_back(item_json(it));
     json j{{"type", v.type}, {"severity", v.severity}, {"description", v.description}, {"items", items}};
+    if (!v.rule.empty()) j["rule"] = v.rule;
     if (v.required >= 0) j["required_mm"] = nm_to_mm(v.required);
     if (v.actual >= 0) j["actual_mm"] = nm_to_mm(v.actual);
     return j;
@@ -672,6 +677,7 @@ void write_drc_json(const DrcReport& rep, const std::string& path) {
   for (const auto& v : rep.violations) d["violations"].push_back(vjson(v));
   for (const auto& v : rep.unconnected) d["unconnected_items"].push_back(vjson(v));
   d["warnings"] = rep.warnings;
+  d["needs_exact_routing"] = rep.needs_exact_routing;
   std::ofstream(path) << d.dump(1);
 }
 

@@ -398,7 +398,7 @@ global routing; no rounded or arc corners; skew in picoseconds needs the stackup
 one half reduce coupling locally (both halves meandering together is not built); per-pair skew limits from the
 component-rule catalogue are not wired (one global `--pair-skew-mm`).
 
-## 16. Custom-rule routing (2026-10-06, D56)
+## 16. Custom-rule routing (2026-10-06 D56; positional enforcement D65)
 
 **Before.** Any custom rule disabled the obstacle cache and cost-to-go fields. Via-only keepouts were ignored.
 
@@ -406,18 +406,46 @@ component-rule catalogue are not wired (one global `--pair-skew-mm`).
 
 | Rule | Router | DRC (`tracemaker drc`) |
 |---|---|---|
-| `disallow track` by net, net class, type or layer, including `inDiffPair` | `RuleEngine::track_allowed` supplies per-net layer masks for pad cells, escapes, planar moves, via landings, diff-pair legs, escape corridors and fields. Through vias may pass through disallowed track layers. | `items_not_allowed`, once per item |
-| `disallow via`, `through_via`, `micro_via`, `buried_via` or `blind_via` with those conditions | `via_allowed` rejects vias for a net if a through via matches on any layer; the net then gets no blind or buried vias either (`--blind-vias`). | `items_not_allowed` |
-| Positional, footprint or pad-dependent `disallow` (`insideArea`, `intersectsArea`, `enclosedByArea`, `memberOfFootprint`, `Reference`, `Pad_Type`, `Width`) | Warned; not applied. | Reported |
-| `disallow hole / footprint / text` | Warned; not applied. | Left to KiCad |
+| `disallow track` by net, net class, type or layer, including `inDiffPair` | `RuleEngine::track_allowed` supplies coarse per-net layer permissions; exact candidate checks remain authoritative for pad escapes, planar segments, pair legs, corridors and final geometry. Through vias may pass through disallowed track layers. | `items_not_allowed`, once per item, with selected rule name |
+| `disallow via`, `through_via`, `micro_via`, `buried_via` or `blind_via` | Exact checks use the proposed via's geometry, actual type and span; a through-via decision cannot prohibit a different legal subtype. | `items_not_allowed`, with selected rule name |
+| Positional, footprint or pad-dependent `disallow` (area/courtyard, coordinates, ownership/reference, dimensions) | Enforced on actual candidate tracks/vias and final segments; residual predicates bypass class caches and fields. | Reported with the same condition evaluator |
+| `disallow hole / footprint / text` or unknown item types | Unsupported coverage is warned and preflight-blocked; matching hole predicates conservatively reject new vias. | Left to KiCad; no full-item-coverage claim |
 | `physical_hole_clearance` | `Obstacles::physical_hole_blocked` checks new via holes against fixed copper of any net, including the same net, on cached and exact paths. Same-net routed copper is not checked. | `hole_clearance`, once per hole and item, any net |
 | Keepout rule areas | Tracks and vias use their respective keepout flags. | Unchanged |
 
-Disallow masks retain the per-class cache. Physical-hole rules do too when independent of `NetName`, `NetClass`
-and `inDiffPair`. Other custom rules, including unparseable conditions, require exact checks.
+Static net/class/type disallows retain class caches when predicates are uniform within each class.
+Item/geometry predicates, subtype spans and actual same-class net differences bypass those caches
+and fields. Prepared selector polygons and per-net/kind partial verdicts remain cached, with plain
+AST/linear-reference equality tests. A representative net cannot encode differing net-qualified
+regions, coordinates, candidate widths or actual via spans. Search disks
+are provisional geometry; final segments, merged tracks, via landings, pair legs, escape copper and
+cleanup must pass the exact candidate evaluator before insertion. Physical-hole rules retain caches
+when independent of `NetName`, `NetClass` and `inDiffPair`; other custom constraints require exact checks.
+Coarse per-net permissions are independent of cache eligibility: known static prohibitions still
+exclude unreachable soft-plane layers/nets, while spatial ignored exceptions and subtype choices
+leave masks optimistic. Track disk samples round odd widths down; width/enclosure/coordinate
+predicates that could overblock a legal whole segment remain provisional. Final segments enforce
+track-width minima/maxima, and actual via checks enforce diameter/drill/annular manufacturing floors.
 
-KiCad's violation names and counts were checked with kicad-cli 10.0.3. Example: inner layers for GND only;
-no via in an SMD pad except on U1.
+The structural condition registry includes `NetClass`, `NetName`, `Type`, `Layer`, `Reference`,
+`Parent.Reference`, `Pad_Type`, `Size_X/Y`, `Width`, `Position_X/Y` and bare context-layer `L`.
+Calls include `isPlated`, `existsOnLayer`, `inDiffPair`, `memberOfFootprint`, area intersection/enclosure
+and generic/front/back courtyard intersection, including deprecated `inside...` aliases.
+Item properties and calls require `A.` / `B.` binding; only `L` is unbound.
+`A.Layer` denotes the item layer, not evaluation context `L`; coordinates are item anchors, not
+bounding boxes. Footprint membership is ownership, not geometric overlap. Free new tracks/vias have no
+footprint/group parent. Reference/library-ID selector wildcards are supported; component-class metadata
+and existing group ancestry are not.
+
+Unknown symbols are diagnosed even in short-circuited branches. Unknown/unparseable conditions match
+conservatively; unknown ignored rules cannot waive known earlier constraints, and unknown numeric
+constraints only strengthen known floors/caps. Whole unreadable custom-rule files stop routing.
+Route emits project/rule warnings to stderr and records separate `project_warnings` / `rule_warnings`
+arrays in the JSON summary. Conservative fallback and partial existing-item coverage do not establish
+blanket KiCad DRC parity; keep a baseline and run KiCad's refilled sign-off.
+
+The original static-rule example below was checked with kicad-cli 10.0.3: inner layers for GND only;
+no via in an SMD pad except on U1. These measurements predate D65's residual predicates.
 
 ```
 (rule "Inner layers carry GND only" (layer inner) (condition "A.NetName != 'GND'") (constraint disallow track))

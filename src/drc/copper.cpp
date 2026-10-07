@@ -143,6 +143,7 @@ CopperModel build_copper(const model::Board& b) {
     it.index = static_cast<int>(i);
     it.net = t.net;
     it.layers = model::layer_bit(t.layer);
+    it.anchor_layer = t.layer;
     it.shapes = {Shape::segment(t.a, t.b, t.width / 2)};
     it.pos = t.a;  // KiCad reports tracks at their start point
     it.width = t.width;
@@ -157,6 +158,7 @@ CopperModel build_copper(const model::Board& b) {
     it.index = static_cast<int>(i);
     it.net = t.net;
     it.layers = model::layer_bit(t.layer);
+    it.anchor_layer = t.layer;
     it.shapes = {Shape::polyline(geom::arc_points(t.a, t.mid, t.b, 100), t.width / 2)};  // 0.1 µm chords: well inside KiCad's epsilon
     it.pos = t.a;
     {
@@ -181,6 +183,8 @@ CopperModel build_copper(const model::Board& b) {
     it.kind = ItemKind::Via;
     it.index = static_cast<int>(i);
     it.net = v.net;
+    it.via_type = v.type;
+    it.anchor_layer = v.layer_top;
     for (int l = v.layer_top; l <= v.layer_bottom; ++l) it.layers |= model::layer_bit(l);
     it.shapes = {Shape::point(v.pos, v.size / 2)};
     it.free_via = v.free;

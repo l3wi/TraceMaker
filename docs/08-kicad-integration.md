@@ -43,14 +43,40 @@
 
 ## 4. Rule coverage policy
 
-- Every rule TraceMaker cannot interpret is reported as a warning with its location, and the router uses
-  the most conservative interpretation (for example, the largest clearance that could apply).
-- Phase 1 custom-rule conditions: `A.NetClass`, `A.NetName`, `A.Type`, `A.Layer`, `A.insideArea(...)`,
-  `A.intersectsArea(...)`, `A.isPlated()`, `A.Pad_Type`, `A.Reference`, boolean `&& || !`. Others later.
-- The router also enforces `disallow track/via` by net and layer, and `physical_hole_clearance` against fixed
-  copper (doc 05 §16). Positional `disallow` rules are warned and left to the DRC.
-- Numeric conditions support `< <= > >=`, unit literals (`mm`, `mil`, `in`) and local pad copper dimensions
-  `Size_X` / `Size_Y`; rotation does not change these dimensions (doc 05 §19).
+- Conditions are checked structurally against an explicit supported registry: all AST leaves are
+  diagnosed even when evaluation would short-circuit. Unknown/unparseable conditions conservatively
+  match, but ignored unknown rules cannot waive known earlier restrictions and unknown numeric rules
+  cannot weaken known floors/caps. Whole unreadable custom-rule files stop routing.
+- Supported properties: `NetClass`, `NetName`, `Type`, item `Layer`, `Reference`, `Parent.Reference`,
+  `Pad_Type`, local `Size_X` / `Size_Y`, `Width`, item-anchor `Position_X` / `Position_Y`. Bare `L`
+  binds the context layer; it is distinct from `A.Layer`. Item properties/calls require `A.` / `B.` binding.
+- Supported calls: `isPlated`, `existsOnLayer`, `inDiffPair`, `memberOfFootprint`, `insideArea`,
+  `intersectsArea`, `enclosedByArea`, `intersectsCourtyard`, `intersectsFrontCourtyard`,
+  `intersectsBackCourtyard`, and corresponding generic/front/back `inside...` courtyard aliases.
+  `insideArea` and courtyard inside aliases mean intersection, not containment; `enclosedByArea`
+  uses whole geometry. Reference/library-ID wildcards select footprints; area selectors include names
+  and UUIDs. Courtyard geometry comes from actual closed per-side outlines, never placement hulls.
+  Front/back courtyard variants swap the selected side on flipped footprints, following KiCad 10.
+  Prepared area targets use their outline, not refilled target copper; zone-as-target fill-sensitive
+  parity is not claimed. Polygon normalization/enclosure use pinned Clipper2 integer Boolean operations.
+  For a zone being tested, intersection uses its fill; enclosure and courtyard predicates use its outline.
+  Intersection deflates area outlines by 0.5 µm; courtyards use 5 µm deflation/curve tessellation and
+  20 µm endpoint chaining. A selected missing/malformed courtyard or area outline produces an
+  unsupported-symbol diagnostic and conservative matching, never a hull or pad-box fallback.
+  Courtyard functions do not themselves restrict copper layers; use a layer predicate when required.
+- The router enforces supported positional/item-dependent `disallow track/via` on actual candidates
+  and final geometry (D65; doc 05 §16). Class-uniform static net/class/type disallows remain cached;
+  item/geometry predicates, subtype spans and differing same-class net predicates bypass class caches/fields.
+  Prepared selector polygons remain cached and reference-tested.
+  `physical_hole_clearance` remains enforced against fixed copper.
+- Existing `memberOfGroup` ancestry, `${Class:...}` selector metadata and `disallow hole/footprint/text`
+  coverage are unsupported and preflight-blocked. Free new tracks/vias have no ownership membership.
+  Matching hole predicates conservatively reject candidate vias because they create unchecked holes.
+  Conservative fallback is not KiCad parity; unsupported existing items still need KiCad sign-off.
+- `route` sends rule/project diagnostics to stderr before routing and includes `rule_warnings`
+  (exactly `RuleEngine::warnings()`) and `project_warnings` arrays in its JSON summary.
+- Numeric conditions support `< <= > >=`, unit literals (`mm`, `mil`, `in`) and local pad copper
+  dimensions; rotation does not change these dimensions (doc 05 §19).
 - `route --keep-vias-off-pads [MM]` appends a synthetic, net-independent `physical_hole_clearance` rule to a
   route-only rules copy. Project files, the output board's rules and `tracemaker drc` are unchanged.
   Compilation failure of a synthetic rule is an error, not an ignored warning. KiCad checks this preference

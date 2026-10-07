@@ -32,14 +32,15 @@ TraceMaker reads the board's `.kicad_dru`. Whether a rule is cheap depends on it
 
 | Rule | Router behaviour | Speed |
 |---|---|---|
-| `disallow track/via` with conditions on `NetName`, `NetClass`, `Type`, `Layer` | Enforced as per-net layer masks / via switches | Cached |
+| `disallow track/via` with static net/class/type predicates | Pre-evaluated permissions guide search; actual candidate checks remain authoritative | **Cached if class-uniform**; bypassed if predicates differ for nets in one class |
 | `physical_hole_clearance` whose condition does not mention `NetName`, `NetClass` or `inDiffPair` | Enforced for every new via | Cached |
-| `physical_hole_clearance` that mentions a net or net class | Enforced | **Disables caches board-wide** |
-| `clearance` (any condition), and any other constraint type | Enforced exactly | **Disables caches board-wide** |
-| `disallow` with `insideArea`, `intersectsArea`, `enclosedByArea`, `memberOfFootprint`, `Reference`, `Pad_Type`, `Width`, `Size_X`, `Size_Y` | **Not avoided by the router**; KiCad DRC reports it | — |
-| `disallow hole/footprint/text` | Not checked by TraceMaker; KiCad DRC reports it | — |
-| Any rule whose condition uses a name TraceMaker cannot evaluate (`insideCourtyard`, `intersectsCourtyard`, `memberOfGroup`, `Position_X`, ...) | **Skipped by the router and by `tracemaker drc`**: an unknown term never makes a rule fire. Preflight grades it `block` | — |
-| Condition that does not parse | **Ignored by the router**, and disables caches | — |
+| `physical_hole_clearance` that mentions a net or net class | Enforced | **Bypasses caches board-wide** |
+| `clearance` (any condition), and any other constraint type | Enforced exactly | **Bypasses caches board-wide** |
+| `disallow` with area/courtyard, coordinates, footprint ownership/reference or item dimensions | **Enforced on actual tracks/vias**, including final geometry; residual exact evaluation | **Bypasses caches and cost-to-go fields** |
+| `disallow hole/footprint/text` or an unknown disallow type | Unsupported item coverage; preflight **block**. Matching hole predicates conservatively reject new vias | Not a supported routing configuration |
+| Unknown property/function, `memberOfGroup`, or unavailable `${Class:...}` selector metadata | Structural diagnostic, even in hidden Boolean branches; preflight **block**. Unknown conditions match conservatively, not as a silently skipped rule | Exact fallback; no KiCad-parity claim |
+| Condition that does not parse | Conservative matching; unknown ignored rules cannot waive known earlier restrictions; preflight **block** | **Bypasses caches** |
+| Whole `.kicad_dru` file that cannot be read | Routing stops rather than dropping the file's custom constraints | Fix before routing |
 
 Measured on StickHub (fixed work): one `clearance` rule conditioned on a single net made the run 2.15×
 slower. The caches go for the whole board, not just the net the rule names.
@@ -47,11 +48,36 @@ slower. The caches go for the whole board, not just the net the rule names.
 What to do:
 - Put clearances in net classes (a class per clearance need, assigned by pattern) instead of custom
   `clearance` rules.
-- Keep-out areas: use rule areas (zones with keep-out flags), not `insideArea()` conditions; the router
-  reads their track/via flags directly.
-- Run `tracemaker drc BOARD`: it prints a `warning:` line for every rule it ignores or does not avoid.
-  Those rules are still KiCad's to check after routing.
+- Keep-out areas directly express unconditional track/via bans. Supported `insideArea`/courtyard
+  conditions are also enforced, and preserve net exemptions and rule precedence that a broad native
+  keepout would lose. Do not rewrite them merely to remove a speed finding.
+- `tracemaker route BOARD --json route.json` prints project and rule diagnostics to **stderr** and
+  records `project_warnings` and `rule_warnings`; the latter matches `RuleEngine::warnings()` exactly.
+  `tracemaker drc BOARD` also reports rule diagnostics. Retain them and sign off with KiCad DRC.
 - Numbers in conditions are compared as KiCad compares them (exact doubles, units scaled, no rounding).
+
+Supported property names are `NetClass`, `NetName`, `Type`, `Layer`, `Reference`, `Parent.Reference`,
+`Pad_Type`, `Size_X`, `Size_Y`, `Width`, `Position_X` and `Position_Y`; bare `L` is the context layer
+(not an item property). Calls: `isPlated()`, `existsOnLayer(...)`, `insideArea(...)`,
+`intersectsArea(...)`, `enclosedByArea(...)`, `inDiffPair(...)`, `memberOfFootprint(...)`,
+`intersectsCourtyard(...)`, `intersectsFrontCourtyard(...)`, `intersectsBackCourtyard(...)`, and
+the corresponding `insideCourtyard` / `insideFrontCourtyard` / `insideBackCourtyard` aliases.
+Bind item properties/calls to `A.` or `B.`; only `L` is unbound.
+`insideArea` and courtyard `inside...` calls mean intersection; `enclosedByArea` means whole
+geometry enclosure. Footprint membership tests ownership, not “physically under this part.”
+Selectors support reference/library-ID wildcards; component-class metadata is not available.
+A selected missing/malformed courtyard or area outline is a capability block (reported by engine DRC
+when the binary is available); no placement hull or pad-box substitute is invented. Area target regions
+come from their outline, not refilled target copper: fill-sensitive target-zone parity is not claimed.
+Front/back courtyard selection swaps on flipped footprints and does not itself constrain copper layers.
+
+Static class-uniform net/class/type disallows retain per-class obstacle caches and cost-to-go fields.
+Item/geometry predicates, subtype spans and actual same-class net differences bypass them; prepared
+selector polygons and per-net/kind partial verdicts remain cached. A representative net cannot
+describe differing net-qualified geometry, candidate widths, coordinates or actual via spans. Candidate checks
+are authoritative, including post-search merges, pair legs, escape segments and cleanup. Cache bypass is a speed
+trade-off, not missing disallow enforcement. Unsupported existing-item/hole coverage remains a block;
+conservative unknown matching cannot establish equivalence with KiCad.
 
 ## Net-class patterns are cheap
 

@@ -22,13 +22,15 @@ class Obstacles {
   // Legality of a probe shape. Result: 0 = free, 1 = only conflicts with rippable routed copper (owners are
   // appended to `owners` when given), 2 = blocked by fixed copper, holes, edges or keepouts.
   // With `ignore_routed` = false, routed copper counts as blocking (result 0 or 2 only).
+  // Track disks are optimistic search samples: enclosure and anchor-dependent disallows are checked on
+  // the final segment, not its samples. Rule geometry never includes the search clearance margin.
   int disk_state(geom::Point p, int layer, Coord hw, model::NetId net, Coord margin, bool ignore_routed,
                  std::vector<int>* owners = nullptr) const;
   int segment_state(geom::Point a, geom::Point b, int layer, Coord width, model::NetId net, bool ignore_routed,
                     std::vector<int>* owners = nullptr) const;
-  // A via on copper layers [l0, l1] only (blind or buried via); via_state covers all layers.
+  // A via on copper layers [l0, l1] only; via_state covers all layers with a through via.
   int via_state_span(geom::Point p, Coord d, Coord drill, model::NetId net, Coord margin, bool ignore_routed, std::vector<int>* owners, int l0,
-                     int l1) const;
+                     int l1, model::ViaType type = model::ViaType::Blind) const;
   int via_state(geom::Point p, Coord d, Coord drill, model::NetId net, Coord margin, bool ignore_routed,
                 std::vector<int>* owners = nullptr) const;
   bool disk_ok(geom::Point p, int layer, Coord hw, model::NetId net, Coord margin) const {
@@ -48,11 +50,13 @@ class Obstacles {
   // Rips up a routed item (by copper item index).
   void remove_item(int item);
 
-  // Fixed-obstacle code of a disk (fixed copper, fixed holes, edges, keepouts, outline), independent of the
-  // probe's own net: kFree, kBlocked, or the single net id whose own copper is the only conflict (so the disk
-  // is legal for that net only). Clearances use `probe_net`'s class; diff-pair relief is not applied (safe).
+  // Fixed-obstacle code: kFree, kBlocked, or the single net whose copper is the only conflict. Custom
+  // disallow checks use probe_net, so callers may share codes only when needs_exact_routing() is false.
+  // Track disks are optimistic samples; via_probe describes a through via. Supply via_diameter when
+  // known to preserve odd-nanometre diameters; otherwise it is 2 * hw.
   static constexpr std::int32_t kFree = -1, kBlocked = -2;
-  std::int32_t fixed_code(geom::Point p, int layer, Coord hw, Coord margin, model::NetId probe_net, bool via_probe = false) const;
+  std::int32_t fixed_code(geom::Point p, int layer, Coord hw, Coord margin, model::NetId probe_net, bool via_probe = false,
+                          Coord via_diameter = 0) const;
   std::int32_t fixed_via_code(geom::Point p, Coord d, Coord drill, Coord margin, model::NetId probe_net) const;
   // Per-layer reference for fixed_via_code.
   std::int32_t fixed_via_code_reference(geom::Point p, Coord d, Coord drill, Coord margin, model::NetId probe_net) const;
@@ -91,6 +95,7 @@ class Obstacles {
                         std::vector<int>* owners) const;
   // Physical hole clearance against fixed copper on `layer`, any net.
   bool physical_hole_blocked(const geom::Shape& hole, model::NetId net, int layer) const;
+  bool via_dimensions_allowed(const drc::CopperItem& via, Coord drill) const;
   int routed_copper_part(const geom::Shape& s, int layer, model::NetId net, drc::ItemKind kind, bool soft, std::vector<int>* owners) const;
   int routed_via_holes_part(const geom::Shape& s, model::NetId net, Coord hc, bool soft, std::vector<int>* owners) const;
   int routed_hole_copper_part(const geom::Shape& h, int layer, model::NetId net, Coord hc, bool soft, std::vector<int>* owners) const;

@@ -118,7 +118,7 @@ RouteJobResult run_route_job(RouteJob job) {
   auto& opt = job.opt;
   auto lb = io::read_board_file(job.in);
   const auto rules = io::read_design_rules(job.in);
-  // No copy or extra rule-engine construction with the preference off; DRC and project files stay unchanged.
+  // DRC and project files stay unchanged; the preference modifies only the routing rules copy.
   std::optional<model::DesignRules> route_rules;
   if (opt.keep_vias_off_pads > 0) {
     route_rules = rules;
@@ -228,6 +228,17 @@ RouteJobResult run_route_job(RouteJob job) {
       log("component rules: generated custom rules written to " + side);
     }
   }
+  out.project_warnings = rules.warnings;
+  {
+    const drc::RuleEngine re(*route_board, routing_rules);
+    out.rule_warnings = re.warnings();
+  }
+  if (job.warning) {
+    for (const auto& warning : out.project_warnings) job.warning(warning);
+    for (const auto& warning : out.rule_warnings) job.warning(warning);
+  }
+  if (routing_rules.unreadable_custom_rules)
+    throw std::runtime_error("cannot route with unreadable custom rules; fix the .kicad_dru diagnostics before routing");
   auto& res = out.result;
   std::vector<int> ran;
   int best_index = 0;
@@ -281,6 +292,8 @@ RouteJobResult run_route_job(RouteJob job) {
                  {"vias", res.vias.size()},  {"seconds", res.seconds},         {"expansions", res.expansions},
                  {"pitch_mm", nm_to_mm(res.pitch)}, {"failures", res.failures}, {"variant", best_index}, {"variant_name", best_name},
                  {"escape_corridors", res.escape_corridors}};
+  out.summary["rule_warnings"] = out.rule_warnings;
+  out.summary["project_warnings"] = out.project_warnings;
   if (opt.soft_zones) {
     out.summary["plane_connections"] = res.plane_connections;
     out.summary["zones_needing_refill"] = res.zones_needing_refill;

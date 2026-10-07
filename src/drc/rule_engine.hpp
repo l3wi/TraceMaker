@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "drc/copper.hpp"
@@ -14,6 +15,7 @@
 namespace tmk::drc {
 
 class Condition;  // compiled custom-rule condition
+class RuleGeometry;
 
 class RuleEngine {
  public:
@@ -50,7 +52,12 @@ class RuleEngine {
 
   // Name of the last rule disallowing `it` on `layer`, if any (KiCad: items_not_allowed).
   std::optional<std::string> disallowed(const CopperItem& it, int layer) const;
-  // Router checks for a new track or through via. Positional and footprint conditions are warned and left to DRC.
+  std::string_view disallow_severity(const CopperItem& it, int layer) const;
+  // Exact legality for router-created geometry; search disks omit non-monotone conditions.
+  bool candidate_allowed(const CopperItem& it, int layer) const;
+  bool candidate_allowed_reference(const CopperItem& it, int layer) const;
+  bool candidate_search_allowed(const CopperItem& it, int layer) const;
+  // Geometry-less net/layer gates, used only when every relevant condition is static.
   bool track_allowed(model::NetId net, int layer) const;
   bool via_allowed(model::NetId net) const;
   // Hole-to-copper clearance on `layer`, any net; -1 when no rule matches (KiCad: hole_clearance).
@@ -66,17 +73,25 @@ class RuleEngine {
     const model::CustomRule* rule;
     std::unique_ptr<Condition> cond;  // null = always
     bool valid = true;
-    bool positional = false;  // position, footprint or pad condition: cannot be pre-evaluated for routing
+    bool item_dependent = false;
+    bool non_monotone = false;
+    bool unsupported = false;
+    bool unknown_except_membership = false;
+    std::vector<std::uint8_t> track_static, via_static;  // 0 false, 1 true, 2 geometry/item residual, by net
   };
   // Item type, layer and condition all match a disallow constraint.
-  bool disallow_hit(const Compiled& c, const CopperItem& it, int layer) const;
+  bool disallow_hit(const Compiled& c, const CopperItem& it, int layer, bool reference = false) const;
+  bool condition_matches(const Compiled& c, const CopperItem* a, const CopperItem* b, int layer, bool reference = false) const;
+  const Compiled* disallow_rule(const CopperItem& it, int layer, bool search, bool reference = false) const;
   // Value of the last matching custom constraint of `type` (min field), trying (a,b) and (b,a).
   std::optional<Coord> custom_min(const char* type, const CopperItem* a, const CopperItem* b, int layer) const;
+  std::optional<Coord> custom_max(const char* type, const CopperItem* a, const CopperItem* b, int layer) const;
   bool layer_matches(const std::string& sel, int layer) const;
 
   const model::Board& b_;
   const model::DesignRules& r_;
   std::vector<Compiled> rules_;
+  std::unique_ptr<RuleGeometry> geometry_;
   std::vector<std::string> warnings_;
   Coord max_clearance_ = 0;
   std::vector<const model::NetClass*> net_class_;  // by net id (nets created later fall back to a lookup)

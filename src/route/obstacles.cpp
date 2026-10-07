@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "route/obstacles.hpp"
 
-#include <array>
 #include <optional>
 #include <tuple>
 #include <algorithm>
@@ -425,7 +424,8 @@ namespace {
 // pooled items have stable addresses while the pool grows.
 class Probe {
  public:
-  Probe(drc::ItemKind kind, const Shape& s, model::NetId net, int layer, Coord width, Point pos) {
+  Probe(drc::ItemKind kind, const Shape& s, model::NetId net, int layer, Coord width, Point pos,
+        model::LayerMask layers = 0, model::ViaType via_type = model::ViaType::Through, int anchor_layer = -1) {
     if (depth_ == pool_.size()) pool_.push_back(std::make_unique<drc::CopperItem>());
     item_ = pool_[depth_++].get();
     drc::CopperItem& p = *item_;
@@ -433,7 +433,7 @@ class Probe {
     p.index = -1;
     p.sub = 0;
     p.net = net;
-    p.layers = layer >= 0 ? model::layer_bit(layer) : 0;
+    p.layers = layers ? layers : layer >= 0 ? model::layer_bit(layer) : 0;
     p.shapes.resize(1);
     p.shapes[0] = s;  // reuses the pooled shape's point storage
     p.box = s.box;
@@ -443,6 +443,8 @@ class Probe {
     p.owner = -1;
     p.removed = false;
     p.free_via = false;
+    p.via_type = via_type;
+    p.anchor_layer = anchor_layer >= 0 ? anchor_layer : layer;
   }
   ~Probe() { --depth_; }
   Probe(const Probe&) = delete;
@@ -463,6 +465,11 @@ const Shape& scratch_hole(Point c, Coord r) {
   return h;
 }
 int worst(int a, int c) { return std::max(a, c); }
+model::LayerMask span_layers(int l0, int l1) {
+  const model::LayerMask below = (model::LayerMask{1} << l0) - 1;
+  const model::LayerMask through = l1 >= 63 ? ~model::LayerMask{0} : (model::LayerMask{1} << (l1 + 1)) - 1;
+  return through & ~below;
+}
 }  // namespace
 
 bool Obstacles::physical_hole_blocked(const Shape& hole, model::NetId net, int layer) const {
@@ -491,9 +498,19 @@ int Obstacles::disk_state(Point p, int layer, Coord hw, model::NetId net, Coord 
     ++rej_outside;
     return 2;
   }
-  const Shape s = Shape::point(p, hw + margin);
-  const Probe pp(drc::ItemKind::Track, s, net, layer, 2 * hw, p);
+  static thread_local Shape actual, s;  // no per-search-sample allocation
+  actual.set_point(p, hw);
+  s.set_point(p, hw + margin);
+  const Probe pp(drc::ItemKind::Track, actual, net, layer, 2 * hw, p);
   const drc::CopperItem& probe = *pp;
+  if (!needs_exact_routing()) {
+    const auto [minimum, maximum] = re_->track_width(probe, layer);
+    if (probe.width + 1 < minimum || (maximum > 0 && probe.width > maximum)) return 2;
+  }
+  if (!re_->candidate_search_allowed(probe, layer)) {
+    ++rej_other;
+    return 2;
+  }
   int st = copper_state(s, probe, layer, ignore_routed, owners);
   if (st == 2) {
     ++rej_copper;
@@ -508,19 +525,31 @@ int Obstacles::segment_state(Point a, Point b, int layer, Coord width, model::Ne
   const Shape s = Shape::segment(a, b, width / 2);
   const Probe pp(drc::ItemKind::Track, s, net, layer, width, a);
   const drc::CopperItem& probe = *pp;
+  const auto [minimum, maximum] = re_->track_width(probe, layer);
+  if (width < minimum || (maximum > 0 && width > maximum)) return 2;
+  if (!re_->candidate_allowed(probe, layer)) return 2;
   const int st = copper_state(s, probe, layer, ignore_routed, owners);
   if (st == 2) return 2;
   return worst(st, holes_edges_state(s, net, layer, false, 0, ignore_routed, owners));
 }
+bool Obstacles::via_dimensions_allowed(const drc::CopperItem& via, Coord drill) const {
+  return via.width >= re_->via_diameter_min(via) && drill >= re_->hole_size_min(&via) &&
+         via.width >= drill && (via.width - drill) / 2 >= re_->annular_width_min(via);
+}
+
 
 int Obstacles::via_state_span(Point p, Coord d, Coord drill, model::NetId net, Coord margin, bool ignore_routed, std::vector<int>* owners, int l0,
-                              int l1) const {
-  if (!inside_board(p, 0)) return 2;
-  const Shape s = Shape::point(p, d / 2 + margin);
+                              int l1, model::ViaType type) const {
+  if (!inside_board(p, 0) || l0 < 0 || l1 >= b_.copper_count() || l0 >= l1) return 2;
+  static thread_local Shape actual, s;  // no per-via-candidate allocation
+  actual.set_point(p, d / 2);
+  s.set_point(p, d / 2 + margin);
+  const Probe pp(drc::ItemKind::Via, actual, net, l0, d, p, span_layers(l0, l1), type, l0);
+  const drc::CopperItem& probe = *pp;
+  if (!via_dimensions_allowed(probe, drill)) return 2;
+  if (!re_->candidate_allowed(probe, -1)) return 2;
   int st = 0;
-  for (int l = std::max(0, l0); l <= std::min(l1, b_.copper_count() - 1) && st != 2; ++l) {
-    const Probe pp(drc::ItemKind::Via, s, net, l, d, p);
-    const drc::CopperItem& probe = *pp;
+  for (int l = l0; l <= l1 && st != 2; ++l) {
     st = worst(st, copper_state(s, probe, l, ignore_routed, owners));
     if (st != 2) st = worst(st, holes_edges_state(s, net, l, true, drill / 2 + margin, ignore_routed, owners));
   }
@@ -528,16 +557,7 @@ int Obstacles::via_state_span(Point p, Coord d, Coord drill, model::NetId net, C
 }
 
 int Obstacles::via_state(Point p, Coord d, Coord drill, model::NetId net, Coord margin, bool ignore_routed, std::vector<int>* owners) const {
-  if (!inside_board(p, 0)) return 2;
-  const Shape s = Shape::point(p, d / 2 + margin);
-  int st = 0;
-  for (int l = 0; l < b_.copper_count() && st != 2; ++l) {
-    const Probe pp(drc::ItemKind::Via, s, net, l, d, p);
-    const drc::CopperItem& probe = *pp;
-    st = worst(st, copper_state(s, probe, l, ignore_routed, owners));
-    if (st != 2) st = worst(st, holes_edges_state(s, net, l, true, drill / 2 + margin, ignore_routed, owners));
-  }
-  return st;
+  return via_state_span(p, d, drill, net, margin, ignore_routed, owners, 0, b_.copper_count() - 1, model::ViaType::Through);
 }
 
 int Obstacles::add_track(int index, int owner) {
@@ -547,6 +567,7 @@ int Obstacles::add_track(int index, int owner) {
   it.index = index;
   it.net = t.net;
   it.layers = model::layer_bit(t.layer);
+  it.anchor_layer = t.layer;
   it.shapes = {Shape::segment(t.a, t.b, t.width / 2)};
   it.pos = t.a;
   it.width = t.width;
@@ -566,6 +587,8 @@ int Obstacles::add_via(int index, int owner) {
   it.index = index;
   it.net = v.net;
   for (int l = v.layer_top; l <= v.layer_bottom; ++l) it.layers |= model::layer_bit(l);
+  it.via_type = v.type;
+  it.anchor_layer = v.layer_top;
   it.shapes = {Shape::point(v.pos, v.size / 2)};
   it.pos = v.pos;
   it.width = v.size;
@@ -615,12 +638,21 @@ void Obstacles::aperture_codes(const Shape& s, int layer, bool via_probe, const 
     if (l == layer && t.box.inflated(tc).intersects(s.box) && geom::closer_than(s, t, tc)) hit(0);
 }
 
-std::int32_t Obstacles::fixed_code(Point p, int layer, Coord hw, Coord margin, model::NetId probe_net, bool via_probe) const {
+std::int32_t Obstacles::fixed_code(Point p, int layer, Coord hw, Coord margin, model::NetId probe_net, bool via_probe, Coord via_diameter) const {
   if (!inside_board(p, 0)) return kBlocked;
-  static thread_local Shape s;  // scratch disk; fixed_code does not re-enter
+  static thread_local Shape s, actual;  // scratch disks; fixed_code does not re-enter
   s.set_point(p, hw + margin);
-  const Probe pp(drc::ItemKind::Track, s, probe_net, layer, 2 * hw, p);
+  actual.set_point(p, hw);
+  const auto layers = via_probe ? span_layers(0, b_.copper_count() - 1) : model::layer_bit(layer);
+  const Coord width = via_probe && via_diameter > 0 ? via_diameter : 2 * hw;
+  const Probe pp(via_probe ? drc::ItemKind::Via : drc::ItemKind::Track, actual, probe_net, layer, width, p, layers,
+                 model::ViaType::Through, via_probe ? 0 : layer);
   const drc::CopperItem& probe = *pp;
+  if (!via_probe && !needs_exact_routing()) {
+    const auto [minimum, maximum] = re_->track_width(probe, layer);
+    if (width + 1 < minimum || (maximum > 0 && width > maximum)) return kBlocked;
+  }
+  if (!(via_probe ? re_->candidate_allowed(probe, layer) : re_->candidate_search_allowed(probe, layer))) return kBlocked;
   std::int32_t code = kFree;
   auto add_net = [&](model::NetId n) {
     if (n == 0) code = kBlocked;
@@ -678,8 +710,10 @@ std::int32_t Obstacles::fixed_via_code(Point p, Coord d, Coord drill, Coord marg
   if (!inside_board(p, 0)) return kBlocked;
   const int nl = b_.copper_count();
   const Coord hw = d / 2;
-  static thread_local Shape s;  // scratch disk
+  static thread_local Shape s, actual;  // scratch disks
   s.set_point(p, hw + margin);
+  actual.set_point(p, hw);
+  const model::LayerMask all = span_layers(0, nl - 1);
   std::int32_t code = kFree;
   auto add_net = [&](model::NetId n) {
     if (n == 0) code = kBlocked;
@@ -687,9 +721,10 @@ std::int32_t Obstacles::fixed_via_code(Point p, Coord d, Coord drill, Coord marg
     else if (code != n) code = kBlocked;
   };
   {
-    std::array<std::optional<Probe>, 64> probes;  // one per layer; reverse destruction preserves the pool stack
-    for (int l = 0; l < nl; ++l) probes[static_cast<std::size_t>(l)].emplace(drc::ItemKind::Track, s, probe_net, l, 2 * hw, p);
-    const model::LayerMask all = nl >= 64 ? ~model::LayerMask{0} : (model::LayerMask{1} << nl) - 1;
+    const Probe pp(drc::ItemKind::Via, actual, probe_net, 0, d, p, all, model::ViaType::Through, 0);
+    const drc::CopperItem& probe = *pp;
+    if (!via_dimensions_allowed(probe, drill)) return kBlocked;
+    if (!re_->candidate_allowed(probe, -1)) return kBlocked;
     grid_->query(s.box.inflated(re_->max_clearance() + 1), [&](int id) {
       if (code == kBlocked) return;
       const auto& it = cm_.items[static_cast<std::size_t>(id)];
@@ -697,7 +732,7 @@ std::int32_t Obstacles::fixed_via_code(Point p, Coord d, Coord drill, Coord marg
       if (it.net != 0 && code == it.net) return;  // already known: only legal for this net
       for (int l = 0; l < nl; ++l) {
         if (!(it.layers & model::layer_bit(l))) continue;
-        Coord req = re_->clearance(**probes[static_cast<std::size_t>(l)], it, l);
+        Coord req = re_->clearance(probe, it, l);
         if (via_mask_ > 0 && (l == 0 || l == nl - 1) && it.kind != drc::ItemKind::Zone && it.kind != drc::ItemKind::Pad)
           req = std::max(req, it.kind == drc::ItemKind::Via ? 2 * via_mask_ + 1'000 : via_mask_ + 1'000);
         for (const auto& u : it.shapes)
@@ -738,9 +773,14 @@ std::int32_t Obstacles::fixed_via_code(Point p, Coord d, Coord drill, Coord marg
 }
 
 std::int32_t Obstacles::fixed_via_code_reference(Point p, Coord d, Coord drill, Coord margin, model::NetId probe_net) const {
+  static thread_local Shape actual;
+  actual.set_point(p, d / 2);
+  const Probe pp(drc::ItemKind::Via, actual, probe_net, 0, d, p, span_layers(0, b_.copper_count() - 1),
+                 model::ViaType::Through, 0);
+  if (!via_dimensions_allowed(*pp, drill)) return kBlocked;
   std::int32_t code = kFree;
   for (int l = 0; l < b_.copper_count(); ++l) {
-    const std::int32_t c = fixed_code(p, l, d / 2, margin, probe_net, true);
+    const std::int32_t c = fixed_code(p, l, d / 2, margin, probe_net, true, d);
     if (c == kBlocked) return kBlocked;
     if (c != kFree) {
       if (code == kFree) code = c;

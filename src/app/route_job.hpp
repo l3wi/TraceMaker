@@ -4,6 +4,7 @@
 // (bindings/), so both take exactly the same code path (design doc 08 §5).
 #include <functional>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -34,6 +35,8 @@ struct RouteJob {
   std::string rules_override;     // --rules-override: user override file (JSON, doc 15 §6.3); empty = none
   // Progress lines (the CLI's stdout text, one line per call, no trailing newline). Empty = silent.
   std::function<void(const std::string&)> log;
+  // Rule/project diagnostics (no prefix or trailing newline); CLI sends these to stderr.
+  std::function<void(const std::string&)> warning;
 };
 
 struct RouteJobResult {
@@ -41,6 +44,8 @@ struct RouteJobResult {
   nlohmann::json items;           // new copper in the --emit-items layout (layer and net by name, nm)
   nlohmann::json summary;         // the --json layout
   std::string viewer_url;         // empty when not viewing
+  std::vector<std::string> rule_warnings;     // RuleEngine diagnostics, in compilation order
+  std::vector<std::string> project_warnings;  // project/rule-file loading diagnostics
   int exit_code() const { return result.routed == result.connections ? 0 : 3; }
 };
 
