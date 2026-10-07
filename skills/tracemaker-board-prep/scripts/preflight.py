@@ -438,6 +438,9 @@ def main():
         allowed = {'track', 'via', 'through_via', 'micro_via', 'buried_via', 'blind_via', 'pad', 'zone', 'graphic'}
         positional = {'insideArea', 'intersectsArea', 'enclosedByArea', 'memberOfFootprint', 'Reference',
                       'Parent.Reference', 'Pad_Type', 'Width', 'Size_X', 'Size_Y'}
+        # Mirrors drc::RuleEngine's evaluator: any other name evaluates as unknown, and an unknown condition never
+        # makes a rule fire, so the rule is silently skipped by both the router and `tracemaker drc`.
+        evaluated = positional | {'NetClass', 'NetName', 'Type', 'Layer', 'isPlated', 'existsOnLayer', 'inDiffPair'}
         caches_disabled = False
         for rule in rules:
             name, condition = rule[1], val(rule, 'condition', '')
@@ -458,8 +461,12 @@ def main():
             finding('Custom rules', 'slow' if reasons else 'info',
                     f"Rule '{name}': {', '.join(kinds) or 'no constraints'}; condition `{condition or 'true'}`; "
                     + ('disables caches board-wide (' + '; '.join(reasons) + ')' if reasons else 'cache-ok'))
-            if 'disallow' in kinds and refs & positional:
-                finding('Custom rules', 'quality', f"Rule '{name}': position/footprint disallow is not avoided by the router; KiCad DRC still enforces it, so routes may need fixing there. Prefer a rule area.")
+            missing = sorted(refs - evaluated)
+            if missing:
+                finding('Custom rules', 'block', f"Rule '{name}': TraceMaker cannot evaluate {', '.join(missing)}, so the router and `tracemaker drc` both skip this rule; only KiCad DRC checks it. Rewrite it with supported terms (a rule area instead of a courtyard), or route and fix its violations by hand.")
+            elif 'disallow' in kinds and refs & positional:
+                finding('Custom rules', 'quality', f"Rule '{name}': position/footprint disallow is not avoided by the router; KiCad DRC still enforces it, so routes may need fixing there. Prefer a rule area."
+                        + (' TraceMaker DRC treats insideArea/enclosedByArea as whole-item containment (KiCad: insideArea = intersectsArea), so it can under-report.' if refs & {'insideArea', 'enclosedByArea'} else ''))
             for c in constraints:
                 if c[1] == 'disallow':
                     unsupported = [w for w in c[2:] if isinstance(w, str) and w not in allowed]
@@ -528,9 +535,11 @@ def main():
             finding('Zones', 'info', 'No conductive zones.')
         finding('Zones', 'info', 'Plane classification uses zone outline areas, not clipped/refilled copper; overlaps, cutouts and clearance subtraction can change actual coverage.')
 
+        routed = 0
         for kind in ('segment', 'arc', 'via'):
             items = children(board, kind)
             count = sum(locked(n) for n in items)
+            routed += len(items)
             finding('Existing copper', 'info', f'{kind}: {len(items)} total, {count} locked, {len(items) - count} unlocked.')
         footprints = children(board, 'footprint')
         refs_locked = []
@@ -631,10 +640,17 @@ def main():
                                 + (f" (+{len(group['pins']) - 12} more)" if len(group['pins']) > 12 else '')
                                 + f" ({group['reason']})"
                                 for part in escape.get('parts', []) for group in part.get('dead', [])]
-                # Lattice-based: "dead" means no escape on the router's lattice, not proof that none exists.
+                # Lattice-based: "dead" means no escape on the router's lattice, not proof that none exists. The
+                # analysis keeps existing tracks/vias and zone fills as fixed obstacles and ignores connectivity.
+                caveats = []
+                if dead and routed:
+                    caveats.append(f'the board already has {routed} tracks/arcs/vias: they count as obstacles and connected pins are not skipped, so strip unlocked routing for a true count')
+                if dead and any(z.get('filled') for z in zone_details):
+                    caveats.append('zone fills count as fixed copper here; with --soft-zones some of these pins may escape through refillable planes')
                 finding('Escape and engine warnings', 'quality' if dead else 'info',
                         f'Dead escape pins: {dead}; ' + ('; '.join(descriptions[:10]) if dead else 'dense-package pins checked can escape.')
-                        + ('; more in JSON report' if len(descriptions) > 10 else ''))
+                        + ('; more in JSON report' if len(descriptions) > 10 else '')
+                        + (' Caveats: ' + '; '.join(caveats) + '.' if caveats else ''))
             except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
                 finding('Escape and engine warnings', 'info', f'Engine checks unavailable: {exc}')
         work = 1000000 if connections < 100 else 10000000 if connections < 500 else 50000000

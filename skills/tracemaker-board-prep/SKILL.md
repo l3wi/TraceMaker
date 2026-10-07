@@ -47,8 +47,12 @@ and why.
 
 Also check, though they are graded `quality`: **dead escape pins** from `tracemaker escape` (pins of dense
 packages with no way out on the router's lattice under the board's rules; usually a real placement or
-fan-out problem, occasionally routable off-lattice, and the router still tries them) and **position or
-footprint `disallow` rules** (not avoided by the router; KiCad still enforces them, so prefer rule areas).
+fan-out problem, occasionally routable off-lattice, and the router still tries them). The analysis treats
+existing tracks and zone fills as fixed obstacles and does not skip connected pins, so run it on the
+stripped board and read it with `--soft-zones` in mind. **Position or footprint `disallow` rules** are
+not avoided by the router; KiCad still enforces them, so prefer rule areas. A rule using a term TraceMaker
+cannot evaluate at all (courtyard functions, `memberOfGroup`, `Position_X/Y`) is `block`: neither the
+router nor `tracemaker drc` applies it.
 
 ### 3. Fix speed findings
 

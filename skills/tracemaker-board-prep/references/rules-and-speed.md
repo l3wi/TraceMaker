@@ -38,6 +38,7 @@ TraceMaker reads the board's `.kicad_dru`. Whether a rule is cheap depends on it
 | `clearance` (any condition), and any other constraint type | Enforced exactly | **Disables caches board-wide** |
 | `disallow` with `insideArea`, `intersectsArea`, `enclosedByArea`, `memberOfFootprint`, `Reference`, `Pad_Type`, `Width`, `Size_X`, `Size_Y` | **Not avoided by the router**; KiCad DRC reports it | — |
 | `disallow hole/footprint/text` | Not checked by TraceMaker; KiCad DRC reports it | — |
+| Any rule whose condition uses a name TraceMaker cannot evaluate (`insideCourtyard`, `intersectsCourtyard`, `memberOfGroup`, `Position_X`, ...) | **Skipped by the router and by `tracemaker drc`**: an unknown term never makes a rule fire. Preflight grades it `block` | — |
 | Condition that does not parse | **Ignored by the router**, and disables caches | — |
 
 Measured on StickHub (fixed work): one `clearance` rule conditioned on a single net made the run 2.15×
