@@ -42,9 +42,10 @@ class Condition {
     std::vector<std::string> args;
   };
 
-  static std::unique_ptr<Condition> parse(const std::string& text, std::string& err) {
+  static std::unique_ptr<Condition> parse(const std::string& text, model::RuleOrigin origin, std::string& err) {
     auto c = std::make_unique<Condition>();
     c->src_ = text;
+    c->integer_lengths_ = origin == model::RuleOrigin::Synthetic;
     c->pos_ = 0;
     try {
       c->root_ = c->parse_or();
@@ -163,11 +164,11 @@ class Condition {
       n->lit.k = Value::K::Num;
       n->lit.n = number * scale;
       if (!std::isfinite(n->lit.n)) throw std::runtime_error("invalid number");
-      if (unit == "mm" || unit == "mil" || unit == "in") {
+      if (integer_lengths_ && (unit == "mm" || unit == "mil" || unit == "in")) {
         if (n->lit.n < static_cast<double>(std::numeric_limits<Coord>::min()) ||
             n->lit.n >= static_cast<double>(std::numeric_limits<Coord>::max()))
           throw std::runtime_error("length literal out of range");
-        // Match integer-nm geometry at exact boundaries despite decimal-to-binary conversion error.
+        // Synthetic geometry boundaries use integer nm; project literals retain KiCad's double semantics.
         n->lit.n = static_cast<double>(std::llround(n->lit.n));
       }
       return n;
@@ -214,7 +215,7 @@ class Condition {
     if (l.k == Value::K::Num || r.k == Value::K::Num) {
       const double a = l.k == Value::K::Num ? l.n : std::atof(l.s.c_str());
       const double b = r.k == Value::K::Num ? r.n : std::atof(r.s.c_str());
-      return std::fabs(a - b) < 1e-9;
+      return a == b;  // KiCad VALUE::EqualTo compares numeric doubles without a tolerance.
     }
     if (l.k == Value::K::Bool || r.k == Value::K::Bool) return l.truthy() == r.truthy();
     // KiCad compares strings case-insensitively with wildcard support on either side.
@@ -331,6 +332,7 @@ class Condition {
 
   std::string src_;
   std::size_t pos_ = 0;
+  bool integer_lengths_ = false;
   std::unique_ptr<Node> root_;
 };
 
@@ -341,7 +343,7 @@ RuleEngine::RuleEngine(const model::Board& b, const model::DesignRules& r, const
     Compiled c{&rule, nullptr, true};
     if (!rule.condition.empty()) {
       std::string err;
-      c.cond = Condition::parse(rule.condition, err);
+      c.cond = Condition::parse(rule.condition, rule.origin, err);
       if (!c.cond) {
         if (rule.origin == model::RuleOrigin::Synthetic)
           throw std::runtime_error("synthetic rule '" + rule.name + "': cannot parse condition (" + err + ")");
