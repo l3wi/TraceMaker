@@ -436,6 +436,8 @@ def escape_findings(escape):
             message += '; more in JSON report'
         if status == 'exhausted':
             message += '. Finite-graph exhaustion is not proof of physical impossibility.'
+        else:
+            message += '. Rerun with a larger --escape-work for a verdict; such pins often need hand fan-out before routing.'
         findings.append(('quality', message))
     return findings
 
@@ -453,6 +455,10 @@ def main():
     parser.add_argument('--blind-vias', action='store_true')
     parser.add_argument('--component-rules', choices=('off', 'report', 'soft', 'on'), default='off')
     parser.add_argument('--rules-override', type=Path)
+    # Exact witnesses cost ~0.1 s per dense pin; 200k units keeps stripped CM5 (340 pins) near 50 s and leaves
+    # only its genuinely hard pins `unknown`. Raise it to try harder; the route itself has its own budgets.
+    parser.add_argument('--escape-work', type=int, default=200_000,
+                        help='Per-pin escape-analysis work budget (default 200000; unknown pins may need more)')
     args = parser.parse_args()
     if not math.isfinite(args.small_pad_mm) or args.small_pad_mm <= 0:
         parser.error('--small-pad-mm must be positive and finite')
@@ -760,8 +766,8 @@ def main():
                     connection_source = 'TraceMaker DRC unconnected_items'
                 with tempfile.TemporaryDirectory(prefix='tracemaker-preflight-') as tmp:
                     escape_path = Path(tmp) / 'escape.json'
-                    p = subprocess.run([binary, 'escape', str(args.board), *routing_args, '--json', str(escape_path)],
-                                       capture_output=True, text=True, timeout=55)
+                    p = subprocess.run([binary, 'escape', str(args.board), *routing_args, '--work', str(args.escape_work),
+                                        '--json', str(escape_path)], capture_output=True, text=True, timeout=600)
                     if p.returncode != 0 or not escape_path.exists():
                         raise RuntimeError(f'TraceMaker escape failed (exit {p.returncode}): {(p.stderr or p.stdout).strip()}')
                     escape = json.loads(escape_path.read_text())
