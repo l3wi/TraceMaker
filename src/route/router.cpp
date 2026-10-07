@@ -167,11 +167,10 @@ struct Router::Impl {
   // Via neck-down (M9 escalation rung, with the track neck-down): KiCad's DRC checks vias against the board
   // minimums only (via diameter, drill, annular ring), not the net class, so the smallest via they allow is
   // legal where the class via does not fit (e.g. between BGA balls or in a dense LED matrix). Only used when
-  // the class via is blocked; never below a 0.2 mm drill, which every board house drills.
-  Coord neck_via_drill(NetId net) const { return std::min(class_via_drill(net), std::max<Coord>(rules.minimums.through_hole_diameter, 200'000)); }
-  Coord neck_via_diameter(NetId net) const {
-    return std::min(class_via_diameter(net), std::max(rules.minimums.via_diameter, neck_via_drill(net) + 2 * std::max<Coord>(rules.minimums.via_annular_width, 100'000)));
-  }
+  // the class via is blocked; never below a 0.2 mm drill, which every board house drills. Sizes come from
+  // route::neck_down_via, which the keep-vias-off-pads margin also uses.
+  Coord neck_via_drill(NetId net) const { return neck_down_via(rules, netclass(net)).drill; }
+  Coord neck_via_diameter(NetId net) const { return neck_down_via(rules, netclass(net)).diameter; }
   bool via_override = false;  // escalation rung: the neck-down via
   Coord via_drill(NetId net) const { return via_override ? neck_via_drill(net) : class_via_drill(net); }
   Coord via_diameter(NetId net) const { return via_override ? neck_via_diameter(net) : class_via_diameter(net); }
