@@ -246,12 +246,19 @@ stripped-CM5 local witnesses, including all 18 reported pins (117 satisfied, no 
 baseline's 43.11 s. Exact saved-output connectivity is **0/18** affected pins before and after native
 refill; all 189 new tracks and four vias pass exact leave-one-out legality. A prior priority-instrumented
 200M Router run also reached only 0/18 while routing 100/212; it is not a success claim.
-The open limitation is global thin-channel traversal: the CM5 PWM witness can reach a legal local exterior
-while its narrow private channel has no usable full-width global-lattice continuation. No automatic
-off-lattice global router or global 10-µm fallback is introduced. Permanent real-Router synthetic consumers
-retain hard local tunnel/pocket geometry and demonstrate both direct narrow-target completion and a
-narrow-width lattice handoff to a target beyond the access radius (123 assertions); these are supplementary
-behavioural regressions, not substitutes for the honest stripped-CM5 result.
+**Fair-test correction (2026-10-08).** The hard-fill stripped-CM5 runs above were not a fair test: the stripped
+board keeps the hand layout's zone fills, whose voids are cut around the removed tracks, so under hard zones
+the only legal paths are essentially the original geometry. With the 18 connections routed first (a knowledge
+base holding only them), 5M work and one variant, hard zones connect **0/18** at both the 0.147 mm 90ohm
+class width and the hand-drawn 0.14 mm (13 boxed in, 5 unattempted, 0/212 overall). With `--soft-zones
+--diff-pairs` and 30M work, KiCad 10.0.3 refilled DRC confirms **17/18** connected (PWM ran out of search
+budget) at either width, 179/222 (0.14 mm) or 174/222 (0.147 mm) overall in 65 s, no errors beyond the
+hand layout's two copper-edge errors. The local access graph did no generation work in those runs: the
+plain router found the paths. Without the priority order, 9 of the 18 were never attempted at 30M. The
+"thin channel" seen earlier is the void left in the retained fills, not a lattice limit. Separately,
+`--diff-pairs` with hard fills spent 1,048 s wall time on 130,247 counted expansions (2/212 routed): pair
+search work is not fully charged to the work budget (rule 5), an open defect. Artifacts:
+`/tmp/tmk-merge/cm5/fair-*`.
 
 StickHub's U1-courtyard via-disallow plus 15×15-mm track-keepout experiment retains **36/133**, two
 negotiated passes, three rips and 2,149,942 total work units at the 2M option (3.09 s; exactly 200,000
