@@ -27,6 +27,15 @@ inline ClassVia class_via(const model::DesignRules& rules, const model::NetClass
   return {std::max({nc.via_diameter, rules.minimums.via_diameter, drill + 2 * rules.minimums.via_annular_width}), drill};
 }
 
+// The neck-down rung lowers the drill independently, so its annulus can exceed the class via's.
+// KiCad checks the board minimums, not the class size; retain the router's 0.2 mm drill / 0.1 mm ring floors.
+inline ClassVia neck_down_via(const model::DesignRules& rules, const model::NetClass& nc) {
+  const auto normal = class_via(rules, nc);
+  const Coord drill = std::min(normal.drill, std::max<Coord>(rules.minimums.through_hole_diameter, 200'000));
+  return {std::min(normal.diameter, std::max(rules.minimums.via_diameter,
+                                           drill + 2 * std::max<Coord>(rules.minimums.via_annular_width, 100'000))), drill};
+}
+
 struct RouterOptions {
   Coord pitch = 0;              // lattice pitch; 0 = automatic from net-class widths and clearances
   double pitch_scale = 1.0;      // auto pitch multiplier, applied only on large lattices (>= 3M points per layer)
