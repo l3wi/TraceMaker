@@ -6,6 +6,7 @@
 
 #include "io/kicad/board_reader.hpp"
 #include "io/kicad/board_editor.hpp"
+#include "drc/connectivity.hpp"
 #include "route/obstacles.hpp"
 #include "route/plane_map.hpp"
 #include "route/router.hpp"
@@ -84,6 +85,89 @@ TEST_CASE("soft zones target unused planes with legal vias but not already conne
   for (const auto& v : r.vias) CHECK(obs.via_ok(v.pos, v.size, v.drill, v.net, 0));
   const auto joined = parse(board_text(plane("F.Cu", 2, "GND", kPts)));
   CHECK(route::Router(joined, rules, o).run().connections == 0);
+}
+
+TEST_CASE("unreachable soft planes do not replace same-layer pad connections", "[route][soft-zones][soft-zone-regression]") {
+  auto b = parse(board_text(plane("In1.Cu", 1, "SIG", kPts)));
+  b.pads[0].net = 1;
+  b.pads.push_back(b.pads[0]);
+  b.pads.back().pos = {8'000'000, 5'000'000};
+  model::DesignRules rules;
+  rules.classes.emplace_back();
+  route::RouterOptions o;
+  o.pitch = 100'000;
+  o.work_budget = 200'000;
+  o.gpu_device = -1;
+  o.optimize = false;
+  SECTION("router disables all layer changes") {
+    o.allow_vias = false;
+    o.blind_vias = false;
+  }
+  SECTION("the net disallows vias, including blind vias") {
+    o.blind_vias = true;
+    rules.minimums.allow_blind_buried_vias = true;
+    model::CustomRule rule;
+    rule.name = "no SIG vias";
+    rule.condition = "A.NetName == 'SIG'";
+    model::Constraint constraint;
+    constraint.type = "disallow";
+    constraint.items = {"via"};
+    rule.constraints.push_back(constraint);
+    rules.custom.push_back(rule);
+  }
+  SECTION("the net may not route on the plane layer") {
+    model::CustomRule rule;
+    rule.name = "no SIG inner tracks";
+    rule.condition = "A.NetName == 'SIG'";
+    rule.layer = "inner";
+    model::Constraint constraint;
+    constraint.type = "disallow";
+    constraint.items = {"track"};
+    rule.constraints.push_back(constraint);
+    rules.custom.push_back(rule);
+  }
+  const auto hard = route::Router(b, rules, o).run();
+  REQUIRE(hard.connections == 1);
+  REQUIRE(hard.routed == hard.connections);
+  REQUIRE(hard.failures.empty());
+  o.soft_zones = true;
+  const auto soft = route::Router(b, rules, o).run();
+  CHECK(soft.connections == hard.connections);
+  CHECK(soft.routed == soft.connections);
+  CHECK(soft.failures.empty());
+  CHECK(soft.vias.empty());
+}
+
+TEST_CASE("one through via joins all aligned same-net soft planes", "[route][soft-zones][soft-zone-regression]") {
+  std::string second = kPts;
+  SECTION("both fills contain the via centre") {}
+  SECTION("the via annulus overlaps the second fill outside its boundary") {
+    second = "(xy 1 1) (xy 3.9 1) (xy 3.9 9) (xy 1 9)";
+  }
+  const auto b = parse(board_text(plane("In1.Cu", 2, "GND", kPts) + plane("In2.Cu", 2, "GND", second.c_str())));
+  model::DesignRules rules;
+  rules.classes.emplace_back();
+  route::RouterOptions o;
+  o.pitch = 100'000;
+  o.work_budget = 200'000;
+  o.gpu_device = -1;
+  o.optimize = false;
+  o.soft_zones = true;
+  const auto r = route::Router(b, rules, o).run();
+  REQUIRE(r.connections == 2);
+  CHECK(r.routed == r.connections);
+  CHECK(r.failures.empty());
+  REQUIRE(r.vias.size() == 1);
+  CHECK(r.vias[0].type == model::ViaType::Through);
+  CHECK(r.vias[0].layer_top == 0);
+  CHECK(r.vias[0].layer_bottom == b.copper_count() - 1);
+  auto routed = b;
+  routed.tracks.insert(routed.tracks.end(), r.tracks.begin(), r.tracks.end());
+  routed.vias.insert(routed.vias.end(), r.vias.begin(), r.vias.end());
+  route::Obstacles obs(routed, rules, true);
+  const auto connected = drc::compute_connectivity(routed, obs.copper(), obs.grid());
+  REQUIRE_FALSE(connected.root.empty());
+  CHECK(std::all_of(connected.root.begin(), connected.root.end(), [&](int root) { return root == connected.root.front(); }));
 }
 
 TEST_CASE("teardrop zones stay fixed copper and never become plane targets", "[route][soft-zones]") {
