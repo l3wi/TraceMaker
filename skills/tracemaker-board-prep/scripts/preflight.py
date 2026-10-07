@@ -409,15 +409,56 @@ def class_for(net, classes, settings):
     return classes[0]
 
 
+def escape_findings(escape):
+    """Separate exact positives from finite-domain failures and incomplete searches."""
+    results = [(part.get('ref', '?'), pin)
+               for part in escape.get('parts', []) for pin in part.get('results', [])]
+    if not results and 'statuses' not in escape:
+        # An older binary cannot supply witnesses or a reproducible domain.
+        dead = escape.get('dead', 0)
+        return [('quality', f'Legacy escape analysis: {dead} dead-labelled pins; status, exact witness and search domain unavailable. '
+                 'Use a current TraceMaker binary; this is not a physical-impossibility proof.')]
+    counts = Counter(pin.get('status', 'unknown') for _, pin in results)
+    if not results:
+        counts.update(escape.get('statuses', {}))
+    findings = [('info', f"Dense-package access: {counts['satisfied']} already satisfied pins; "
+                 f"{counts['witness']} exact witnessed escapes. Witnesses establish individual access, not simultaneous routability or DRC sign-off.")]
+    for status, description in (('exhausted', 'No escape found in configured router search domain'),
+                                ('unknown', 'Escape access unknown')):
+        if not counts[status]:
+            continue
+        details = [f"{ref}.{pin.get('pin', pin.get('pad', '?'))}: {pin.get('reason', status)}; "
+                   f"domain: {pin.get('domain') or 'not reported'}"
+                   for ref, pin in results if pin.get('status', 'unknown') == status]
+        message = f'{description}: {counts[status]} pin(s). '
+        message += '; '.join(details[:10]) if details else 'See engine JSON for the configured domain.'
+        if len(details) > 10:
+            message += '; more in JSON report'
+        if status == 'exhausted':
+            message += '. Finite-graph exhaustion is not proof of physical impossibility.'
+        findings.append(('quality', message))
+    return findings
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('board', type=Path)
     parser.add_argument('--tracemaker')
     parser.add_argument('--json', type=Path)
     parser.add_argument('--small-pad-mm', type=float, default=2)
+    parser.add_argument('--soft-zones', action=argparse.BooleanOptionalAction, default=None,
+                        help='Use refillable planes for escape and suggested routing (default: on when planes exist)')
+    parser.add_argument('--keep-vias-off-pads', nargs='?', const=2, type=float,
+                        help='Shared escape/route small-pad via preference, MM (default when present: 2)')
+    parser.add_argument('--blind-vias', action='store_true')
+    parser.add_argument('--component-rules', choices=('off', 'report', 'soft', 'on'), default='off')
+    parser.add_argument('--rules-override', type=Path)
     args = parser.parse_args()
     if not math.isfinite(args.small_pad_mm) or args.small_pad_mm <= 0:
         parser.error('--small-pad-mm must be positive and finite')
+    if args.keep_vias_off_pads is not None and (
+            not math.isfinite(args.keep_vias_off_pads) or not 0.000001 <= args.keep_vias_off_pads <= 1e9):
+        parser.error('--keep-vias-off-pads must be positive and finite, between 1 nm and 1e9 mm')
     report = {'board': str(args.board), 'findings': []}
     sections = defaultdict(list)
 
@@ -663,11 +704,29 @@ def main():
         for a, b in sorted(misses):
             finding('Differential pairs', 'quality', f'Possible near-miss {a} / {b}: not paired. If these are a differential pair, rename to identical case-sensitive stems with final uppercase P/N or +/- (e.g. USB_P/USB_N or USB_D+/USB_D-).')
 
+        # Analyse precisely the zone/via/component policy suggested below, not a different hard-fill model.
+        routing_args = []
+        soft_zones = bool(planes) if args.soft_zones is None else args.soft_zones
+        if soft_zones:
+            routing_args.append('--soft-zones')
+        pad_limit = args.keep_vias_off_pads
+        if pad_limit is None and soft_zones and planes:
+            pad_limit = args.small_pad_mm
+        if pad_limit is not None:
+            routing_args.extend(['--keep-vias-off-pads', f'{pad_limit:g}'])
+        if args.blind_vias:
+            routing_args.append('--blind-vias')
+        if args.component_rules != 'off':
+            routing_args.extend(['--component-rules', args.component_rules])
+        if args.rules_override is not None:
+            routing_args.extend(['--rules-override', str(args.rules_override)])
+        report['routing_args'] = routing_args
+
         estimate = sum(max(0, len(p) - 1) for p in pads_by_net.values())
         connections, connection_source = estimate, 'pad-count estimate, before existing copper/planes'
         binary = shutil.which(args.tracemaker or os.environ.get('TRACEMAKER', 'tracemaker'))
         if not binary:
-            finding('Escape and engine warnings', 'info', 'TraceMaker not found: skipping engine DRC warnings and escape checks; set --tracemaker or TRACEMAKER. This is not routing clearance sign-off.')
+            finding('Escape and engine warnings', 'quality', 'Escape access unknown: TraceMaker not found; skipping engine DRC warnings and escape checks. Set --tracemaker or TRACEMAKER. This is not routing clearance sign-off.')
         else:
             try:
                 with tempfile.TemporaryDirectory(prefix='tracemaker-preflight-drc-') as drc_tmp:
@@ -701,37 +760,22 @@ def main():
                     connection_source = 'TraceMaker DRC unconnected_items'
                 with tempfile.TemporaryDirectory(prefix='tracemaker-preflight-') as tmp:
                     escape_path = Path(tmp) / 'escape.json'
-                    p = subprocess.run([binary, 'escape', str(args.board), '--json', str(escape_path)],
+                    p = subprocess.run([binary, 'escape', str(args.board), *routing_args, '--json', str(escape_path)],
                                        capture_output=True, text=True, timeout=55)
                     if p.returncode != 0 or not escape_path.exists():
                         raise RuntimeError(f'TraceMaker escape failed (exit {p.returncode}): {(p.stderr or p.stdout).strip()}')
                     escape = json.loads(escape_path.read_text())
                 report['escape'] = escape
-                dead = escape['dead']
-                descriptions = [f"{part['ref']}: {', '.join(group['pins'][:12])}"
-                                + (f" (+{len(group['pins']) - 12} more)" if len(group['pins']) > 12 else '')
-                                + f" ({group['reason']})"
-                                for part in escape.get('parts', []) for group in part.get('dead', [])]
-                # Lattice-based: "dead" means no escape on the router's lattice, not proof that none exists. The
-                # analysis keeps existing tracks/vias and zone fills as fixed obstacles and ignores connectivity.
-                caveats = []
-                if dead and routed:
-                    caveats.append(f'the board already has {routed} tracks/arcs/vias: they count as obstacles and connected pins are not skipped, so strip unlocked routing for a true count')
-                if dead and any(z.get('filled') for z in zone_details):
-                    caveats.append('zone fills count as fixed copper here; with --soft-zones some of these pins may escape through refillable planes')
-                finding('Escape and engine warnings', 'quality' if dead else 'info',
-                        f'Dead escape pins: {dead}; ' + ('; '.join(descriptions[:10]) if dead else 'dense-package pins checked can escape.')
-                        + ('; more in JSON report' if len(descriptions) > 10 else '')
-                        + (' Caveats: ' + '; '.join(caveats) + '.' if caveats else ''))
+                for severity, message in escape_findings(escape):
+                    finding('Escape and engine warnings', severity, message)
+                for warning in escape.get('warnings', []):
+                    finding('Escape and engine warnings', 'quality', f'Escape domain warning: {warning}')
             except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
-                finding('Escape and engine warnings', 'info', f'Engine checks unavailable: {exc}')
+                finding('Escape and engine warnings', 'quality', f'Escape access unknown: engine checks unavailable: {exc}')
         work = 1000000 if connections < 100 else 10000000 if connections < 500 else 50000000
         command = [binary or 'tracemaker', 'route', str(args.board), '-o',
                    str(args.board.with_name(args.board.stem + '-routed.kicad_pcb')), '--json', 'route.json']
-        if planes:
-            command.extend(['--soft-zones', '--keep-vias-off-pads'])
-            if args.small_pad_mm != 2:
-                command.append(f'{args.small_pad_mm:g}')
+        command.extend(routing_args)
         if pairs:
             command.append('--diff-pairs')
         command.extend(['--work', str(work)])

@@ -12,6 +12,7 @@
 #include "route/escape.hpp"
 #include "route/escape_flow.hpp"
 #include "route/obstacles.hpp"
+#include "drc/copper.hpp"
 
 using namespace tmk;
 using geom::Point;
@@ -50,6 +51,138 @@ double dist_point_segment(Point p, Point a, Point b) {
   double t = len2 > 0 ? ((static_cast<double>(p.x - a.x)) * ux + (static_cast<double>(p.y - a.y)) * uy) / len2 : 0;
   t = std::clamp(t, 0.0, 1.0);
   return std::hypot(static_cast<double>(p.x - a.x) - t * ux, static_cast<double>(p.y - a.y) - t * uy);
+}
+
+model::DesignRules access_rules(Coord width = 150'000, Coord clearance = 10'000) {
+  model::DesignRules rules;
+  rules.classes.emplace_back();
+  rules.classes[0].track_width = width;
+  rules.classes[0].clearance = clearance;
+  rules.classes[0].via_diameter = 450'000;
+  rules.classes[0].via_drill = 300'000;
+  rules.minimums.via_diameter = 450'000;
+  rules.minimums.through_hole_diameter = 300'000;
+  rules.minimums.via_annular_width = 75'000;
+  return rules;
+}
+
+// One outstanding dense-package pad; the other balls are geometric neighbours, not routing obligations.
+model::Board access_board() {
+  auto b = bga(3, 600'000, 200'000);
+  for (std::size_t i = 0; i < b.nets.size(); ++i) b.nets[i].id = static_cast<model::NetId>(i);
+  b.layers = {{0, "F.Cu", "F.Cu", "signal", "", 0}, {31, "B.Cu", "B.Cu", "signal", "", 1}};
+  b.copper = {0, 1};
+  b.vias_tented = true;
+  for (std::size_t i = 1; i < b.pads.size(); ++i) b.pads[i].net = 0;
+  b.footprints.push_back({});
+  b.footprints[1].reference = "J1";
+  auto terminal = b.pads[0];
+  terminal.footprint = 1;
+  terminal.pos = {10'000'000, 0};
+  b.footprints[1].pads.push_back(static_cast<int>(b.pads.size()));
+  b.pads.push_back(terminal);
+  return b;
+}
+
+void fill_rectangle(model::Board& b, int layer, Coord x0, Coord y0, Coord x1, Coord y1) {
+  model::Zone zone;
+  zone.net = 2;
+  zone.copper = model::layer_bit(layer);
+  zone.outline.push_back({{x0, y0}, {x1, y0}, {x1, y1}, {x0, y1}});
+  zone.fills.emplace_back(layer, zone.outline.front());
+  b.zones.push_back(std::move(zone));
+}
+
+const route::PartEscape& dense_part(const std::vector<route::PartEscape>& parts) {
+  const auto found = std::find_if(parts.begin(), parts.end(), [](const auto& part) { return part.footprint == 0; });
+  REQUIRE(found != parts.end());
+  return *found;
+}
+
+bool pad_contains(const model::Pad& pad, Point point) {
+  const auto shapes = drc::pad_shapes(pad);
+  return std::any_of(shapes.begin(), shapes.end(), [&](const auto& shape) {
+    return geom::closer_than_disk(shape, point, 0, 1);
+  });
+}
+
+void check_access_witness(const model::Board& b, route::Obstacles& obs, int pad, const route::AccessPath& path) {
+  const auto& source = b.pads[static_cast<std::size_t>(pad)];
+  REQUIRE((!path.steps.empty() || !path.vias.empty()));
+  Point cursor = path.steps.empty() ? path.end : path.steps.front().a;
+  int layer = path.steps.empty() ? path.layer : path.steps.front().layer;
+  CHECK(pad_contains(source, cursor));
+  CHECK(((source.copper & model::layer_bit(layer)) != 0 ||
+        std::any_of(path.vias.begin(), path.vias.end(), [&](const auto& via) {
+          if (via.pos != cursor || layer < via.layer_top || layer > via.layer_bottom) return false;
+          for (int l = via.layer_top; l <= via.layer_bottom; ++l)
+            if (source.copper & model::layer_bit(l)) return true;
+          return false;
+        })));
+  for (const auto& step : path.steps) {
+    CHECK(step.a == cursor);
+    if (step.layer != layer) {
+      const auto via = std::find_if(path.vias.begin(), path.vias.end(), [&](const auto& v) {
+        return v.pos == cursor && v.layer_top <= std::min(layer, step.layer) &&
+               v.layer_bottom >= std::max(layer, step.layer);
+      });
+      CHECK(via != path.vias.end());
+    }
+    CHECK(step.width > 0);
+    CHECK(obs.segment_state(step.a, step.b, step.layer, step.width, source.net, false) == 0);
+    cursor = step.b;
+    layer = step.layer;
+  }
+  CHECK(cursor == path.end);
+  if (layer != path.layer) {
+    CHECK(std::any_of(path.vias.begin(), path.vias.end(), [&](const auto& v) {
+      return v.pos == cursor && v.layer_top <= std::min(layer, path.layer) &&
+             v.layer_bottom >= std::max(layer, path.layer);
+    }));
+  }
+  for (const auto& via : path.vias) {
+    CHECK(via.net == source.net);
+    CHECK(obs.via_state_span(via.pos, via.size, via.drill, via.net, 0, false, nullptr,
+                             via.layer_top, via.layer_bottom) == 0);
+    CHECK(((path.steps.empty() && via.pos == path.end) || std::any_of(path.steps.begin(), path.steps.end(), [&](const auto& step) {
+      return step.a == via.pos || step.b == via.pos;
+    })));
+  }
+}
+
+void check_same_access(const route::AccessSearchResult& indexed, const route::AccessSearchResult& reference) {
+  REQUIRE(indexed.candidates.size() == reference.candidates.size());
+  for (std::size_t i = 0; i < indexed.candidates.size(); ++i) {
+    CHECK(indexed.candidates[i].first == reference.candidates[i].first);
+    CHECK(indexed.candidates[i].second == reference.candidates[i].second);
+  }
+  CHECK(indexed.exhausted == reference.exhausted);
+  CHECK(indexed.work == reference.work);
+  REQUIRE(indexed.paths.size() == reference.paths.size());
+  for (std::size_t i = 0; i < indexed.paths.size(); ++i) {
+    const auto& a = indexed.paths[i];
+    const auto& b = reference.paths[i];
+    CHECK(a.end == b.end);
+    CHECK(a.layer == b.layer);
+    CHECK(a.cost == b.cost);
+    REQUIRE(a.steps.size() == b.steps.size());
+    for (std::size_t k = 0; k < a.steps.size(); ++k) {
+      CHECK(a.steps[k].a == b.steps[k].a);
+      CHECK(a.steps[k].b == b.steps[k].b);
+      CHECK(a.steps[k].layer == b.steps[k].layer);
+      CHECK(a.steps[k].width == b.steps[k].width);
+    }
+    REQUIRE(a.vias.size() == b.vias.size());
+    for (std::size_t k = 0; k < a.vias.size(); ++k) {
+      CHECK(a.vias[k].pos == b.vias[k].pos);
+      CHECK(a.vias[k].size == b.vias[k].size);
+      CHECK(a.vias[k].drill == b.vias[k].drill);
+      CHECK(a.vias[k].type == b.vias[k].type);
+      CHECK(a.vias[k].layer_top == b.vias[k].layer_top);
+      CHECK(a.vias[k].layer_bottom == b.vias[k].layer_bottom);
+      CHECK(a.vias[k].net == b.vias[k].net);
+    }
+  }
 }
 
 }  // namespace
@@ -116,30 +249,386 @@ TEST_CASE("escape plan: perimeter pins fan out, inner balls get one dog-bone sit
   CHECK(route::plan_escapes(b, needs, [](model::NetId) { return Coord{300'000}; }, coarse).empty());
 }
 
-TEST_CASE("escape analysis: sbc's DRAM balls are blocked only by the solder-mask rule", "[escape][fixture]") {
+TEST_CASE("escape analysis: fixture verdicts stay domain-qualified and witnesses exact", "[escape][fixture]") {
   const std::string path = std::string(TM_SOURCE_DIR) + "/bench/data/freerouting/scripts/benchmark/fixtures/PCBench/sbc_sbc/unrouted.kicad_pcb";
   if (!std::filesystem::exists(path)) SKIP("fixture missing: " + path);
   const auto lb = io::read_board_file(path);
   const auto rules = io::read_design_rules(path);
   model::Board b = lb.board;
   route::Obstacles obs(b, rules);
+  const Coord mask = obs.via_mask();
   const auto parts = route::analyse_escapes(b, rules, obs);
   const route::PartEscape* dram = nullptr;
   for (const auto& pe : parts)
     if (pe.ref == "DRAM1") dram = &pe;
   REQUIRE(dram != nullptr);
-  CHECK(dram->pins > 60);
-  CHECK(!dram->dead.empty());
-  int mask_only = 0;
-  for (const auto& d : dram->dead) mask_only += d.reason.find("solder-mask") != std::string::npos;
-  CHECK(mask_only > 0);
-  CHECK(!dram->hint.empty());
-  // With tented vias the same balls escape: the analysis restores the setting it probes with.
-  CHECK(obs.via_mask() > 0);
+  CHECK(dram->results.size() > 60);
+  const auto check_results = [&](const route::PartEscape& part) {
+    int witnessed = 0;
+    for (const auto& pin : part.results) {
+      CHECK_FALSE(pin.domain.empty());
+      CHECK((pin.status == "satisfied" || pin.status == "witness" || pin.status == "exhausted" || pin.status == "unknown"));
+      if (pin.status == "witness") {
+        ++witnessed;
+        check_access_witness(b, obs, pin.pad, pin.witness);
+      }
+    }
+    CHECK(witnessed == part.escapable);
+    for (const auto& dead : part.dead) {
+      CHECK(std::any_of(part.results.begin(), part.results.end(), [&](const auto& pin) {
+        return pin.pad == dead.pad && pin.status == "exhausted";
+      }));
+    }
+  };
+  check_results(*dram);
+  // The configured mask is not changed by the analysis.
+  CHECK(mask > 0);
+  CHECK(obs.via_mask() == mask);  // analysing did not modify the selected rule domain
   obs.set_via_mask(0);
   const auto tented = route::analyse_escapes(b, rules, obs);
-  for (const auto& pe : tented)
-    if (pe.ref == "DRAM1") CHECK(pe.dead.size() < dram->dead.size());
+  for (const auto& part : tented)
+    if (part.ref == "DRAM1") check_results(part);
+}
+
+TEST_CASE("escape analysis skips already-connected pads, including an internally satisfied net", "[escape]") {
+  auto b = access_board();
+  const auto rules = access_rules();
+  SECTION("existing locked route to a remote terminal") {
+    b.tracks.push_back({b.pads[0].pos, b.pads.back().pos, 150'000, 0, 1, true});
+  }
+  SECTION("both required terminals are inside the package") {
+    b.pads.back().net = 0;
+    b.pads[1].net = 1;
+    b.tracks.push_back({b.pads[0].pos, b.pads[1].pos, 150'000, 0, 1, true});
+  }
+  route::Obstacles obs(b, rules);
+  const auto parts = route::analyse_escapes(b, rules, obs);
+  const auto& part = dense_part(parts);
+  CHECK(part.pins == 0);
+  CHECK(part.escapable == 0);
+  CHECK(part.dead.empty());
+  REQUIRE_FALSE(part.results.empty());
+  for (const auto& pin : part.results) {
+    CHECK(pin.status == "satisfied");
+    CHECK(pin.witness.steps.empty());
+    CHECK(pin.witness.vias.empty());
+  }
+  REQUIRE(b.tracks.size() == 1);
+  CHECK(b.tracks[0].locked);
+}
+
+TEST_CASE("escape obligations include reachable unused planes only in refillable mode", "[escape][soft-zones]") {
+  auto b = access_board();
+  const auto rules = access_rules();
+  b.pads.back().net = 0;
+  fill_rectangle(b, 1, -2'000'000, -2'000'000, 2'000'000, 2'000'000);
+  b.zones.back().net = 1;
+  route::Obstacles hard(b, rules);
+  const auto fixed = route::analyse_escapes(b, rules, hard);
+  CHECK(dense_part(fixed).pins == 0);
+  CHECK(dense_part(fixed).results.front().status == "satisfied");
+  route::Obstacles soft(b, rules, true);
+  route::EscapeAnalysisOptions options;
+  options.routing.soft_zones = true;
+  const auto refillable = route::analyse_escapes(b, rules, soft, options);
+  CHECK(dense_part(refillable).pins == 1);
+  CHECK(dense_part(refillable).results.front().status == "witness");
+}
+
+TEST_CASE("escape analysis distinguishes immutable fills from refillable zones", "[escape][soft-zones]") {
+  auto b = access_board();
+  const auto rules = access_rules();
+  for (int layer = 0; layer < b.copper_count(); ++layer) {
+    fill_rectangle(b, layer, -3'000'000, -3'000'000, -400'000, 3'000'000);
+    fill_rectangle(b, layer, 1'600'000, -3'000'000, 3'000'000, 3'000'000);
+    fill_rectangle(b, layer, -400'000, -3'000'000, 1'600'000, -400'000);
+    fill_rectangle(b, layer, -400'000, 1'600'000, 1'600'000, 3'000'000);
+  }
+  route::EscapeAnalysisOptions options;
+  options.work_budget = 2'000'000;
+  options.routing.allow_vias = false;
+  route::Obstacles hard(b, rules);
+  const auto hard_parts = route::analyse_escapes(b, rules, hard, options);
+  const auto& hard_part = dense_part(hard_parts);
+  REQUIRE(hard_part.results.size() == 1);
+  CHECK(hard_part.results[0].status == "exhausted");
+  CHECK(hard_part.escapable == 0);
+  REQUIRE(hard_part.dead.size() == 1);
+  CHECK_FALSE(hard_part.results[0].domain.empty());
+  route::Obstacles soft(b, rules, true);
+  options.routing.soft_zones = true;
+  const auto soft_parts = route::analyse_escapes(b, rules, soft, options);
+  const auto& soft_part = dense_part(soft_parts);
+  REQUIRE(soft_part.results.size() == 1);
+  CHECK(soft_part.results[0].status == "witness");
+  CHECK(soft_part.escapable == 1);
+  CHECK(soft_part.dead.empty());
+  CHECK(soft_part.results[0].domain != hard_part.results[0].domain);
+  check_access_witness(b, soft, 0, soft_part.results[0].witness);
+  options.reference = true;
+  const auto reference = route::analyse_escapes(b, rules, soft, options);
+  const auto& ref_part = dense_part(reference);
+  REQUIRE(ref_part.results.size() == soft_part.results.size());
+  CHECK(ref_part.results[0].status == soft_part.results[0].status);
+  CHECK(ref_part.results[0].domain == soft_part.results[0].domain);
+}
+
+TEST_CASE("escape analysis work exhaustion is unknown, never a dead-pin proof", "[escape]") {
+  auto b = access_board();
+  const auto rules = access_rules();
+  route::Obstacles obs(b, rules);
+  route::EscapeAnalysisOptions options;
+  options.work_budget = 1;
+  const auto parts = route::analyse_escapes(b, rules, obs, options);
+  const auto& part = dense_part(parts);
+  REQUIRE(part.results.size() == 1);
+  CHECK(part.results[0].status == "unknown");
+  CHECK_FALSE(part.results[0].reason.empty());
+  CHECK_FALSE(part.results[0].domain.empty());
+  CHECK(part.dead.empty());
+}
+
+TEST_CASE("escape analysis seeds only real copper after package rotation and side changes", "[escape]") {
+  auto b = access_board();
+  const auto rules = access_rules();
+  double angle = 37;
+  int layer = 0;
+  SECTION("front") {}
+  SECTION("flipped") {
+    angle = 127;
+    layer = 1;
+    b.footprints[0].back = true;
+  }
+  const Point translation{1'010'010, 1'010'010};
+  const double radians = angle * std::acos(-1.0) / 180.0;
+  for (auto& pad : b.pads) {
+    const Point original = pad.pos;
+    pad.pos = {translation.x + static_cast<Coord>(std::llround(static_cast<double>(original.x) * std::cos(radians) - static_cast<double>(original.y) * std::sin(radians))),
+               translation.y + static_cast<Coord>(std::llround(static_cast<double>(original.x) * std::sin(radians) + static_cast<double>(original.y) * std::cos(radians)))};
+    pad.angle = angle;
+    pad.copper = model::layer_bit(layer);
+  }
+  b.pads[0].shape = model::PadShape::Rect;
+  b.pads[0].size_x = 700'000;
+  b.pads[0].size_y = 200'000;
+  route::Obstacles obs(b, rules);
+  route::EscapeAnalysisOptions options;
+  options.routing.allow_vias = false;
+  const auto parts = route::analyse_escapes(b, rules, obs, options);
+  const auto& part = dense_part(parts);
+  REQUIRE(part.results.size() == 1);
+  REQUIRE(part.results[0].status == "witness");
+  check_access_witness(b, obs, 0, part.results[0].witness);
+  options.reference = true;
+  const auto reference = route::analyse_escapes(b, rules, obs, options);
+  const auto& ref_part = dense_part(reference);
+  REQUIRE(ref_part.results.size() == 1);
+  CHECK(ref_part.results[0].status == part.results[0].status);
+  CHECK(ref_part.results[0].domain == part.results[0].domain);
+  check_same_access({{part.results[0].witness}, false, 0, {}}, {{ref_part.results[0].witness}, false, 0, {}});
+}
+
+TEST_CASE("access graph seeds rotated and flipped pads on their real copper", "[escape][access]") {
+  auto b = access_board();
+  const auto rules = access_rules();
+  auto& pad = b.pads[0];
+  pad.pos = {1'010'010, 1'010'010};
+  pad.shape = model::PadShape::Rect;
+  pad.size_x = 700'000;
+  pad.size_y = 200'000;
+  SECTION("rotated front pad") { pad.angle = 37; }
+  SECTION("rotated flipped pad") {
+    b.footprints[0].back = true;
+    b.footprints[0].angle = 90;
+    pad.angle = 127;
+    pad.copper = model::layer_bit(1);
+  }
+  for (std::size_t i = 1; i < b.pads.size(); ++i) b.pads[i].pos.x += 20'000'000;
+  route::Obstacles obs(b, rules);
+  route::AccessSearchOptions options;
+  options.routing.allow_vias = false;
+  options.target = [centre = pad.pos](Point p, int) {
+    return std::llabs(p.x - centre.x) >= 600'000 || std::llabs(p.y - centre.y) >= 600'000;
+  };
+  const auto indexed = route::generate_access_paths(b, rules, obs, 0, options);
+  REQUIRE_FALSE(indexed.paths.empty());
+  for (const auto& path : indexed.paths) {
+    check_access_witness(b, obs, 0, path);
+    CHECK(options.target(path.end, path.layer));
+  }
+  options.reference = true;
+  const auto reference = route::generate_access_paths(b, rules, obs, 0, options);
+  check_same_access(indexed, reference);
+}
+
+TEST_CASE("access graph finds a via pocket between global lattice sites", "[escape][access]") {
+  auto b = access_board();
+  const auto rules = access_rules();
+  const Point pocket{1'010'010, 1'010'010};
+  b.pads[0].pos = {pocket.x - 500'000, pocket.y};
+  for (std::size_t i = 1; i < b.pads.size(); ++i) b.pads[i].pos.x += 20'000'000;
+  const Coord left = pocket.x - 235'000, right = pocket.x + 235'000;
+  const Coord bottom = pocket.y - 235'000, top = pocket.y + 235'000;
+  // F.Cu has a 0.2 mm access tunnel feeding the square cavity. B.Cu has only the cavity.
+  fill_rectangle(b, 0, -4'000'000, pocket.y + 100'000, left, 6'000'000);
+  fill_rectangle(b, 0, -4'000'000, -4'000'000, left, pocket.y - 100'000);
+  fill_rectangle(b, 0, left, top, 6'000'000, 6'000'000);
+  fill_rectangle(b, 0, left, -4'000'000, 6'000'000, bottom);
+  fill_rectangle(b, 0, right, bottom, 6'000'000, top);
+  fill_rectangle(b, 1, -4'000'000, -4'000'000, left, 6'000'000);
+  fill_rectangle(b, 1, right, -4'000'000, 6'000'000, 6'000'000);
+  fill_rectangle(b, 1, left, -4'000'000, right, bottom);
+  fill_rectangle(b, 1, left, top, right, 6'000'000);
+  route::Obstacles obs(b, rules);
+  REQUIRE(obs.via_state(pocket, 450'000, 300'000, 1, 0, false) == 0);
+  CHECK(obs.via_state({1'000'000, 1'000'000}, 450'000, 300'000, 1, 0, false) == 2);
+  route::AccessSearchOptions options;
+  options.record_candidates = true;
+  options.origin = {0, 0};
+  options.target = [](Point, int layer) { return layer == 1; };
+  const auto indexed = route::generate_access_paths(b, rules, obs, 0, options);
+  REQUIRE_FALSE(indexed.paths.empty());
+  for (const auto& path : indexed.paths) {
+    check_access_witness(b, obs, 0, path);
+    CHECK(path.layer == 1);
+    REQUIRE_FALSE(path.vias.empty());
+    CHECK(std::any_of(path.vias.begin(), path.vias.end(), [&](const auto& via) {
+      return (via.pos.x - options.origin.x) % options.pitch != 0 ||
+             (via.pos.y - options.origin.y) % options.pitch != 0;
+    }));
+  }
+  options.reference = true;
+  check_same_access(indexed, route::generate_access_paths(b, rules, obs, 0, options));
+  SECTION("the router commits the same off-grid access transactionally") {
+    b.pads.back().pos = pocket;
+    b.pads.back().copper = model::layer_bit(1);
+    route::RouterOptions routing;
+    routing.pitch = options.pitch;
+    routing.work_budget = 2'000'000;
+    routing.time_limit_s = 30;
+    routing.gpu_device = -1;
+    routing.optimize = false;
+    const auto routed = route::Router(b, rules, routing).run();
+    REQUIRE(routed.connections == 1);
+    REQUIRE(routed.routed == 1);
+    REQUIRE(routed.access_connections == 1);
+    REQUIRE_FALSE(routed.vias.empty());
+    CHECK(std::any_of(routed.vias.begin(), routed.vias.end(), [&](const auto& v) {
+      return v.pos.x % options.pitch != 0 || v.pos.y % options.pitch != 0;
+    }));
+    for (const auto& track : routed.tracks)
+      CHECK(obs.segment_state(track.a, track.b, track.layer, track.width, track.net, false) == 0);
+    for (const auto& v : routed.vias)
+      CHECK(obs.via_state(v.pos, v.size, v.drill, v.net, 0, false) == 0);
+  }
+}
+
+TEST_CASE("access widths use hard constraints, not the 0.147 mm class target as a floor", "[escape][access]") {
+  auto b = access_board();
+  auto rules = access_rules(147'000, 200'000);
+  // As on CM5, the designer has also declared a 0.127 mm class; zero board minimum is not
+  // permission to invent an infinitesimal manufacturing floor.
+  auto fine = rules.classes[0];
+  fine.name = "100ohm";
+  fine.track_width = 127'000;
+  rules.classes.push_back(fine);
+  b.pads[0].size_x = b.pads[0].size_y = 100'000;
+  for (std::size_t i = 1; i < b.pads.size(); ++i) b.pads[i].pos.x += 20'000'000;
+  fill_rectangle(b, 0, -5'000'000, 270'000, 5'000'000, 5'000'000);
+  fill_rectangle(b, 0, -5'000'000, -5'000'000, 5'000'000, -270'000);
+  bool narrowing_allowed = true;
+  SECTION("the board permits a narrower legal access") {}
+  SECTION("a hard custom floor between declared floor and target still permits access") {
+    model::CustomRule rule;
+    rule.name = "N0 minimum access width";
+    rule.condition = "A.NetName == 'N0'";
+    model::Constraint constraint;
+    constraint.type = "track_width";
+    constraint.min = 130'000;
+    rule.constraints.push_back(constraint);
+    rules.custom.push_back(rule);
+  }
+  SECTION("the board forbids narrowing below 0.147 mm") {
+    rules.minimums.track_width = 147'000;
+    narrowing_allowed = false;
+  }
+  SECTION("a net-specific custom minimum forbids narrowing below 0.147 mm") {
+    model::CustomRule rule;
+    rule.name = "N0 minimum access width";
+    rule.condition = "A.NetName == 'N0'";
+    model::Constraint constraint;
+    constraint.type = "track_width";
+    constraint.min = 147'000;
+    rule.constraints.push_back(constraint);
+    rules.custom.push_back(rule);
+    narrowing_allowed = false;
+  }
+  route::Obstacles obs(b, rules);
+  CHECK(obs.segment_state({0, 0}, {1'000'000, 0}, 0, 147'000, 1, false) == 2);
+  CHECK(obs.segment_state({0, 0}, {1'000'000, 0}, 0, 140'000, 1, false) == 0);
+  CHECK(obs.segment_state({0, 0}, {1'000'000, 0}, 0, 140'002, 1, false) == 2);
+  // The obstacle geometry fits 0.140 mm; width constraints are enforced separately by access policy.
+  route::AccessSearchOptions options;
+  options.routing.allow_vias = false;
+  options.target = [](Point p, int layer) { return layer == 0 && p.x >= 1'000'000; };
+  const auto indexed = route::generate_access_paths(b, rules, obs, 0, options);
+  if (narrowing_allowed) {
+    REQUIRE_FALSE(indexed.paths.empty());
+    for (const auto& path : indexed.paths) {
+      check_access_witness(b, obs, 0, path);
+      CHECK(options.target(path.end, path.layer));
+      // An odd integer width shares the same width/2 exact radius; the next radius (140002) is blocked.
+      CHECK(std::any_of(path.steps.begin(), path.steps.end(), [](const auto& step) { return step.width <= 140'001; }));
+    }
+  } else {
+    CHECK(indexed.paths.empty());
+    CHECK(indexed.exhausted);
+  }
+  options.reference = true;
+  check_same_access(indexed, route::generate_access_paths(b, rules, obs, 0, options));
+}
+
+TEST_CASE("access graph retains multibend escapes beyond 0.8 mm and never rips locked copper", "[escape][access]") {
+  auto b = access_board();
+  const auto rules = access_rules();
+  for (std::size_t i = 1; i < b.pads.size(); ++i) b.pads[i].pos.x += 20'000'000;
+  fill_rectangle(b, 0, -10'000'000, 900'000, 10'000'000, 10'000'000);
+  fill_rectangle(b, 0, -10'000'000, -10'000'000, 10'000'000, -900'000);
+  b.tracks.push_back({{700'000, -200'000}, {700'000, 900'000}, 200'000, 0, 2, true});
+  b.tracks.push_back({{1'300'000, -900'000}, {1'300'000, 200'000}, 200'000, 0, 2, true});
+  const auto original = b.tracks;
+  route::Obstacles obs(b, rules);
+  CHECK(obs.segment_state({0, 0}, {2'000'000, 0}, 0, 150'000, 1, false) == 2);
+  route::AccessSearchOptions options;
+  options.radius = 4'000'000;
+  options.routing.allow_vias = false;
+  options.target = [](Point p, int layer) { return layer == 0 && p.x >= 2'000'000 && std::llabs(p.y) < 200'000; };
+  const auto indexed = route::generate_access_paths(b, rules, obs, 0, options);
+  REQUIRE_FALSE(indexed.paths.empty());
+  for (const auto& path : indexed.paths) {
+    check_access_witness(b, obs, 0, path);
+    CHECK(options.target(path.end, path.layer));
+    REQUIRE(path.steps.size() >= 3);
+    bool below = false, above = false;
+    for (const auto& step : path.steps) {
+      below |= step.a.y < -200'000 || step.b.y < -200'000;
+      above |= step.a.y > 200'000 || step.b.y > 200'000;
+    }
+    CHECK(below);
+    CHECK(above);
+    CHECK(path.end.x - b.pads[0].pos.x > 800'000);
+    CHECK(path.vias.empty());
+  }
+  options.reference = true;
+  check_same_access(indexed, route::generate_access_paths(b, rules, obs, 0, options));
+  REQUIRE(b.tracks.size() == original.size());
+  for (std::size_t i = 0; i < original.size(); ++i) {
+    CHECK(b.tracks[i].a == original[i].a);
+    CHECK(b.tracks[i].b == original[i].b);
+    CHECK(b.tracks[i].width == original[i].width);
+    CHECK(b.tracks[i].net == original[i].net);
+    CHECK(b.tracks[i].locked);
+  }
 }
 
 // ---- Escape planning v2: min-cost-flow channel and layer assignment (route/escape_flow.hpp) ----

@@ -92,8 +92,8 @@ struct Router::Impl {
     int rips = 0, fails = 0;
     std::string why;                 // last failure explanation
     bool coupled = false;            // routed as half of a differential pair: clean-up leaves it alone
-    // Boxed in even by a negotiated search, which may cross every other net's routed copper: only fixed copper
-    // encloses the pin (M9). Retrying it in later passes and restarts only spends budget others could use.
+    // Exhausted the configured fixed-copper access graph, not a geometric impossibility certificate.
+    // Incomplete graph construction is never terminal; changes of access domain get distinct nogoods.
     bool dead = false;
   };
   std::vector<ConnState> cs;
@@ -178,13 +178,13 @@ struct Router::Impl {
   bool force_escapes = false; // escalation rung: off-lattice escapes even when the pad has lattice exits
   Coord class_width(NetId net) const { return std::max(netclass(net).track_width, rules.minimums.track_width); }
   Coord track_width(NetId net) const { return width_override > 0 ? width_override : class_width(net); }
-  // Narrowest legal width to fall back to: the board minimum (KiCad's track_width rule), but not below 0.15 mm
-  // unless the board minimum itself is smaller and non-zero.
   Coord neck_width(NetId net) const {
-    const Coord mn = rules.minimums.track_width;
-    const Coord w = mn > 0 ? std::max(mn, std::min<Coord>(class_width(net), 150'000)) : std::min<Coord>(class_width(net), 150'000);
-    return w < class_width(net) ? w : 0;
+    const Coord w = access_width_floor(rules);
+    return w > 0 && w < class_width(net) ? w : 0;
   }
+  bool local_access = false;
+  bool access_incomplete = false;
+  std::map<int, std::vector<AccessPath>> access_cache;
   // Static disallow permissions are an optimization; residual rules use exact candidate checks instead.
   std::vector<model::LayerMask> net_layers;
   std::vector<std::uint8_t> net_vias;
@@ -421,6 +421,7 @@ struct Router::Impl {
     std::vector<std::pair<int, std::int64_t>> cells;  // (layer, cell index in window)
     std::vector<Point> stub;                           // per cell: off-lattice escape point (or the pad centre)
     std::vector<std::int64_t> cost;                    // per cell: cost from the pad centre
+    std::vector<const AccessPath*> access;            // stable paths owned by access_cache
   };
   // Off-lattice escapes: straight exits from the pad centre in 8 directions, exactly checked, joining the
   // lattice at the first legal point (fine-pitch pins are often unreachable from lattice points alone).
@@ -481,6 +482,36 @@ struct Router::Impl {
       e.cells.emplace_back(x.layer, static_cast<std::int64_t>(cy) * w.w + cx);
       e.stub.push_back(x.stub);
       e.cost.push_back(x.cost);
+    }
+    if (!local_access) return;
+    auto it = access_cache.find(pad);
+    if (it == access_cache.end()) {
+      AccessSearchOptions ao;
+      ao.origin = {lat.x0, lat.y0};
+      ao.pitch = pitch;
+      ao.routing = opt;
+      if (opt.work_budget > 0) ao.work_budget = std::max<long>(1, std::min<long>(ao.work_budget, opt.work_budget - res.expansions));
+      auto result = generate_access_paths(b, rules, *obs, pad, ao);
+      res.expansions += result.work;
+      if (!result.exhausted && result.paths.empty()) { access_incomplete = true; return; }
+      it = access_cache.emplace(pad, std::move(result.paths)).first;
+    }
+    e.access.resize(e.cells.size());
+    for (const auto& path : it->second) {
+      const int gx = to_ix(path.end.x), gy = to_iy(path.end.y);
+      const int cx = gx - w.x0, cy = gy - w.y0;
+      if (cx < 0 || cy < 0 || cx >= w.w || cy >= w.h) continue;
+      if (point_state(path.layer, gx, gy, p.net, width / 2) == 2) continue;
+      bool legal = true;
+      for (const auto& s : path.steps)
+        if (obs->segment_state(s.a, s.b, s.layer, s.width, p.net, soft) == 2) legal = false;
+      for (const auto& v : path.vias)
+        if (obs->via_state_span(v.pos, v.size, v.drill, p.net, 0, soft, nullptr, v.layer_top, v.layer_bottom) == 2) legal = false;
+      if (!legal) continue;
+      e.cells.emplace_back(path.layer, static_cast<std::int64_t>(cy) * w.w + cx);
+      e.stub.push_back(path.end);
+      e.cost.push_back(path.cost);
+      e.access.push_back(&path);
     }
   }
 
@@ -662,7 +693,7 @@ struct Router::Impl {
         break;
       }
     }
-    if (!any_free || force_escapes) add_escapes(w, pad, e);
+    if (!any_free || force_escapes || local_access) add_escapes(w, pad, e);
     return e;
   }
 
@@ -921,9 +952,15 @@ struct Router::Impl {
     const Point sp = b.pads[static_cast<std::size_t>(c.pad_a)].pos;
     start_stub.clear();
     target_stub.clear();
+    start_access.clear();
+    target_access.clear();
     for (std::size_t k = 0; k < dst.cells.size(); ++k) {
       const auto key = cell_key(dst.cells[k].first, w.x0 + static_cast<int>(dst.cells[k].second % w.w), w.y0 + static_cast<int>(dst.cells[k].second / w.w));
-      if (!target_stub.count(key) || dst.stub[k] == tp) target_stub[key] = dst.stub[k];
+      if (!target_stub.count(key) || dst.stub[k] == tp) {
+        target_stub[key] = dst.stub[k];
+        target_access.erase(key);
+        if (!dst.access.empty() && dst.access[k]) target_access[key] = dst.access[k];
+      }
     }
     (void)sp;
     for (std::size_t k = 0; k < src.cells.size(); ++k) {
@@ -933,6 +970,9 @@ struct Router::Impl {
       const std::size_t s = sidx(l, ci, kNoDir);
       if ((sn[s].tag & kGenMask) == gen && sn[s].g <= g0) continue;
       start_stub[cell_key(l, w.x0 + cx, w.y0 + cy)] = src.stub[k];
+      start_access.erase(cell_key(l, w.x0 + cx, w.y0 + cy));
+      if (!src.access.empty() && src.access[k])
+        start_access[cell_key(l, w.x0 + cx, w.y0 + cy)] = src.access[k];
       sn[s] = SNode{g0, gen | (static_cast<std::uint32_t>(kNoDir) << 28), -1};
       if (h(l, w.x0 + cx, w.y0 + cy) >= kUnreachable) continue;
       open.emplace(g0 + h(l, w.x0 + cx, w.y0 + cy), s);
@@ -1077,7 +1117,7 @@ struct Router::Impl {
     const Coord width = track_width(net);
     const Coord vd = via_diameter(net);
     const Coord vdrill = via_drill(net);
-    struct Seg { Point a, b; int layer; };
+    struct Seg { Point a, b; int layer; Coord width = 0; };
     std::vector<Seg> segs;
     std::vector<Point> vias;
     std::vector<std::pair<int, int>> via_span;  // layers joined by each via
@@ -1087,8 +1127,18 @@ struct Router::Impl {
     Point cur = pa;
     int layer = path.front().layer;
     auto P = [&](const PathNode& n) { return at(n.gx, n.gy); };
-    // Leading escape stub (pad centre -> escape point) before the first lattice point.
-    if (auto it = start_stub.find(cell_key(path.front().layer, path.front().gx, path.front().gy)); it != start_stub.end() && !(it->second == pa)) {
+    auto append_access = [&](const AccessPath& access, bool reverse) {
+      if (!reverse) for (const auto& s : access.steps) segs.push_back({s.a, s.b, s.layer, s.width});
+      else for (auto it = access.steps.rbegin(); it != access.steps.rend(); ++it) segs.push_back({it->b, it->a, it->layer, it->width});
+    };
+    const auto skey = cell_key(path.front().layer, path.front().gx, path.front().gy);
+    const auto tkey = cell_key(path.back().layer, path.back().gx, path.back().gy);
+    const AccessPath* leading = start_access.count(skey) ? start_access.at(skey) : nullptr;
+    const AccessPath* trailing = target_access.count(tkey) ? target_access.at(tkey) : nullptr;
+    if (leading) {
+      append_access(*leading, false);
+      cur = leading->end;
+    } else if (auto it = start_stub.find(skey); it != start_stub.end() && !(it->second == pa)) {
       segs.push_back({pa, it->second, layer});
       cur = it->second;
     }
@@ -1111,17 +1161,22 @@ struct Router::Impl {
       if (!(cur == p)) segs.push_back({cur, p, layer});
       cur = p;
     }
-    if (c.pad_b >= 0) {
-      if (auto it = target_stub.find(cell_key(path.back().layer, path.back().gx, path.back().gy)); it != target_stub.end() && !(it->second == pb) && !(it->second == cur)) {
-        segs.push_back({cur, it->second, layer});
-        cur = it->second;
+    if (trailing) {
+      append_access(*trailing, true);
+      cur = pb;
+    } else {
+      if (c.pad_b >= 0) {
+        if (auto it = target_stub.find(tkey); it != target_stub.end() && !(it->second == pb) && !(it->second == cur)) {
+          segs.push_back({cur, it->second, layer});
+          cur = it->second;
+        }
       }
+      if (!(cur == pb)) segs.push_back({cur, pb, layer});
     }
-    if (!(cur == pb)) segs.push_back({cur, pb, layer});
     // Merge collinear consecutive segments on the same layer (after adding the pad legs).
     std::vector<Seg> merged;
     for (const auto& s : segs) {
-      if (!merged.empty() && merged.back().layer == s.layer && merged.back().b == s.a) {
+      if (!merged.empty() && merged.back().layer == s.layer && merged.back().width == s.width && merged.back().b == s.a) {
         const Point a = merged.back().a, m = merged.back().b, e = s.b;
         if (geom::orient(a, m, e) == 0 && ((m.x - a.x) * (e.x - m.x) + (m.y - a.y) * (e.y - m.y)) > 0) {
           merged.back().b = e;
@@ -1146,13 +1201,14 @@ struct Router::Impl {
     bool ok = true;
     std::vector<int> victims;
     for (const auto& s : merged) {
-      const int st = obs->segment_state(s.a, s.b, s.layer, width, net, soft, &victims);
+      const Coord sw = s.width > 0 ? s.width : width;
+      const int st = obs->segment_state(s.a, s.b, s.layer, sw, net, soft, &victims);
       if (st == 2) {
         ok = false;
         if (std::getenv("TM_DEBUG_EXACT"))
           std::fprintf(stderr, "EXACT %s conn %d soft %d: (%.4f,%.4f)-(%.4f,%.4f) L%d w %.3f\n", b.nets[static_cast<std::size_t>(net)].name.c_str(), current,
                        soft ? 1 : 0, nm_to_mm(s.a.x), nm_to_mm(s.a.y), nm_to_mm(s.b.x), nm_to_mm(s.b.y), s.layer, nm_to_mm(width));
-        learn_block(c, s, width);
+        learn_block(c, s, sw);
       }
     }
     // Each via is a through via where that is legal, else (boards that allow them) a blind/buried via over its span.
@@ -1164,6 +1220,14 @@ struct Router::Impl {
         continue;
       }
       ok = false;
+    }
+    std::vector<model::Via> access_vias;
+    for (const auto* access : {leading, trailing}) {
+      if (!access) continue;
+      for (const auto& v : access->vias) {
+        if (obs->via_state_span(v.pos, v.size, v.drill, net, 0, soft, &victims, v.layer_top, v.layer_bottom) == 2) ok = false;
+        access_vias.push_back(v);
+      }
     }
     if (!ok) {
       commit_why = "exact check rejected the lattice path";
@@ -1182,7 +1246,7 @@ struct Router::Impl {
     // Commit.
     auto& st = cs[static_cast<std::size_t>(current)];
     for (const auto& s : merged) {
-      model::Track t{s.a, s.b, width, s.layer, net, false, sexpr::kNoNode};
+      model::Track t{s.a, s.b, s.width > 0 ? s.width : width, s.layer, net, false, sexpr::kNoNode};
       b.tracks.push_back(t);
       const int id = static_cast<int>(b.tracks.size() - 1);
       st.items.push_back(obs->add_track(id, current));
@@ -1202,6 +1266,19 @@ struct Router::Impl {
       near_mark(st.items.back(), +1);
       if (!through) ++res.blind_vias;
       emit_via_add(id);
+    }
+    for (const auto& v : access_vias) {
+      b.vias.push_back(v);
+      const int id = static_cast<int>(b.vias.size() - 1);
+      st.items.push_back(obs->add_via(id, current));
+      near_mark(st.items.back(), +1);
+      if (v.type != model::ViaType::Through) ++res.blind_vias;
+      emit_via_add(id);
+    }
+    if (leading || trailing) {
+      ++res.access_connections;
+      if (std::any_of(merged.begin(), merged.end(), [&](const auto& s) { return s.width > 0 && s.width < class_width(net); }))
+        ++res.narrowed_access;
     }
     return true;
   }
@@ -1310,7 +1387,9 @@ struct Router::Impl {
     return h;
   }
   std::unordered_map<std::int64_t, Point> start_stub, target_stub;  // lattice point -> escape point (pad centre if none)
+  std::unordered_map<std::int64_t, const AccessPath*> start_access, target_access;
   bool search_and_commit(const Connection& c, bool soft_mode) {
+    access_incomplete = false;
     soft = soft_mode;
     // Skip an attempt that already failed in exactly this situation.
     const Point pa0 = b.pads[static_cast<std::size_t>(c.pad_a)].pos;
@@ -1320,7 +1399,7 @@ struct Router::Impl {
     wb.add(pb0);
     wb = wb.inflated(6'000'000 + c.length / 4);
     const std::uint64_t ng = splitmix64(window_signature(wb) ^ (static_cast<std::uint64_t>(current) << 3) ^ (soft_mode ? 1u : 0u) ^
-                                        (force_escapes ? 2u : 0u) ^ (static_cast<std::uint64_t>(width_override) << 20));
+                                        (force_escapes ? 2u : 0u) ^ (local_access ? 4u : 0u) ^ (static_cast<std::uint64_t>(width_override) << 20));
     if (!bypass_nogoods && nogoods.count(ng)) {
       ++nogood_skips;
       why = "skipped: identical earlier attempt failed (nogood)";
@@ -1329,7 +1408,7 @@ struct Router::Impl {
     corr = (!global.corridor.empty() && current >= 0 && static_cast<std::size_t>(current) < global.corridor.size()) ? &global.corridor[static_cast<std::size_t>(current)] : nullptr;
     const bool ok = search_and_commit_inner(c);
     corr = nullptr;
-    if (!ok && !bypass_nogoods) nogoods[ng] = 1;
+    if (!ok && !bypass_nogoods && !access_incomplete) nogoods[ng] = 1;
     return ok;
   }
 
@@ -2965,6 +3044,13 @@ struct Router::Impl {
             width_override = 0;
             via_override = false;
           }
+          if (!ok && !out_of_budget()) {
+            local_access = true;
+            st.dead = false;
+            access_incomplete = false;
+            ok = search_and_commit(st.c, false);
+            local_access = false;
+          }
           force_escapes = false;
           if (!ok) reason += "; escapes/neck-down: " + why;
         }
@@ -2976,22 +3062,24 @@ struct Router::Impl {
             force_escapes = true;
             if (neck_width(st.c.net) > 0) width_override = neck_width(st.c.net);
             via_override = true;
+            local_access = true;
             ok = search_and_commit(st.c, true);
             if (ok) ++res.necked;
             width_override = 0;
             via_override = false;
+            local_access = false;
             force_escapes = false;
-            if (!ok && why.starts_with("boxed in")) {
+            if (!ok && !access_incomplete && why.starts_with("boxed in")) {
               st.dead = true;
               if (opt.sink) {
                 const int dp = why.find("target") != std::string::npos && st.c.pad_b >= 0 ? st.c.pad_b : st.c.pad_a;
                 const Point q = b.pads[static_cast<std::size_t>(dp)].pos;
                 emit("{\"type\":\"escape_dead\",\"id\":" + std::to_string(dp) + ",\"net\":" + std::to_string(st.c.net) + ",\"pad\":\"" + pad_label(dp) +
-                     "\",\"p\":[" + jnum(q.x) + "," + jnum(q.y) + "],\"why\":\"fixed copper encloses the pin\"}");
+                     "\",\"p\":[" + jnum(q.x) + "," + jnum(q.y) + "],\"why\":\"no escape in configured router search domain\"}");
               }
               release_pad(st.c.pad_a, st.c.net);  // a sealed pin's corridor only blocks others
               release_pad(st.c.pad_b, st.c.net);
-              reason += "; fixed copper encloses the pin";
+              reason += "; no escape in configured router search domain";
             }
           }
         }

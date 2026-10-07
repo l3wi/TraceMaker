@@ -26,12 +26,14 @@ edit tell them to close without saving and reopen (or File → Revert), or KiCad
 ### 1. Run the preflight
 
 ```
-python3 <this skill>/scripts/preflight.py BOARD.kicad_pcb [--tracemaker PATH] [--json preflight.json]
+python3 <this skill>/scripts/preflight.py BOARD.kicad_pcb [--tracemaker PATH] [--json preflight.json] [--soft-zones | --no-soft-zones] [--keep-vias-off-pads [MM]] [--blind-vias] [--component-rules off|report|soft|on] [--rules-override FILE]
 ```
 
 It reads the board, project and rules, runs `tracemaker drc` (rule warnings) and `tracemaker escape`
-(dead pins) when the binary is found (`--tracemaker`, `$TRACEMAKER` or `PATH`), and prints findings
-graded `block` (routes wrong or illegal), `slow`, `quality` and `info`, then a suggested route command.
+(connectivity-aware access statuses and exact witnesses) when the binary is found (`--tracemaker`,
+`$TRACEMAKER` or `PATH`), and prints findings graded `block` (routes wrong or illegal), `slow`, `quality`
+and `info`, then a suggested route command. Escape uses the same zone/via/component policy as that command:
+refillable planes and the small-pad via preference are selected when planes exist, unless overridden.
 Fix every `block`. Fix `slow` and `quality` findings unless the design needs them; say which you kept
 and why.
 
@@ -45,11 +47,14 @@ and why.
 | Unparseable custom rule or unsupported condition term | Whole unreadable rule files stop routing; unreadable/unknown conditions match conservatively and bypass caches, not as proven KiCad-equivalent rules | Fix syntax and unsupported terms before routing |
 | Open Edge.Cuts outline | Board area and edge clearance are undefined | Close the outline |
 
-Also check, though they are graded `quality`: **dead escape pins** from `tracemaker escape` (pins of dense
-packages with no way out on the router's lattice under the board's rules; usually a real placement or
-fan-out problem, occasionally routable off-lattice, and the router still tries them). The analysis treats
-existing tracks and zone fills as fixed obstacles and does not skip connected pins, so run it on the
-stripped board and read it with `--soft-zones` in mind.
+Also check, though they are graded `quality`: **exhausted or unknown escape access** from
+`tracemaker escape`. `exhausted` means no escape was found in the reported finite router search domain,
+not physical impossibility; `unknown` means the work budget or unsupported rules prevented a verdict.
+Already-connected obligations are `satisfied`; successful access has an exact `witness` and is `info`.
+Existing copper participates in connectivity and legality, so analyse the actual board you will route
+without stripping it merely to silence findings. Match `--soft-zones`, `--keep-vias-off-pads [MM]`,
+`--blind-vias`, `--component-rules` and `--rules-override` to routing. Soft-zone witnesses remain
+provisional until refill and plane/thermal sign-off.
 
 **Position/footprint `disallow track/via` rules are enforced before insertion**, including final track
 segments and actual via types/spans. Area, courtyard, coordinate and item-dimension predicates use the

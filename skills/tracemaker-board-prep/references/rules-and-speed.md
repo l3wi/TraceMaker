@@ -101,3 +101,33 @@ When the class via does not fit, it falls back to a smaller "neck-down" via at t
 size is a hard requirement, raise the board minimums to it.
 
 Blind, buried and micro vias are used only with `--blind-vias` and only when the board settings allow them.
+
+## Dense-package access uses the routing domain
+
+`tracemaker escape BOARD --json escape.json` shares route preparation: project/custom rules, optional
+synthetic small-pad via clearance, and component-rule keep-outs. Match the options you will route with:
+`--soft-zones`, `--keep-vias-off-pads [MM]`, `--blind-vias`, `--component-rules off|report|soft|on`,
+`--rules-override FILE`, and any `--pitch-um` override. Analysis is read-only: generated keep-outs and
+synthetic rules stay in memory, with no board/project changes or sidecar output.
+
+Each checked pin reports one of:
+
+| Status | Meaning | Preflight severity |
+|---|---|---|
+| `satisfied` | Existing same-net connectivity already satisfies its routing obligation | `info` |
+| `witness` | A pad-contacting exact-legal path reaches the declared exterior | `info` |
+| `exhausted` | All candidates in the configured finite router search domain were exhausted | `quality` |
+| `unknown` | Work exhaustion or unsupported rules prevent a conclusive domain verdict | `quality` |
+
+JSON retains the legacy `pins`, `escapable` and grouped `dead` fields; `dead` now includes **only
+exhausted domains**, never unknown searches. Use `parts[].results[]` for pad identity, status, reason,
+domain and witness segments/via spans (integer nanometres). `statuses`, `configuration` and `warnings`
+make the policy and result counts explicit. `--work` bounds deterministic access work per pin;
+`--reference` runs the uncached exact reference search.
+
+No finite-lattice negative proves physical impossibility, and independent witnesses do not prove all
+pins can escape simultaneously. Existing routing is checked for connectivity before searching outstanding
+obligations; there is no need to strip a connected board to obtain an honest result. With `--soft-zones`,
+access follows the same refillable-plane semantics as routing, not an immutable-fill approximation;
+refill and KiCad plane/thermal/DRC sign-off are still required. Preflight forwards the same route-affecting
+options to escape and the suggested route command.

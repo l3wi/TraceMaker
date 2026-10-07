@@ -57,3 +57,7 @@ add_test(NAME vias_off_pads COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integrat
 set_tests_properties(vias_off_pads PROPERTIES SKIP_RETURN_CODE 77 LABELS "route;kicad;integration" TIMEOUT 600)
 add_test(NAME preflight_rules COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/preflight_rules.py $<TARGET_FILE:tracemaker>)
 set_tests_properties(preflight_rules PROPERTIES LABELS "rules;skills;integration" TIMEOUT 180)
+add_test(NAME escape_cli COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/escape_cli.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/escape_cli)
+set_tests_properties(escape_cli PROPERTIES LABELS "route;integration" TIMEOUT 600)
+add_test(NAME preflight_escape COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/preflight_escape.py)
+set_tests_properties(preflight_escape PROPERTIES LABELS "route;integration" TIMEOUT 120)

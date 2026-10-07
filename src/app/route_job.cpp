@@ -111,6 +111,82 @@ model::CustomRule keep_vias_off_pads_rule(const model::DesignRules& rules, Coord
   return rule;
 }
 
+PreparedRouteDomain prepare_route_domain(const model::Board& board, const model::DesignRules& rules, RouteJob& job) {
+  auto log = [&](const std::string& line) {
+    if (job.log) job.log(line);
+  };
+  auto& opt = job.opt;
+  PreparedRouteDomain domain;
+  if (opt.keep_vias_off_pads > 0) {
+    domain.rules_override = rules;
+    domain.rules_override->custom.push_back(keep_vias_off_pads_rule(rules, opt.keep_vias_off_pads));
+    log(fmt("keep vias off SMD pads smaller than %.6f mm; physical hole margin %.6f mm (route only; shared with escape)",
+            nm_to_mm(opt.keep_vias_off_pads), nm_to_mm(*domain.rules_override->custom.back().constraints.front().min)));
+  }
+  const crules::Mode cr_mode = crules::parse_mode(job.component_rules);
+  if (cr_mode == crules::Mode::Off && !job.rules_override.empty()) {
+    crules::load_overrides_file(job.rules_override, crules::builtin_catalogue());
+    log("warning: --rules-override " + job.rules_override + " has no effect with --component-rules off");
+  }
+  if (cr_mode != crules::Mode::Off) {
+    const auto& cat = crules::builtin_catalogue();
+    crules::Overrides ov;
+    if (!job.rules_override.empty()) ov = crules::load_overrides_file(job.rules_override, cat);
+    const auto det = crules::detect(board, cat, job.rules_override.empty() ? nullptr : &ov);
+    if (!job.rules_override.empty()) {
+      log(fmt("component rules: %zu user override(s) from %s", det.override_entries.size(), job.rules_override.c_str()));
+      for (const auto& u : det.override_unused) log("  warning: override matched nothing: " + u);
+    }
+    std::vector<std::string> skipped;
+    const auto kos = crules::generate_keepouts(board, cat, det, &skipped);
+    log(fmt("component rules (%s): %zu instance(s), %zu generated keep-out(s)%s", job.component_rules.c_str(), det.instances.size(), kos.size(),
+            cr_mode == crules::Mode::On ? "" : " (not applied: use --component-rules on)"));
+    for (const auto& s : skipped) log("  keep-out not generated: " + s);
+    if (opt.sink) {
+      for (const auto& in : det.instances)
+        opt.sink->publish(nlohmann::json{{"type", "crules.detected"},
+                                         {"category", cat.categories[static_cast<std::size_t>(in.category)].id},
+                                         {"anchor", board.footprints[static_cast<std::size_t>(in.anchor)].reference},
+                                         {"confidence", in.confidence}}
+                              .dump());
+      for (const auto& k : kos) {
+        nlohmann::json poly = nlohmann::json::array();
+        for (const auto& q : k.zone.outline.front()) poly.push_back({q.x, q.y});
+        opt.sink->publish(nlohmann::json{{"type", "crules.keepout"}, {"name", k.zone.name}, {"layers", k.zone.layers},
+                                         {"applied", cr_mode == crules::Mode::On}, {"polygon", poly}}
+                              .dump());
+      }
+    }
+    // USB2-02 is a soft preference, not a change to the user's hard rules.
+    if (cr_mode == crules::Mode::Soft || cr_mode == crules::Mode::On)
+      for (const auto& p : crules::usb_pairs(board, cat, det)) {
+        if (std::find(opt.pair_nets.begin(), opt.pair_nets.end(), p) != opt.pair_nets.end()) continue;
+        opt.pair_nets.push_back(p);
+        log("  differential pair (USB2-02): " + board.nets[static_cast<std::size_t>(p.first)].name + " / " +
+            board.nets[static_cast<std::size_t>(p.second)].name);
+      }
+    if (cr_mode == crules::Mode::On && !kos.empty()) {
+      domain.board_override = board;
+      for (const auto& k : kos) {
+        domain.board_override->zones.push_back(k.zone);
+        log("  keep-out " + k.zone.name + " on " + [&] {
+          std::string l;
+          for (const auto& n : k.zone.layers) l += (l.empty() ? "" : "+") + n;
+          return l;
+        }());
+      }
+    }
+    if (!job.out.empty()) {
+      std::string side = job.out;
+      if (side.ends_with(".kicad_pcb")) side.resize(side.size() - 10);
+      side += ".tracemaker.kicad_dru";
+      std::ofstream(side) << crules::dru_sidecar(board, cat, det);
+      log("component rules: generated custom rules written to " + side);
+    }
+  }
+  return domain;
+}
+
 RouteJobResult run_route_job(RouteJob job) {
   auto log = [&](const std::string& line) {
     if (job.log) job.log(line);
@@ -118,15 +194,7 @@ RouteJobResult run_route_job(RouteJob job) {
   auto& opt = job.opt;
   auto lb = io::read_board_file(job.in);
   const auto rules = io::read_design_rules(job.in);
-  // DRC and project files stay unchanged; the preference modifies only the routing rules copy.
-  std::optional<model::DesignRules> route_rules;
-  if (opt.keep_vias_off_pads > 0) {
-    route_rules = rules;
-    route_rules->custom.push_back(keep_vias_off_pads_rule(rules, opt.keep_vias_off_pads));
-    log(fmt("keep vias off SMD pads smaller than %.6f mm; physical hole margin %.6f mm (route only)",
-            nm_to_mm(opt.keep_vias_off_pads), nm_to_mm(*route_rules->custom.back().constraints.front().min)));
-  }
-  const auto& routing_rules = route_rules ? *route_rules : rules;
+
   const std::string name = std::filesystem::path(job.in).filename().string();
   RouteJobResult out;
   std::unique_ptr<server::ViewerServer> server;
@@ -160,77 +228,12 @@ RouteJobResult run_route_job(RouteJob job) {
     for (const auto& f : kb->failed_connections(feat.hash)) opt.priority.emplace_back(f.pad_a, f.pad_b);
     if (!opt.priority.empty()) log(fmt("knowledge base: %zu connections that failed before are routed first", opt.priority.size()));
   }
-  // Component rules (doc 15 §5.5): generated keep-outs are added to an in-memory copy of the board the router
-  // sees; the output is written from the original document, so the user's board never gains them.
-  const crules::Mode cr_mode = crules::parse_mode(job.component_rules);
-  model::Board with_rules;
-  const model::Board* route_board = &lb.board;
-  if (cr_mode == crules::Mode::Off && !job.rules_override.empty()) {
-    crules::load_overrides_file(job.rules_override, crules::builtin_catalogue());  // still validated: a broken file is an error
-    log("warning: --rules-override " + job.rules_override + " has no effect with --component-rules off");
-  }
-  if (cr_mode != crules::Mode::Off) {
-    const auto& cat = crules::builtin_catalogue();
-    crules::Overrides ov;
-    if (!job.rules_override.empty()) ov = crules::load_overrides_file(job.rules_override, cat);
-    const auto det = crules::detect(lb.board, cat, job.rules_override.empty() ? nullptr : &ov);
-    if (!job.rules_override.empty()) {
-      log(fmt("component rules: %zu user override(s) from %s", det.override_entries.size(), job.rules_override.c_str()));
-      for (const auto& u : det.override_unused) log("  warning: override matched nothing: " + u);
-    }
-    std::vector<std::string> skipped;
-    const auto kos = crules::generate_keepouts(lb.board, cat, det, &skipped);
-    log(fmt("component rules (%s): %zu instance(s), %zu generated keep-out(s)%s", job.component_rules.c_str(), det.instances.size(), kos.size(),
-            cr_mode == crules::Mode::On ? "" : " (not applied: use --component-rules on)"));
-    for (const auto& s : skipped) log("  keep-out not generated: " + s);
-    // Events for the viewer and recordings (rule 7, doc 15 §7): what was detected and the keep-out polygons (nm).
-    if (opt.sink) {
-      for (const auto& in : det.instances)
-        opt.sink->publish(nlohmann::json{{"type", "crules.detected"},
-                                         {"category", cat.categories[static_cast<std::size_t>(in.category)].id},
-                                         {"anchor", lb.board.footprints[static_cast<std::size_t>(in.anchor)].reference},
-                                         {"confidence", in.confidence}}
-                              .dump());
-      for (const auto& k : kos) {
-        nlohmann::json poly = nlohmann::json::array();
-        for (const auto& q : k.zone.outline.front()) poly.push_back({q.x, q.y});
-        opt.sink->publish(nlohmann::json{{"type", "crules.keepout"}, {"name", k.zone.name}, {"layers", k.zone.layers},
-                                         {"applied", cr_mode == crules::Mode::On}, {"polygon", poly}}
-                              .dump());
-      }
-    }
-    // USB2-02 (P3): route each detected USB 2.0 D+/D- pair coupled first (a soft preference: the router falls back
-    // to single tracks). Only pairs bound to exactly one net each.
-    if (cr_mode == crules::Mode::Soft || cr_mode == crules::Mode::On)
-      for (const auto& p : crules::usb_pairs(lb.board, cat, det)) {
-        if (std::find(opt.pair_nets.begin(), opt.pair_nets.end(), p) != opt.pair_nets.end()) continue;
-        opt.pair_nets.push_back(p);
-        log("  differential pair (USB2-02): " + lb.board.nets[static_cast<std::size_t>(p.first)].name + " / " +
-            lb.board.nets[static_cast<std::size_t>(p.second)].name);
-      }
-    if (cr_mode == crules::Mode::On && !kos.empty()) {
-      with_rules = lb.board;
-      for (const auto& k : kos) {
-        with_rules.zones.push_back(k.zone);
-        log("  keep-out " + k.zone.name + " on " + [&] {
-          std::string l;
-          for (const auto& n : k.zone.layers) l += (l.empty() ? "" : "+") + n;
-          return l;
-        }());
-      }
-      route_board = &with_rules;
-    }
-    if (!job.out.empty()) {
-      std::string side = job.out;
-      if (side.ends_with(".kicad_pcb")) side.resize(side.size() - 10);
-      side += ".tracemaker.kicad_dru";
-      std::ofstream(side) << crules::dru_sidecar(lb.board, cat, det);
-      log("component rules: generated custom rules written to " + side);
-    }
-  }
+  const auto domain = prepare_route_domain(lb.board, rules, job);
+  const auto& routing_rules = domain.rules(rules);
+  const auto& route_board = domain.board(lb.board);
   out.project_warnings = rules.warnings;
   {
-    const drc::RuleEngine re(*route_board, routing_rules);
+    const drc::RuleEngine re(route_board, routing_rules);
     out.rule_warnings = re.warnings();
   }
   if (job.warning) {
@@ -252,7 +255,7 @@ RouteJobResult run_route_job(RouteJob job) {
     std::vector<int> pick;
     if (kb && variants < route::portfolio_size()) pick = kb->choose_variants(feat, route::portfolio_size(), variants, opt.seed);
     log(fmt("portfolio: %d variants on %d thread%s", variants, std::min(threads, variants), std::min(threads, variants) == 1 ? "" : "s"));
-    auto pr = route::route_portfolio(*route_board, routing_rules, opt, variants, pick, threads);
+    auto pr = route::route_portfolio(route_board, routing_rules, opt, variants, pick, threads);
     for (std::size_t i = 0; i < pr.variants.size(); ++i)
       log(fmt("  variant %d %-30s routed %d in %.1f s%s", pr.indices[i], pr.variants[i].c_str(), pr.routed[i], pr.seconds[i],
               static_cast<int>(i) == pr.best_variant ? "  <- best" : ""));
@@ -261,7 +264,7 @@ RouteJobResult run_route_job(RouteJob job) {
     best_name = pr.variants[static_cast<std::size_t>(pr.best_variant)];
     res = std::move(pr.best);
   } else {
-    res = route::Router(*route_board, routing_rules, opt).run();
+    res = route::Router(route_board, routing_rules, opt).run();
     ran = {0};
   }
   if (kb) {
@@ -283,6 +286,9 @@ RouteJobResult run_route_job(RouteJob job) {
   }
   log(fmt("routed %d/%d connections, %zu tracks, %zu vias, pitch %.3f mm, %ld expansions, %.2f s", res.routed, res.connections, res.tracks.size(),
           res.vias.size(), nm_to_mm(res.pitch), res.expansions, res.seconds));
+  if (res.access_connections > 0)
+    log(fmt("geometry access: %d connections, %d with local tracks narrower than the class target",
+            res.access_connections, res.narrowed_access));
   for (const auto& f : res.failures) log("  unrouted: " + f);
   for (std::size_t r = 0; r < res.escape_rings.size(); ++r)
     log(fmt("  deep-array ring %zu: %d of %d pins connected", r + 1, res.escape_rings[r].second, res.escape_rings[r].first));
@@ -291,7 +297,8 @@ RouteJobResult run_route_job(RouteJob job) {
   out.summary = {{"routed", res.routed},     {"connections", res.connections}, {"tracks", res.tracks.size()},
                  {"vias", res.vias.size()},  {"seconds", res.seconds},         {"expansions", res.expansions},
                  {"pitch_mm", nm_to_mm(res.pitch)}, {"failures", res.failures}, {"variant", best_index}, {"variant_name", best_name},
-                 {"escape_corridors", res.escape_corridors}};
+                 {"escape_corridors", res.escape_corridors}, {"access_connections", res.access_connections},
+                 {"narrowed_access", res.narrowed_access}};
   out.summary["rule_warnings"] = out.rule_warnings;
   out.summary["project_warnings"] = out.project_warnings;
   if (opt.soft_zones) {

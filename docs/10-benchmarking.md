@@ -32,12 +32,18 @@ pile outside the outline (what KiCad's "Update PCB from Schematic" produces).
 | Metric | Definition |
 |---|---|
 | **Clean pass** | 100% connections routed **and** zero added routing-relevant KiCad DRC errors (input vs output, `kicad-cli pcb drc --refill-zones`: saved fills predate the routing; filter below, D63) |
-| Completion | routed connections / routable connections (excluding pins proved dead) |
+| Completion | routed connections / required connections; finite escape-domain exhaustion is not a physically unroutable exclusion |
 | Added DRC errors | by KiCad violation type |
 | Vias, wirelength, bends | totals; also normalised to the reference routing where it exists |
 | Wall time, work units | engine-reported, with hardware recorded |
 | Placement (P&R set) | HPWL, lower-bound gap, crossings, courtyard overlaps (must be 0), moved parts |
 | Determinism | output hash per board at 1 and N threads, GPU on/off |
+
+Escape diagnostics (`D66`) distinguish satisfied/witness/exhausted/unknown. The legacy `dead_pins`
+benchmark field counts only finite-domain exhaustion; `escape_unknown` records work/unsupported cases.
+The optional `clean_pass_feasible` split includes only boards with zero exhausted **and** zero unknown
+pins under the recorded domain. Legacy analyses without statuses are unknown, not feasibility evidence.
+Neither diagnostic changes the required clean-pass denominator or substitutes for refilled KiCad sign-off.
 
 ### Routing quality score
 
