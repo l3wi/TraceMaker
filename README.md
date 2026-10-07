@@ -76,6 +76,13 @@ two of the eight portfolio variants; `--escape-plan` turns it on in all of them.
 
 KiCad 10 plugin: `kicad_plugin/` (IPC action plugin; routes the open board in one undoable commit; see its README).
 
+Agent skills: `skills/` holds two skills for coding agents (Claude Code, Codex, ...), installable with the
+[skills CLI](https://skills.sh): `npx skills add DingoOz/TraceMaker`. `tracemaker-board-prep` prepares a placed
+board (net classes and lattice pitch, custom rules that disable caches, planes, thermal reliefs, teardrops,
+via sizes, pair names, escape) with a preflight script; `tracemaker-route` chooses options, routes and signs
+off with KiCad's refilled DRC. They follow on from American Embedded's
+[kistack](https://github.com/American-Embedded/kistack) KiCad skills.
+
 Useful route options: `--threads N` (threads; also the portfolio size unless `--work` is given, when all eight variants
 run and the output is identical at any thread count), `--variants N` (portfolio size), `--no-gpu` (CPU cost-to-go fields, identical results),
 `--no-rip-up`, `--fast-bends`, `--kb FILE` / `--no-kb` (knowledge base of earlier runs).
