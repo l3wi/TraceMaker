@@ -4,15 +4,16 @@
 --keep-vias-off-pads, judged by KiCad after a zone refill and scored against the demos' own hand routing.
 
   bench/planes_eval.py TRACEMAKER_BINARY [--work 2000000] [--demos DIR/NAME ...] [--pcbench NAME ...]
-                       [--configs NAME=ARGS ...] [--no-original] [--out build/planes_eval]
+                       [--configs NAME=ARGS ...] [--seeds N ...] [--no-original] [--out build/planes_eval]
 
 Demo boards are the demos' own projects with tracks and vias removed (bench/speed_ab.py prepare_demo), so their
 net classes, custom rules and zones apply. PCBench boards route the fixture's unrouted.kicad_pcb (zones already
 removed by PCBench, so they test signal routing only) against the human raw.kicad_pcb. The hand-routed original
 is scored the same way, labelled "original", as a guide: it is judged by the same rules and can lose. Each board
 becomes a metric record (bench/quality.py record(): KiCad DRC after a zone refill, per-net geometry, plane
-metrics before and after routing), written to OUT/records/BOARD.json and scored by bench/score.py. KiCad's
-Python (pcbnew) is needed for the plane and small-pad metrics (TM_KICAD_PYTHON, or the macOS KiCad.app
+metrics before and after routing), written with all seeds to OUT/records/BOARD.json and scored by bench/score.py.
+Seeds default to 7; each route is stored in OUT/CONFIG/sSEED, with config label and seed recorded separately.
+KiCad's Python (pcbnew) is needed for the plane and small-pad metrics (TM_KICAD_PYTHON, or the macOS KiCad.app
 default); without it those are null.
 """
 import argparse
@@ -48,9 +49,11 @@ def main() -> int:
     ap.add_argument("--pcbench", nargs="*", default=[], help="PCBench fixture names")
     ap.add_argument("--small-pad-mm", type=float, default=2.0)
     ap.add_argument("--configs", nargs="*", default=CONFIGS, help="NAME=ARGS (args space-separated)")
+    ap.add_argument("--seeds", type=int, nargs="+", default=[7], help="routing seeds (default: 7)")
     ap.add_argument("--no-original", action="store_true", help="do not score the hand-routed originals")
     ap.add_argument("--out", default=str(ROOT / "build/planes_eval"))
     a = ap.parse_args()
+    a.seeds = list(dict.fromkeys(a.seeds))
     quality.TM = pathlib.Path(a.binary)  # `tracemaker inspect` for the geometry metrics
     out = pathlib.Path(a.out)
     (out / "records").mkdir(parents=True, exist_ok=True)
@@ -67,21 +70,28 @@ def main() -> int:
             orig = out / "original" / board.name
             copy_project(hand, orig)
             recs.append(quality.record(board, orig, "original", hand=True, small_pad_mm=a.small_pad_mm))
+            recs[-1]["seed"] = None
         for cfg, args in [(c.split("=", 1)[0], c.split("=", 1)[1].split() if "=" in c else []) for c in a.configs]:
-            pcb, summary = out / cfg / board.name, out / cfg / f"{board.stem}.json"
-            copy_project(board, pcb)
-            subprocess.run([a.binary, "route", str(board), "-o", str(pcb), "--json", str(summary), "--work", str(a.work), "--time",
-                            "3600", "--threads", "1", "--variants", "1", "--no-kb", "--no-gpu"] + args, capture_output=True, check=False)
-            s = json.loads(summary.read_text())
-            rec = quality.record(board, pcb, cfg, small_pad_mm=a.small_pad_mm)
-            rec["router"] = {k: s.get(k) for k in ("routed", "connections", "plane_connections", "zones_needing_refill", "seconds")}
-            rec["router"]["args"] = args
-            recs.append(rec)
+            for seed in a.seeds:
+                run_dir = out / cfg / f"s{seed}"
+                pcb, summary = run_dir / board.name, run_dir / f"{board.stem}.json"
+                copy_project(board, pcb)
+                subprocess.run([a.binary, "route", str(board), "-o", str(pcb), "--json", str(summary), "--work", str(a.work), "--time",
+                                "3600", "--threads", "1", "--variants", "1", "--no-kb", "--no-gpu", "--seed", str(seed)] + args,
+                               capture_output=True, check=False)
+                s = json.loads(summary.read_text())
+                rec = quality.record(board, pcb, cfg, small_pad_mm=a.small_pad_mm)
+                rec["seed"] = seed
+                rec["router"] = {k: s.get(k) for k in ("routed", "connections", "plane_connections", "zones_needing_refill", "seconds")}
+                rec["router"]["args"] = args
+                recs.append(rec)
         for r in recs:
-            print(f"{r['board']} {r['label']}: unconnected {r.get('unconnected')}, added errors {r.get('added_errors')}", flush=True)
+            seed = "" if r.get("seed") is None else f"@s{r['seed']}"
+            print(f"{r['board']} {r['label']}{seed}: unconnected {r.get('unconnected')}, added errors {r.get('added_errors')}", flush=True)
         (out / "records" / f"{board.stem}.json").write_text(json.dumps(recs, indent=1))
         records += recs
-    (out / "summary.json").write_text(json.dumps({"work": a.work, "configs": a.configs, "records": [r["file"] for r in records]}, indent=1))
+    (out / "summary.json").write_text(json.dumps({"work": a.work, "configs": a.configs, "seeds": a.seeds,
+                                                "records": [r["file"] for r in records]}, indent=1))
     print()
     print(score.markdown(records, hand_label=None if a.no_original else "original"))
     return 0
