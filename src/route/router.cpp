@@ -99,6 +99,8 @@ struct Router::Impl {
   std::vector<ConnState> cs;
   std::unordered_map<std::int64_t, std::uint16_t> history;  // contested lattice cells (PathFinder history cost)
   std::vector<int> init_root;        // copper item -> initial cluster root (fixed copper)
+  std::vector<std::vector<int>> soft_zone_roots;  // committed copper item -> touched initial plane clusters
+  std::unique_ptr<drc::ZoneFills> soft_fills;
   bool soft = false;                 // current search may cross routed copper
   // Persistent fixed-obstacle caches per net class (codes from Obstacles::fixed_code), lattice-indexed.
   struct ClassCache {
@@ -203,6 +205,7 @@ struct Router::Impl {
 
   void setup() {
     obs = std::make_unique<Obstacles>(b, rules, opt.soft_zones);
+    if (opt.soft_zones) soft_fills = std::make_unique<drc::ZoneFills>(obs->copper());
     use_cache = !obs->needs_exact_routing();
     nl = b.copper_count();
     blind_ok = opt.blind_vias && rules.minimums.allow_blind_buried_vias && nl > 2;
@@ -257,6 +260,21 @@ struct Router::Impl {
   Coord near_infl = 0;
   void near_mark(int item, int delta) {
     const auto& it = obs->copper().items[static_cast<std::size_t>(item)];
+    if (opt.soft_zones && delta > 0) {
+      // Reuse the zone overlap query with compute_connectivity's 1 nm touching tolerance.
+      for (const auto& s : it.shapes)
+        for (int zi : drc::zones_touching(obs->copper(), *soft_fills, obs->grid(), s, it.layers, 1)) {
+          const auto& z = obs->copper().items[static_cast<std::size_t>(zi)];
+          if (z.footprint >= 0 || z.net != it.net || b.zones[static_cast<std::size_t>(z.index)].teardrop) continue;
+          const auto i = static_cast<std::size_t>(item);
+          if (soft_zone_roots.size() <= i) soft_zone_roots.resize(i + 1);
+          auto& roots = soft_zone_roots[i];
+          const int root = init_root[static_cast<std::size_t>(zi)];
+          if (std::find(roots.begin(), roots.end(), root) == roots.end()) roots.push_back(root);
+        }
+      if (static_cast<std::size_t>(item) < soft_zone_roots.size())
+        std::sort(soft_zone_roots[static_cast<std::size_t>(item)].begin(), soft_zone_roots[static_cast<std::size_t>(item)].end());
+    }
     const geom::Box bx = it.box.inflated(near_infl);
     const int x0 = std::max(0, static_cast<int>((bx.x0 - lat.x0) / pitch) - 1), x1 = std::min(nx - 1, static_cast<int>((bx.x1 - lat.x0) / pitch) + 1);
     const int y0 = std::max(0, static_cast<int>((bx.y0 - lat.y0) / pitch) - 1), y1 = std::min(ny - 1, static_cast<int>((bx.y1 - lat.y0) / pitch) + 1);
@@ -306,9 +324,24 @@ struct Router::Impl {
     std::vector<Connection> out;
     for (auto& [net, cl] : net_clusters) {
       if (!opt.only_net.empty() && b.nets[static_cast<std::size_t>(net)].name != opt.only_net) continue;
+      const auto allowed = net_layers[static_cast<std::size_t>(net)];
+      const bool change_layers = vias_ok(net) && (opt.allow_vias || blind_ok);
+      auto reachable = [&](model::LayerMask pads, int zone) {
+        const auto layers = cm.items[static_cast<std::size_t>(zone)].layers & allowed;
+        pads &= allowed;
+        return (pads & layers) || (pads && layers && change_layers);
+      };
+      model::LayerMask pad_layers = 0;
+      if (opt.soft_zones)
+        for (const auto& [r, c] : cl)
+          for (int p : c.pads) pad_layers |= b.pads[static_cast<std::size_t>(p)].copper;
       std::vector<Cluster> groups;
-      for (auto& [r, c] : cl)
+      for (auto& [r, c] : cl) {
+        // An inaccessible plane must not replace routable pad-to-pad edges in the MST.
+        if (opt.soft_zones)
+          c.zones.erase(std::remove_if(c.zones.begin(), c.zones.end(), [&](int z) { return !reachable(pad_layers, z); }), c.zones.end());
         if (!c.pads.empty() || (opt.soft_zones && !c.zones.empty())) groups.push_back(c);
+      }
       if (groups.size() < 2 || std::none_of(groups.begin(), groups.end(), [](const Cluster& c) { return !c.pads.empty(); })) continue;
       // Prim over clusters; a pad may connect to another cluster's pad or into its zone fill (plane).
       const std::size_t k = groups.size();
@@ -331,11 +364,14 @@ struct Router::Impl {
               const Point B = b.pads[static_cast<std::size_t>(pb)].pos;
               consider(pa, pb, -1, std::hypot(static_cast<double>(A.x - B.x), static_cast<double>(A.y - B.y)));
             }
-            for (int z : groups[j].zones) consider(pa, -1, z, zone_dist(A, z));
+            for (int z : groups[j].zones)
+              if (!opt.soft_zones || reachable(b.pads[static_cast<std::size_t>(pa)].copper, z)) consider(pa, -1, z, zone_dist(A, z));
           }
           // And pads of cluster j into zones of the tree side.
           for (int pb : groups[j].pads)
-            for (int z : groups[from].zones) consider(pb, -1, z, zone_dist(b.pads[static_cast<std::size_t>(pb)].pos, z));
+            for (int z : groups[from].zones)
+              if (!opt.soft_zones || reachable(b.pads[static_cast<std::size_t>(pb)].copper, z))
+                consider(pb, -1, z, zone_dist(b.pads[static_cast<std::size_t>(pb)].pos, z));
         }
       };
       upd(0);
@@ -1403,6 +1439,15 @@ struct Router::Impl {
       const int x = find(init_root[static_cast<std::size_t>(pad_item[static_cast<std::size_t>(o.c.pad_a)])]);
       const int y = find(o.c.pad_b >= 0 ? init_root[static_cast<std::size_t>(pad_item[static_cast<std::size_t>(o.c.pad_b)])] : init_root[static_cast<std::size_t>(o.c.zone_b)]);
       if (x != y) up[x] = y;
+      if (opt.soft_zones)
+        for (int item : o.items) {
+          const auto i = static_cast<std::size_t>(item);
+          if (i >= soft_zone_roots.size()) continue;
+          for (int root : soft_zone_roots[i]) {
+            const int a = find(x), z = find(root);
+            if (a != z) up[a] = z;
+          }
+        }
     }
     return find(ra) == find(rb);
   }
