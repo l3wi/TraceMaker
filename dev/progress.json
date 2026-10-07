@@ -566,6 +566,14 @@
     {
      "text": "Routing quality score: refill judge, lexicographic legality/completion tiers, plane and DFM terms against the refilled input, matched-net comparison, hand routing as a guide (bench/score.py, bench/planes_eval.py; 8 demos + 9 PCBench boards; D63)",
      "done": true
+    },
+    {
+     "text": "Adversarial review of D61-D63 fixed: refill-sensitive legality (starved thermals, islands, zone shorts), unsupported-plane exposure, arcs, copper-only small-pad vias, spatial antipads, 2% tie floor, seeds; soft-zone plane reachability and multi-plane via credit; neck-down margin; KiCad double literals (bench/results/planes-eval-*)",
+     "done": true
+    },
+    {
+     "text": "Router: model thermal-spoke starvation and unfilled mask circles (both now caught by the refill judge on interf_u and StickHub)",
+     "done": false
     }
    ]
   },

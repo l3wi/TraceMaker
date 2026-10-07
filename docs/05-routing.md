@@ -498,12 +498,17 @@ they consumed the whole budget before pad pairs were attempted.
 
 **What was built**
 
-- `--soft-zones` is opt-in. Conductive fills remain in the copper model for initial connectivity and
-  participate in the stable cluster MST as plane targets. A pad already joined to a fill adds no target;
-  nets without pads have no routable terminal. Rule areas keep their independent track/via flags, and holes,
-  edges, locked copper and non-zone checks remain hard. Teardrop zones (`(attr (teardrop ...))`) are track
-  copper: they stay hard, add no target and own no plane-map cell. KiCad regenerates them from their tracks,
-  and one left behind by deleted routing is no plane.
+- `--soft-zones` is opt-in. Conductive fills remain in the copper model for initial connectivity.
+  Plane-only MST groups participate only if some pad of the net can reach a fill layer under the net's
+  track-layer mask and enabled via permissions; inaccessible planes cannot replace routable pad pairs.
+  A pad already joined to a fill adds no target; nets without pads have no routable terminal. Rule areas
+  keep their independent track/via flags, and holes, edges, locked copper and non-zone checks remain hard.
+  Teardrop zones (`(attr (teardrop ...))`) are track copper: they stay hard, add no target and own no
+  plane-map cell. KiCad regenerates them from their tracks, and one left behind by deleted routing is no plane.
+- Every committed track or via credits all same-net soft fills its copper touches on a common layer,
+  using `drc::zones_touching` with initial connectivity's 1 nm touching predicate, not just a centre-point
+  test. Later MST connections already satisfied by those contacts are skipped. Contacts follow live
+  routed copper; ripping that copper removes its contacts.
 - One `zone_is_soft` predicate is shared by track, fixed-disk, one-pass fixed-via and physical-hole queries.
   Zones cannot simply be removed from `Obstacles::grid()`: `drc::compute_connectivity` uses it too and must
   preserve existing pad/plane clusters. Via-hole/zone queries already skip zones; escape, global routing and
@@ -539,6 +544,9 @@ Obstacle parity tests cover hard/soft planes, rule areas, physical-hole rules, h
 tests cover plane targets, already-joined pads and equal-length plane-avoiding alternatives. A long route
 across a board-wide foreign pour checks the (1 + F) cost bound and bounded search expansions against an
 unpenalized route; writer tests cover selective track/via invalidation and untouched bytes.
+The regressions in `tests/test_soft_zones.cpp` are "unreachable soft planes do not replace same-layer pad
+connections" (disabled layer changes, net via disallow and track-layer mask) and "one through via joins all
+aligned same-net soft planes" (centre containment and annulus overlap outside a fill boundary).
 Plane-target tests compare with the zero heuristic at identical integer route costs on a generated
 four-layer board: directly above the inner plane, expansions drop from 51,429 to 1 (cost 3 mm);
 with the target 4 mm to the side, total expansions drop from 1,347,518 to 534,635 (cost 7.2 mm).
@@ -551,9 +559,12 @@ after refill reported zero unconnected items and zero added errors. The test nee
 without `kicad-cli`. Off-mode outputs on `sbc_sbc` and `oskirby_logicbone` remain byte-identical at 1M work,
 seed 7, one variant/thread and CPU fields.
 
-**KiCad demo results.** KiCad demo projects, routing stripped, 2M work units, one variant;
-`bench/planes_eval.py` (CPU fields). Cells show unconnected items after `kicad-cli pcb drc --refill-zones`,
-followed by routed/connections in parentheses. Soft mode can add plane targets, so connection totals differ.
+**Historical KiCad demo results.** KiCad demo projects, routing stripped, 2M work units, one variant;
+`bench/planes_eval.py` (CPU fields). These measurements predate stripping teardrops from fixtures and
+excluding teardrops as routing targets. The older judge used `--severity-error` and all error-type deltas,
+not the current routing-relevant filter. Cells show unconnected items after
+`kicad-cli pcb drc --refill-zones`, followed by routed/connections in parentheses. Soft mode can add plane
+targets, so connection totals differ.
 
 | Board | No options | Soft F=0.5 | Soft F=0.2 | Soft F=0 |
 |---|---:|---:|---:|---:|
@@ -566,20 +577,51 @@ followed by routed/connections in parentheses. Soft mode can add plane targets, 
 | CM5_MINIMA_3 | 124 (88/212) | 174 (42/222) | 133 (86/222) | 85 (136/222) |
 | kit-dev-coldfire-xilinx_5213 | 459 (18/479) | 379 (102/485) | 229 (256/485) | 164 (321/485) |
 
-F=0 gave the fewest or tied-fewest unconnected items on every board, so it is the default.
-Positive factors spent more search work because the surcharge is not in the heuristic, with no measured
-plane-integrity gain. Refilling did not expose a fragmentation regression on the tested two-layer pours:
-their unconnected-item counts fell. All runs added zero KiCad errors except interf_u at F=0.2, which added one.
-The preference remains available explicitly; these measurements do not establish a benefit for enabling it.
+Positive F was never better than F=0 in this historical experiment (two boards tie).
+No plane-integrity metric was measured then, so no plane-integrity benefit was established.
+Under that older judge, all runs added zero KiCad errors except interf_u at F=0.2, which added one.
+The preference remains available explicitly and defaults to zero; these measurements establish neither
+a current-results comparison nor a fragmentation verdict.
 
-On the KiCad demos (doc 10 §2 quality score, 10M work, F=0, judged after a refill) soft zones reduce open
-connections on the multilayer boards (CM5 118 → 62, StickHub 31 → 10, ColdFire 415 → 125, RoyalBlue
-112 → 87) and on multichannel_mixer (11 → 4); pic_programmer (10 → 13) and interf_u (43 → 46) trail
-off-mode slightly. The cheapest way into a plane is often a via in the pad: 0.15–0.80 per delivered
-connection land in SMD pads under 2 mm, so use soft zones with `--keep-vias-off-pads` (§19).
-Before teardrops were excluded, the 263 teardrops left on a stripped RoyalBlue demo raised its connections
-from 161 to 288 and the job routed 24, every one a plane connection (141 unconnected after refill); with
-the exclusion it routes 84 (92 unconnected). Test: `[soft-zones]` "teardrop zones stay fixed copper and
+**Current KiCad demo results.** Refilled fixtures with teardrops stripped, integrated binary, 10M work,
+one variant/thread, CPU fields, seeds 7/19/31 (`ev-demos10m`, 2026-10-07; doc 10 §2).
+`base` = no options; `soft` = `--soft-zones --plane-cut-cost 0`; `soft+vop` adds
+`--keep-vias-off-pads` at 2 mm. Cells are median unconnected items [min–max over seeds].
+Metrics are identical across these seeds; single-variant routing is seed-independent here (only UUIDs
+change), so this is not seed-robustness evidence.
+
+| Board | base | soft | soft+vop |
+|---|---:|---:|---:|
+| StickHub | 31 [31–31] | 10 [10–10] | 24 [24–24] |
+| multichannel_mixer | 11 [11–11] | 4 [4–4] | 4 [4–4] |
+| interf_u | 43 [43–43] | 46 [46–46] | 46 [46–46] |
+| pic_programmer | 10 [10–10] | 13 [13–13] | 13 [13–13] |
+| complex_hierarchy | 0 [0–0] | 0 [0–0] | 0 [0–0] |
+| RoyalBlue54L-Feather | 112 [112–112] | 87 [87–87] | 92 [92–92] |
+| CM5_MINIMA_3 | 118 [118–118] | 62 [62–62] | 71 [71–71] |
+| kit-dev-coldfire-xilinx_5213 | 415 [415–415] | 125 [125–125] | 125 [125–125] |
+
+These are completion counts, not legality verdicts: interf_u adds one `starved_thermal` with `base`,
+two with `soft` or `soft+vop`; all fail legality. StickHub `soft+vop` adds one `solder_mask_bridge`.
+On complex_hierarchy all three configurations complete legally and beat the hand score; `base` has
+Q 50.418 [50.418–50.418] and plane cost 1.249, versus hand Q 39.483 and plane cost 2.350.
+`soft` and `soft+vop` have Q 47.109 [47.109–47.109], plane cost 1.687.
+
+**Known limitations.** Soft-zone routing can starve thermal spokes after refill; the router does not
+model thermal-spoke starvation. StickHub's mask bridges expose a pre-existing omission: unfilled mask
+circles on a logo are ignored by the router. Both remain open router work items, caught by the judge;
+fewer unconnected items is not sign-off. At 50M work, seed 7 (`ev-demos50m`), no additional board among
+StickHub, interf_u, multichannel_mixer and pic_programmer finishes. StickHub `soft` worsens from 10 to 14
+open and gains a mask bridge; `soft+vop` improves 24 → 19 but adds four mask bridges.
+interf_u `soft`/`soft+vop` improves 46 → 28 open but adds three starved thermals (`base`: 43 → 26,
+still one). pic_programmer `base` improves 10 → 3 and `soft`/`soft+vop` 13 → 7;
+multichannel_mixer remains 11 with `base`, 4 with `soft`/`soft+vop`. More work is not monotonic in quality.
+
+In the historical RoyalBlue teardrop experiment, 161 is the hard-zone baseline denominator, not the
+teardrop-excluded soft-zone denominator. With 263 teardrops left in the stripped demo and treated as
+plane targets, soft mode had 288 connections and routed 24, all plane connections (141 unconnected after
+refill); excluding teardrops as targets routed 84 (92 unconnected). These are historical single-run
+counts, not the current multi-seed comparison. Test: `[soft-zones]` "teardrop zones stay fixed copper and
 never become plane targets".
 
 ## 19. Keep vias off small pads (D62)
@@ -593,14 +635,16 @@ Absent means off; present without a number uses X = 2 mm. A supplied positive `M
 Only SMD pads with **both** local copper dimensions strictly less than X match; equal-sized, elongated,
 exposed and thermal pads remain via-capable. The route job copies its project rules only when enabled and
 appends a synthetic `physical_hole_clearance` constraint. Its minimum is
-`M = max_classes(ceil((effective_via_diameter - effective_via_drill) / 2) + clearance)` in integer nm.
-The effective drill is the larger of the class drill and the board's minimum through-hole diameter; the
-effective diameter is the maximum of the class diameter, the board's minimum via diameter, and the effective
-drill plus twice the board's minimum annular width. Routing and the preference share `route::class_via`,
-so the margin follows the via actually placed, not just the unadjusted net-class size. Because KiCad measures
-this constraint from the drill edge, the margin keeps the whole effective via copper clear by its clearance;
-smaller neck-down vias are protected too. The existing exact via checks, escape checks and one-pass/reference
-cache paths enforce it against fixed copper of **any** net (same net included). `Size_X/Y` are item-only,
+`M = max_classes max_via(ceil((diameter - drill) / 2) + class_clearance)` in integer nm, where the
+via choices are `route::class_via(rules, nc)` and `route::neck_down_via(rules, nc)`.
+The effective class drill is the larger of the class drill and the board's minimum through-hole diameter;
+the effective class diameter is the maximum of the class diameter, the board's minimum via diameter,
+and the effective drill plus twice the board's minimum annular width. Routing and the preference share
+both helpers. A neck-down via can reduce the drill more than the diameter and thus enlarge the annulus;
+the class via alone is not a conservative bound. Because KiCad measures this constraint from the drill
+edge, M keeps the copper of both via choices clear by the class clearance. The existing exact via checks,
+escape checks and one-pass/reference cache paths enforce it against fixed copper of **any** net (same
+net included). `Size_X/Y` are item-only,
 so this net-independent rule does not disable per-class caches. Nothing is added to the output board or
 project rules. `tracemaker drc` and KiCad remain unaware of the preference unless a project rule is installed.
 Unparseable synthetic conditions are hard errors.
@@ -613,22 +657,28 @@ return the padstack's own copper dimensions, not its rotated board-axis bounding
 pad or its footprint therefore does not swap these properties.
 The [`condition grammar`](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/common/libeval_compiler/grammar.lemon)
 supports `<`, `<=`, `>`, `>=` and a number followed by a unit. The PCB unit resolver accepts `mm`, `mil`, `in`,
-`deg`, `fs` and `ps`. Length literals (`mm`, `mil`, `in`) are rounded to the nearest integer nm at parse time,
-so decimal conversion cannot put a literal just below a pad or track of exactly the same size.
-Bare numbers are unscaled, **not millimetres**; `ps`, `fs` and `deg` retain their numeric conversions without
-length rounding. The [`compiler`](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/common/libeval_compiler/libeval_compiler.cpp)
+`deg`, `fs` and `ps`. Project `.kicad_dru` dimensional literals retain unit-scaled doubles without rounding:
+KiCad 10's unit resolver returns a double, conversion multiplies it, and comparisons use doubles.
+Numeric equality is exact, with no tolerance. At 1,001,000 nm, `Width < 1.0010004mm` is true and
+`Width > 1.001mm` is also true because of decimal-to-double conversion; at 200,000 nm,
+`Width < 0.2mm` is false and `Width <= 0.2mm` is true.
+Only `RuleOrigin::Synthetic` length literals (`mm`, `mil`, `in`) round to integer nm so generated
+geometry boundaries remain exact. Bare numbers are unscaled, **not millimetres**; `ps`, `fs` and `deg`
+retain their numeric conversions without length rounding.
+The [`compiler`](https://gitlab.com/kicad/code/kicad/-/blob/10.0.3/common/libeval_compiler/libeval_compiler.cpp)
 also diagnoses a lone numeric literal without units; TraceMaker accepts it as unscaled. Use explicit units
 for dimensions. See KiCad's [custom rules manual](https://docs.kicad.org/10.0/en/pcbnew/pcbnew.html#custom-design-rules)
 for `.kicad_dru` placement, conditions and the `physical_hole_clearance` constraint.
 
 **Width compatibility.** `Width` now evaluates in nm like KiCad's dimensional properties instead of mm.
-Explicit-unit conditions such as `A.Width == 0.2mm` and `A.Width != 0.25mm` retain their previous results:
-both sides now receive the same unit conversion. Bare `A.Width == 0.2` no longer means 0.2 mm; write
+Explicit-unit conditions such as `A.Width == 0.2mm` and `A.Width != 0.25mm` use KiCad's double
+unit conversion and exact numeric comparison. Bare `A.Width == 0.2` no longer means 0.2 mm; write
 `A.Width == 0.2mm` instead. Numeric literals use the KiCad compiler's unscaled bare-number semantics.
 
-**Equivalent KiCad rule.** For default 0.6 mm diameter / 0.3 mm drill / 0.2 mm clearance, M = 0.35 mm.
+**Equivalent KiCad rule.** For a class via of 0.6 mm diameter / 0.3 mm drill / 0.2 mm clearance, and no
+board minimum that raises either via's annulus, M = 0.35 mm (the default neck-down via is 0.4 / 0.2 mm).
 Add this text to `<board>.kicad_dru` (one `(version 1)` header per file); replace 0.35 mm with your maximum
-class margin and 2 mm with your selected threshold:
+margin over both via choices in every class and 2 mm with your selected threshold:
 
 ```
 (version 1)
@@ -649,9 +699,11 @@ minimums and a 0402 dog-bone into an anchored bottom plane. The generated integr
 CLI values before positional and option arguments, project/DRC isolation, and KiCad enforcement of the
 equivalent rule; its KiCad portion skips cleanly without `kicad-cli`.
 
-**Results.** `bench/planes_eval.py`: eight KiCad demo projects with routing stripped, 2M work, one variant,
-CPU fields. “Small-pad vias” counts vias whose copper touches an SMD pad with both dimensions below 2 mm,
-using KiCad's own shapes. Unconnected items are counted after `kicad-cli pcb drc --refill-zones`.
+**Historical results.** `bench/planes_eval.py`: eight KiCad demo projects with routing stripped, 2M work,
+one variant, CPU fields. These measurements predate stripping teardrops from fixtures and excluding them
+as targets; the older judge used `--severity-error` and all error-type deltas. “Small-pad vias” used
+KiCad's shapes but also counted paste-only apertures; the current metric requires copper on the tested
+outer layer (F.Cu and B.Cu checked). Unconnected items are after `kicad-cli pcb drc --refill-zones`.
 Soft-zone runs use zero plane-cut penalty (`--plane-cut-cost 0`, the default).
 
 | Board | No options: small-pad vias / unconnected | `--keep-vias-off-pads` | `--soft-zones` (F = 0) | `--soft-zones` (F = 0) + `--keep-vias-off-pads` |
@@ -665,13 +717,35 @@ Soft-zone runs use zero plane-cut penalty (`--plane-cut-cost 0`, the default).
 | CM5_MINIMA_3 | 0 / 124 | 0 / 124 | 48 / 85 | 0 / 88 |
 | kit-dev-coldfire-xilinx_5213 | 4 / 459 | 0 / 454 | 131 / 164 | 0 / 216 |
 
-*The two counted vias on RoyalBlue54L-Feather sit on U2's unnumbered, netless 0.57 mm custom sub-pads inside
-its exposed pad (thermal-via sites); the counter cannot distinguish them from separate small pads.
+*The two historically counted RoyalBlue54L-Feather vias touched U2's F.Paste-only apertures, not copper
+pads. The corrected metric ignores paste-only pads, so this residual is 0.
 
-The preference removes small-pad vias, but dog-bones need more space and can cost connections on dense
-boards: with soft zones, coldfire rises from 164 to 216 unconnected items. It stays opt-in rather than
-trading completion for pad clearance by default. KiCad added errors are zero in all runs except one
-`solder_mask_bridge` on StickHub with soft zones and the pad preference together.
-The benchmark also caught the need to use effective via sizes: before that fix, multichannel_mixer's
-1.5 mm board-minimum via diameter left 18 small-pad vias with the preference on.
+The historical table shows the dog-bone space/completion trade-off, not a current-results comparison.
+Under that older judge, all runs added zero errors except one `solder_mask_bridge` on StickHub with
+`--soft-zones --plane-cut-cost 0 --keep-vias-off-pads`. No plane-integrity metric was measured then;
+no plane-integrity benefit was established. The preference remains opt-in.
+
+**Current results.** On the 10M demo run in §18 (seeds 7/19/31), the copper-only metric counts no
+small-pad vias with `soft+vop` on any board. With `soft`, it is zero on interf_u, pic_programmer and
+complex_hierarchy, and 0.154–0.695 per delivered connection on the other five boards.
+Cells below are median small-pad vias / unconnected items; each median's min–max seed spread is [v–v].
+This is seed-independent single-variant routing, not evidence of robustness over random routing orders.
+
+| Board | base | soft (`--soft-zones --plane-cut-cost 0`) | soft+vop (also `--keep-vias-off-pads`) |
+|---|---:|---:|---:|
+| StickHub | 9 / 31 | 25 / 10 | 0 / 24 |
+| multichannel_mixer | 9 / 11 | 26 / 4 | 0 / 4 |
+| interf_u | 0 / 43 | 0 / 46 | 0 / 46 |
+| pic_programmer | 0 / 10 | 0 / 13 | 0 / 13 |
+| complex_hierarchy | 0 / 0 | 0 / 0 | 0 / 0 |
+| RoyalBlue54L-Feather | 0 / 112 | 41 / 87 | 0 / 92 |
+| CM5_MINIMA_3 | 0 / 118 | 53 / 62 | 0 / 71 |
+| kit-dev-coldfire-xilinx_5213 | 7 / 415 | 129 / 125 | 0 / 125 |
+
+Against `soft`, `soft+vop` costs 0–14 additional unconnected items across the demos and adds the StickHub
+mask bridge; no configuration of interf_u is legal. Standalone `--keep-vias-off-pads` was not regenerated
+on these demos. On the nine zone-free PCBench inputs, both `base` and standalone `vop` complete legally,
+and `vop` leaves zero small-pad vias (doc 10 §2). These observations keep the preference opt-in.
+The earlier effective-via-size experiment left 18 small-pad vias on multichannel_mixer with the
+preference before applying its 1.5 mm board-minimum diameter; the margin now also covers neck-down annuli.
 
