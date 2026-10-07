@@ -39,7 +39,9 @@ NOT_ROUTING = {"lib_footprint_issues", "lib_footprint_mismatch", "silk_overlap",
                "footprint_type_mismatch", "footprint_filters_mismatch", "nonmirrored_text_on_back_layer",
                "npth_inside_courtyard", "pth_inside_courtyard", "duplicate_footprints", "extra_footprint",
                "missing_footprint", "footprint_symbol_mismatch", "unconnected_items", "track_dangling", "via_dangling",
-               "isolated_copper", "starved_thermal", "lib_footprint_mismatch", "holes_co_located"}
+               "lib_footprint_mismatch", "holes_co_located"}
+REFILL_SENSITIVE = {"starved_thermal", "isolated_copper"}
+ZONE_ERRORS = {"clearance", "shorting_items"}
 
 
 def fr_baseline() -> dict[str, dict]:
@@ -79,12 +81,15 @@ def drc(path: pathlib.Path, timeout: int = 600) -> dict | None:
         return None
     d = json.loads(out.read_text())
     c = Counter(v["type"] for v in d.get("violations", []) if v.get("severity") == "error")
-    # Router-introduced = violations involving a track, arc or via (PCBench inputs have none). Pad-versus-footprint
-    # graphic violations can appear or disappear in KiCad's report once nets are connected; they are not caused by
-    # the router and are not counted (Freerouting's harness counts router-introduced violations the same way).
+    # Refilled planes can introduce errors involving only zones/pads. Thermals/islands are always
+    # refill-sensitive; clearance/shorts count for zones as well as routed copper. Pad-versus-footprint
+    # graphic reports can change when nets connect, so keep the copper-item filter for other errors.
     def routed_copper(v):
         return any(i.get("description", "").startswith(("Track", "Via", "Arc")) for i in v.get("items", []))
-    r = Counter(v["type"] for v in d.get("violations", []) if v.get("severity") == "error" and routed_copper(v))
+    def zone_error(v):
+        return v["type"] in ZONE_ERRORS and any(i.get("description", "").startswith("Zone") for i in v.get("items", []))
+    r = Counter(v["type"] for v in d.get("violations", []) if v.get("severity") == "error"
+                and (v["type"] in REFILL_SENSITIVE or routed_copper(v) or zone_error(v)))
     # Violations between items of one footprint (pads, its copper graphics) cannot be caused by moving it: the
     # footprint is rigid. KiCad still re-classifies some of them (short <-> clearance) after a rotation, so
     # placement-added errors count only violations that involve two footprints or board items.

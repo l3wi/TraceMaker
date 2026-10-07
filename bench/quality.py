@@ -6,12 +6,12 @@
 
 Per routed board:
   completion, unconnected       from kicad-cli DRC (connections left unrouted)
-  router_errors                 KiCad DRC errors involving routed copper that the input did not have
-  length_mm (and per layer)     total track length
+  router_errors                 added routed-copper errors, refill-sensitive thermals/islands and zone clearance/shorts
+  length_mm (and per layer)     total track and arc length
   vias                          via count
-  detour                        signal track length / pad-centre minimum spanning tree, over nets without a conductive
-                                zone (a zone carries part of a plane net, so its MST is no reference); < 1 is still
-                                possible with shared trunks
+  detour                        signal track/arc length / pad-centre minimum spanning tree, over nets without a conductive
+                                zone and with an available positive MST (unavailable above 2000 pads); both numerator
+                                and denominator omit other nets. < 1 is possible with shared trunks
   nets                          per net: length, vias, pad MST, pads, whether it owns a zone, and (record()) complete
   bends, sharp_bends            direction changes at joints; sharp = interior angle under 90 degrees at a joint outside
                                 pad copper (an acid trap); sharp_at_pads counts those inside a pad, where pad copper
@@ -39,11 +39,15 @@ KICAD_PYTHON = os.environ.get("TM_KICAD_PYTHON", _MAC_KICAD_PYTHON if pathlib.Pa
 
 
 def board_json(path: pathlib.Path) -> dict:
-    out = ROOT / "build/quality" / (path.resolve().as_posix().replace("/", "_")[-150:] + ".json")
+    st, binary = path.stat(), pathlib.Path(TM).resolve()
+    key = hashlib.sha1(f"inspect-v2:{path.resolve()}:{st.st_mtime_ns}:{st.st_size}:{binary}:{binary.stat().st_mtime_ns}".encode()).hexdigest()[:16]
+    out = ROOT / "build/quality" / f"inspect-{key}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
-    if not out.exists() or out.stat().st_mtime < path.stat().st_mtime:
+    cached = json.loads(out.read_text()) if out.exists() else None
+    if cached is None or "arcs" not in cached or any("teardrop" not in z for z in cached.get("zones", [])):
         subprocess.run([str(TM), "inspect", str(path), "--json", str(out)], check=True, capture_output=True)
-    return json.loads(out.read_text())
+        cached = json.loads(out.read_text())
+    return cached
 
 
 def mst_length(pts):
@@ -65,6 +69,23 @@ def mst_length(pts):
     return total
 
 
+def arc_length(arc):
+    """Length of the circular arc through inspect's start, midpoint and end (nanometres)."""
+    sx, sy = arc["sx"], arc["sy"]
+    mx, my = arc["mx"] - sx, arc["my"] - sy
+    ex, ey = arc["ex"] - sx, arc["ey"] - sy
+    cross = mx * ey - my * ex
+    if not cross:
+        return math.hypot(mx, my) + math.hypot(ex - mx, ey - my)
+    m2, e2 = mx * mx + my * my, ex * ex + ey * ey
+    cx, cy = (m2 * ey - e2 * my) / (2 * cross), (mx * e2 - ex * m2) / (2 * cross)
+    start = math.atan2(-cy, -cx)
+    mid = (math.atan2(my - cy, mx - cx) - start) % math.tau
+    end = (math.atan2(ey - cy, ex - cx) - start) % math.tau
+    sweep = end if mid <= end else math.tau - end
+    return math.hypot(cx, cy) * sweep
+
+
 def geometry(d: dict) -> dict:
     mm = 1e-6
     by_layer = defaultdict(float)
@@ -84,6 +105,12 @@ def geometry(d: dict) -> dict:
             narrowed += L
         ends[(t["net"], t["layer"], a)].append(b)
         ends[(t["net"], t["layer"], b)].append(a)
+    for arc in d["arcs"]:
+        length = arc_length(arc) * mm
+        by_layer[arc["layer"]] += length
+        net_len[arc["net"]] += length
+        if arc["net"] in widths and arc["width"] < widths[arc["net"]] - 1000:
+            narrowed += length
     for v in d["vias"]:
         net_vias[v.get("net", "")] += 1
     # Pad copper per layer (rotated rectangles; round pads are covered by their bounding square, conservative).
@@ -128,12 +155,12 @@ def geometry(d: dict) -> dict:
     for net in sorted(set(pads_by_net) | set(net_len) | {n for n in net_vias if n}):
         pts = pads_by_net.get(net, [])
         nets[net] = {"plane": net in zone_nets, "length_mm": round(net_len[net], 3), "vias": net_vias[net], "pads": len(pts),
-                     "mst_mm": round(mst_length(pts), 3) if 1 < len(pts) <= 2000 else 0.0}
-    signal = [n for n in nets.values() if not n["plane"] and n["mst_mm"] > 0]
+                     "mst_mm": round(mst_length(pts), 3) if len(pts) <= 2000 else None}
+    signal = [n for n in nets.values() if not n["plane"] and n["mst_mm"] is not None and n["mst_mm"] > 0]
     sig_len, sig_ref = sum(n["length_mm"] for n in signal), sum(n["mst_mm"] for n in signal)
     total = sum(by_layer.values())
     return {"length_mm": round(total, 1), "length_by_layer_mm": {k: round(v, 1) for k, v in sorted(by_layer.items())},
-            "vias": len(d["vias"]), "segments": len(d["tracks"]), "bends": bends, "sharp_bends": sharp, "sharp_at_pads": sharp_pad,
+            "vias": len(d["vias"]), "segments": len(d["tracks"]) + len(d["arcs"]), "bends": bends, "sharp_bends": sharp, "sharp_at_pads": sharp_pad,
             "narrowed_mm": round(narrowed, 1), "narrowed_share": round(narrowed / total, 4) if total else 0.0,
             "signal_length_mm": round(sig_len, 1), "signal_mst_mm": round(sig_ref, 1),
             "detour": round(sig_len / sig_ref, 3) if sig_ref else None,
@@ -188,7 +215,7 @@ def coupling(d: dict) -> dict:
 
 
 def judge(before: dict, after: dict) -> dict:
-    """Completion and router-added errors of `after` against its unrouted input `before` (bench/run.py drc())."""
+    """Positive input/output error deltas, including refill-sensitive types from bench/run.py drc()."""
     added = {t: n - before["routed_errors"].get(t, 0) for t, n in after["routed_errors"].items()
              if t not in bench_run.NOT_ROUTING and n - before["routed_errors"].get(t, 0) > 0}
     return {"connections": before["unconnected"], "unconnected": after["unconnected"], "router_errors": added,
@@ -210,7 +237,7 @@ def metrics(unrouted: pathlib.Path, routed: pathlib.Path) -> dict:
 
 
 def plane_metrics(pcb: pathlib.Path, small_pad_mm: float = 2.0) -> dict | None:
-    """bench/plane_metrics_kicad.py (KiCad's refill, plane coverage/islands/gaps, small-pad vias); None without pcbnew."""
+    """KiCad refill, plane coverage/islands/unsupported exposure, small-pad vias; None without pcbnew."""
     st, probe = pcb.stat(), ROOT / "bench/plane_metrics_kicad.py"
     key = hashlib.sha1(f"{pcb.resolve()}:{st.st_mtime_ns}:{st.st_size}:{small_pad_mm}:{probe.stat().st_mtime_ns}".encode()).hexdigest()[:16]
     out = ROOT / "build/quality" / f"planes-{key}.json"
