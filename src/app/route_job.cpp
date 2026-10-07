@@ -298,7 +298,10 @@ RouteJobResult run_route_job(RouteJob job) {
                  {"vias", res.vias.size()},  {"seconds", res.seconds},         {"expansions", res.expansions},
                  {"pitch_mm", nm_to_mm(res.pitch)}, {"failures", res.failures}, {"variant", best_index}, {"variant_name", best_name},
                  {"escape_corridors", res.escape_corridors}, {"access_connections", res.access_connections},
-                 {"narrowed_access", res.narrowed_access}};
+                 {"narrowed_access", res.narrowed_access}, {"access_work", res.access_work},
+                 {"access_generation_work", res.access_generation_work}, {"access_neighbor_work", res.access_neighbor_work},
+                 {"access_check_work", res.access_check_work}, {"access_expansion_work", res.access_expansion_work},
+                 {"access_lattice_work", res.access_lattice_work}};
   out.summary["rule_warnings"] = out.rule_warnings;
   out.summary["project_warnings"] = out.project_warnings;
   if (opt.soft_zones) {

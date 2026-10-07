@@ -54,7 +54,8 @@ Already-connected obligations are `satisfied`; successful access has an exact `w
 Existing copper participates in connectivity and legality, so analyse the actual board you will route
 without stripping it merely to silence findings. Match `--soft-zones`, `--keep-vias-off-pads [MM]`,
 `--blind-vias`, `--component-rules` and `--rules-override` to routing. Soft-zone witnesses remain
-provisional until refill and plane/thermal sign-off.
+provisional until refill and plane/thermal sign-off. An individual witness does not prove that the global
+lattice can continue through a thin channel, that its other terminal is reached, or that all pins route.
 
 **Position/footprint `disallow track/via` rules are enforced before insertion**, including final track
 segments and actual via types/spans. Area, courtyard, coordinate and item-dimension predicates use the

@@ -422,7 +422,7 @@ def escape_findings(escape):
     if not results:
         counts.update(escape.get('statuses', {}))
     findings = [('info', f"Dense-package access: {counts['satisfied']} already satisfied pins; "
-                 f"{counts['witness']} exact witnessed escapes. Witnesses establish individual access, not simultaneous routability or DRC sign-off.")]
+                 f"{counts['witness']} exact witnessed escapes. Witnesses establish individual access, not global-lattice channel completion, simultaneous routability or DRC sign-off.")]
     for status, description in (('exhausted', 'No escape found in configured router search domain'),
                                 ('unknown', 'Escape access unknown')):
         if not counts[status]:

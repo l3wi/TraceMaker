@@ -495,7 +495,7 @@
      "done": true
     },
     {
-     "text": "Permanent synthetic escape legality/reference tests and CLI/preflight contracts added; execution and CM5/quick/KiCad gates pending integration",
+     "text": "D66 charged access caps, exact consumer/reference/CLI tests, 216 passing CTests (3 skips; 2 KiCad-version parity exclusions), quick 30/30 baseline-identical and saved native KiCad refill/DRC verified; CM5 global thin-channel completion remains open (0/18 affected pins)",
      "done": true
     },
     {

@@ -521,8 +521,16 @@ int Obstacles::disk_state(Point p, int layer, Coord hw, model::NetId net, Coord 
   return st;
 }
 
+bool Obstacles::track_source_blocked(Point p, int layer, Coord half_width) const {
+  for (const auto& [area, zone] : keepouts_)
+    if (zone->keepout_tracks && (zone->copper & model::layer_bit(layer)) &&
+        geom::closer_than_disk(area, p, half_width, 1)) return true;
+  return false;
+}
+
 int Obstacles::segment_state(Point a, Point b, int layer, Coord width, model::NetId net, bool ignore_routed, std::vector<int>* owners) const {
-  const Shape s = Shape::segment(a, b, width / 2);
+  static thread_local Shape s = Shape::segment({}, {}, 0);
+  s.pts[0] = a; s.pts[1] = b; s.r = width / 2; s.update_box();
   const Probe pp(drc::ItemKind::Track, s, net, layer, width, a);
   const drc::CopperItem& probe = *pp;
   const auto [minimum, maximum] = re_->track_width(probe, layer);

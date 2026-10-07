@@ -104,7 +104,12 @@ The top-level `configuration` records `soft_zones`, `blind_vias`, `keep_vias_off
 `component_rules`, `rules_override`, `pitch_um`, `reference` and `work_budget`; `warnings` contains rule/domain
 warnings. Keep these alongside the input project/rules when comparing verdicts. A soft-zone witness is
 provisional until refill and plane/thermal/DRC sign-off. This report describes individual access, not
-simultaneous full-board routability; the clean-pass judge remains authoritative.
+global thin-channel completion or simultaneous full-board routability; the clean-pass judge remains authoritative.
+
+Route JSON includes `access_work`, split into `access_generation_work`, `access_neighbor_work`,
+`access_check_work`, `access_expansion_work` and `access_lattice_work`. Their sum is `access_work`;
+every access unit is also included in total `expansions`. Generation/metadata loops, neighbour visits,
+exact geometry/width/via/goal checks and graph expansion are deterministic work, not just graph pops.
 
 
 ## 5. IPC plugin (`kicad_plugin/`)

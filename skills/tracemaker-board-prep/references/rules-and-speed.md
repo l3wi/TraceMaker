@@ -122,11 +122,15 @@ Each checked pin reports one of:
 JSON retains the legacy `pins`, `escapable` and grouped `dead` fields; `dead` now includes **only
 exhausted domains**, never unknown searches. Use `parts[].results[]` for pad identity, status, reason,
 domain and witness segments/via spans (integer nanometres). `statuses`, `configuration` and `warnings`
-make the policy and result counts explicit. `--work` bounds deterministic access work per pin;
-`--reference` runs the uncached exact reference search.
+make the policy and result counts explicit. `--work` bounds deterministic access work per pin (default
+5M), charging generation, neighbour enumeration, exact predicates and expansion. `--reference` runs the
+linear, uncached reference; it can spend more work but completed domains must agree geometrically.
+Router access shares a strict 10% global-work pool and revalidates actual widths and via subtypes before
+commit. A bounded local path may reach a usable lattice node or finish the requested nearby terminal.
 
-No finite-lattice negative proves physical impossibility, and independent witnesses do not prove all
-pins can escape simultaneously. Existing routing is checked for connectivity before searching outstanding
+No finite-lattice negative proves physical impossibility. A witness at a local exterior does not prove
+global thin-channel traversal or that all pins escape simultaneously; there is no automatic global
+fine-grid/off-lattice fallback. Existing routing is checked for connectivity before searching outstanding
 obligations; there is no need to strip a connected board to obtain an honest result. With `--soft-zones`,
 access follows the same refillable-plane semantics as routing, not an immutable-fill approximation;
 refill and KiCad plane/thermal/DRC sign-off are still required. Preflight forwards the same route-affecting

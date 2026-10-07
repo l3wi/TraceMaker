@@ -28,6 +28,8 @@ class Obstacles {
                  std::vector<int>* owners = nullptr) const;
   int segment_state(geom::Point a, geom::Point b, int layer, Coord width, model::NetId net, bool ignore_routed,
                     std::vector<int>* owners = nullptr) const;
+  // A centre contact with a hard track keepout blocks every wider pad-centred access.
+  bool track_source_blocked(geom::Point p, int layer, Coord half_width) const;
   // A via on copper layers [l0, l1] only; via_state covers all layers with a through via.
   int via_state_span(geom::Point p, Coord d, Coord drill, model::NetId net, Coord margin, bool ignore_routed, std::vector<int>* owners, int l0,
                      int l1, model::ViaType type = model::ViaType::Blind) const;

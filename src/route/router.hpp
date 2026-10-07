@@ -123,6 +123,9 @@ struct RouteResult {
   int necked = 0;               // connections routed at the neck-down width
   int access_connections = 0;   // committed off-lattice geometry accesses
   int narrowed_access = 0;      // those with local tracks narrower than their class target
+  long access_work = 0;         // included in expansions; all access preparation and validation
+  long access_generation_work = 0, access_neighbor_work = 0, access_check_work = 0, access_expansion_work = 0;
+  long access_lattice_work = 0; // bounded checked lattice exits before local graph construction
   int restarts = 0;
   int optimized = 0;
   int pairs = 0;

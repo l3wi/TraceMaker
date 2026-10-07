@@ -13,6 +13,8 @@
 #include <cmath>
 #include <cstdio>
 #include <map>
+#include <limits>
+#include <optional>
 #include <queue>
 #include <array>
 #include <deque>
@@ -184,7 +186,11 @@ struct Router::Impl {
   }
   bool local_access = false;
   bool access_incomplete = false;
-  std::map<int, std::vector<AccessPath>> access_cache;
+  struct CachedAccess { std::vector<AccessPath> paths; bool complete = false; };
+  std::map<std::tuple<int, Coord, int, int>, CachedAccess> access_cache;
+  std::map<std::pair<int, Coord>, bool> lattice_exit_cache;
+  const AccessPath* finished_access = nullptr;
+  bool finished_access_reverse = false;
   // Static disallow permissions are an optimization; residual rules use exact candidate checks instead.
   std::vector<model::LayerMask> net_layers;
   std::vector<std::uint8_t> net_vias;
@@ -422,6 +428,7 @@ struct Router::Impl {
     std::vector<Point> stub;                           // per cell: off-lattice escape point (or the pad centre)
     std::vector<std::int64_t> cost;                    // per cell: cost from the pad centre
     std::vector<const AccessPath*> access;            // stable paths owned by access_cache
+    const AccessPath* finished = nullptr;
   };
   // Off-lattice escapes: straight exits from the pad centre in 8 directions, exactly checked, joining the
   // lattice at the first legal point (fine-pitch pins are often unreachable from lattice points alone).
@@ -469,7 +476,70 @@ struct Router::Impl {
   // Off-lattice escapes: straight exits from the pad centre in 8 directions, exactly checked, joining the
   // lattice at the first legal point (fine-pitch pins are often unreachable from lattice points alone).
   // Cached per pad against fixed copper; routed copper is checked by the search and at commit.
-  void add_escapes(const Window& w, int pad, Endpoint& e) {
+  long access_remaining() const {
+    const long limit = opt.work_budget > 0 ? std::max(1L, opt.work_budget / 10) : 5'000'000L;
+    long remaining = limit - res.access_work;
+    if (opt.work_budget > 0) remaining = std::min(remaining, opt.work_budget - res.expansions);
+    return std::max(0L, remaining);
+  }
+  bool access_tick(long& category) {
+    if (!access_remaining()) { access_incomplete = true; return false; }
+    ++category; ++res.access_work; ++res.expansions; return true;
+  }
+  std::optional<bool> checked_lattice_exit(const Window& w, int pad, const Endpoint& e) {
+    const auto& p = b.pads[static_cast<std::size_t>(pad)];
+    const Coord width = track_width(p.net);
+    const auto cache_key = std::pair{pad, width};
+    if (const auto it = lattice_exit_cache.find(cache_key); it != lattice_exit_cache.end()) return it->second;
+    long used = 0;
+    auto tick = [&]() {
+      if (used >= 4'096 || !access_tick(res.access_lattice_work)) return false;
+      ++used; return true;
+    };
+    geom::Box box;
+    for (int pi : b.footprints[static_cast<std::size_t>(p.footprint)].pads) {
+      if (!tick()) return std::nullopt;
+      const auto& other = b.pads[static_cast<std::size_t>(pi)];
+      if (other.copper && other.type != model::PadType::NpThruHole) box.add(other.pos);
+    }
+    box = box.inflated(500'000);
+    std::array<std::pair<Coord, std::size_t>, 64> nearest;
+    nearest.fill({std::numeric_limits<Coord>::max(), SIZE_MAX});
+    for (std::size_t i = 0; i < e.cells.size(); ++i) {
+      if (!tick()) return std::nullopt;
+      const auto [layer, cell] = e.cells[i];
+      const Point point = at(w.x0 + static_cast<int>(cell % w.w), w.y0 + static_cast<int>(cell / w.w));
+      const Coord distance = std::llabs(point.x - p.pos.x) + std::llabs(point.y - p.pos.y);
+      auto& best = nearest[static_cast<std::size_t>(layer)];
+      best = std::min(best, std::pair{distance, i});
+    }
+    for (int layer = 0; layer < nl; ++layer) {
+      const auto i = nearest[static_cast<std::size_t>(layer)].second;
+      if (i == SIZE_MAX) continue;
+      const auto cell = e.cells[i].second;
+      const int sx = w.x0 + static_cast<int>(cell % w.w), sy = w.y0 + static_cast<int>(cell / w.w);
+      for (int direction = 0; direction < 8; ++direction) {
+        int gx = sx, gy = sy;
+        Point previous = at(gx, gy);
+        for (Coord distance = 0; distance <= 4'000'000; distance += pitch) {
+          if (!tick()) return std::nullopt;
+          if (previous.x < box.x0 || previous.x > box.x1 || previous.y < box.y0 || previous.y > box.y1) {
+            lattice_exit_cache.emplace(cache_key, true); return true;
+          }
+          gx += kDx[direction]; gy += kDy[direction];
+          if (gx < 0 || gy < 0 || gx >= nx || gy >= ny ||
+              fixed_point_blocked(layer, gx, gy, p.net, width / 2)) break;
+          const Point next = at(gx, gy);
+          if (!tick()) return std::nullopt;
+          if (obs->segment_state(previous, next, layer, width, p.net, true) == 2) break;
+          previous = next;
+        }
+      }
+    }
+    lattice_exit_cache.emplace(cache_key, false); return false;
+  }
+
+  void add_escapes(const Window& w, int pad, int target_pad, int target_zone, Endpoint& e) {
     const auto& p = b.pads[static_cast<std::size_t>(pad)];
     const Coord width = track_width(p.net);
     for (const auto& x : escapes(pad)) {
@@ -484,30 +554,93 @@ struct Router::Impl {
       e.cost.push_back(x.cost);
     }
     if (!local_access) return;
-    auto it = access_cache.find(pad);
+    const auto lattice_exit = checked_lattice_exit(w, pad, e);
+    if (!lattice_exit) { access_incomplete = true; return; }
+    if (*lattice_exit) return;
+    const auto access_key = std::tuple{pad, width, target_pad, target_zone};
+    auto it = access_cache.find(access_key);
     if (it == access_cache.end()) {
       AccessSearchOptions ao;
       ao.origin = {lat.x0, lat.y0};
       ao.pitch = pitch;
+      ao.lattice_target = true;
       ao.routing = opt;
-      if (opt.work_budget > 0) ao.work_budget = std::max<long>(1, std::min<long>(ao.work_budget, opt.work_budget - res.expansions));
+      ao.width = width;
+      const int target_item = target_pad >= 0 ? pad_item[static_cast<std::size_t>(target_pad)] : target_zone;
+      std::vector<int> target_items;
+      if (target_item >= 0 && static_cast<std::size_t>(target_item) < init_root.size()) {
+        const int root = init_root[static_cast<std::size_t>(target_item)];
+        for (std::size_t i = 0; i < init_root.size(); ++i) {
+          if (!access_tick(res.access_generation_work)) return;
+          if (init_root[i] == root && obs->copper().items[i].net == p.net) target_items.push_back(static_cast<int>(i));
+        }
+      }
+      // Carry copper past an unusable via pocket, or finish directly on the requested fixed component.
+      // A short full-width visibility exit prevents sixteen duplicate goals in a sealed via cavity.
+      ao.target = [&](Point q, int layer, const std::function<bool()>& check) {
+        for (int id : target_items) {
+          if (!check()) return AccessGoal::None;
+          const auto& item = obs->copper().items[static_cast<std::size_t>(id)];
+          if (!(item.layers & model::layer_bit(layer)) || q.x < item.box.x0 || q.x > item.box.x1 ||
+              q.y < item.box.y0 || q.y > item.box.y1) continue;
+          for (const auto& shape : item.shapes) {
+            if (!check()) return AccessGoal::None;
+            if (geom::closer_than_disk(shape, q, 0, 1)) return AccessGoal::Connected;
+          }
+        }
+        const Point delta = q - p.pos;
+        if ((p.copper & model::layer_bit(layer)) && delta.x * delta.x + delta.y * delta.y < ao.radius * ao.radius / 4)
+          return AccessGoal::None;
+        if (!(q == at(to_ix(q.x), to_iy(q.y))) || !check() ||
+            obs->disk_state(q, layer, width / 2, p.net, 0, true) == 2) return AccessGoal::None;
+        for (int direction = 0; direction < 8; ++direction) {
+          if (!check()) return AccessGoal::None;
+          const Point out{q.x + kDx[direction] * 500'000, q.y + kDy[direction] * 500'000};
+          if (obs->segment_state(q, out, layer, width, p.net, true) != 2) return AccessGoal::Endpoint;
+        }
+        return AccessGoal::None;
+      };
+      // Leave room to validate returned witnesses against current copper; the rest of the work
+      // remains for ordinary search/negotiation even when many sources are physically boxed in.
+      const long remaining = access_remaining();
+      if (remaining <= 512) { access_incomplete = true; return; }
+      ao.work_budget = std::min(ao.work_budget, remaining - 512);
       auto result = generate_access_paths(b, rules, *obs, pad, ao);
       res.expansions += result.work;
-      if (!result.exhausted && result.paths.empty()) { access_incomplete = true; return; }
-      it = access_cache.emplace(pad, std::move(result.paths)).first;
+      res.access_work += result.work;
+      res.access_generation_work += result.generation_work;
+      res.access_neighbor_work += result.neighbor_work;
+      res.access_check_work += result.check_work;
+      res.access_expansion_work += result.expansion_work;
+      const bool complete = result.exhausted || static_cast<int>(result.paths.size()) >= ao.max_paths ||
+          std::any_of(result.paths.begin(), result.paths.end(), [](const auto& path) { return path.target_connected; });
+      it = access_cache.emplace(access_key, CachedAccess{std::move(result.paths), complete}).first;
     }
+    if (!it->second.complete) access_incomplete = true;
     e.access.resize(e.cells.size());
-    for (const auto& path : it->second) {
+    for (const auto& path : it->second.paths) {
+      if (!access_tick(res.access_neighbor_work)) return;
       const int gx = to_ix(path.end.x), gy = to_iy(path.end.y);
       const int cx = gx - w.x0, cy = gy - w.y0;
-      if (cx < 0 || cy < 0 || cx >= w.w || cy >= w.h) continue;
-      if (point_state(path.layer, gx, gy, p.net, width / 2) == 2) continue;
+      if (!path.target_connected && (cx < 0 || cy < 0 || cx >= w.w || cy >= w.h)) continue;
+      if (!path.target_connected) {
+        if (!access_tick(res.access_check_work)) return;
+        if (point_state(path.layer, gx, gy, p.net, width / 2) == 2) continue;
+      }
       bool legal = true;
-      for (const auto& s : path.steps)
-        if (obs->segment_state(s.a, s.b, s.layer, s.width, p.net, soft) == 2) legal = false;
-      for (const auto& v : path.vias)
-        if (obs->via_state_span(v.pos, v.size, v.drill, p.net, 0, soft, nullptr, v.layer_top, v.layer_bottom) == 2) legal = false;
+      for (const auto& s : path.steps) {
+        if (!access_tick(res.access_check_work)) return;
+        if (obs->segment_state(s.a, s.b, s.layer, s.width, p.net, soft) == 2) { legal = false; break; }
+      }
+      if (legal) for (const auto& v : path.vias) {
+        if (!access_tick(res.access_check_work)) return;
+        if (obs->via_state_span(v.pos, v.size, v.drill, p.net, 0, soft, nullptr, v.layer_top, v.layer_bottom, v.type) == 2) { legal = false; break; }
+      }
       if (!legal) continue;
+      if (path.target_connected) {
+        if (!e.finished || path.cost < e.finished->cost) e.finished = &path;
+        continue;
+      }
       e.cells.emplace_back(path.layer, static_cast<std::int64_t>(cy) * w.w + cx);
       e.stub.push_back(path.end);
       e.cost.push_back(path.cost);
@@ -650,7 +783,7 @@ struct Router::Impl {
 
   // Lattice cells of the window inside a pad's copper on each of its layers (falls back to cells next to the
   // pad centre for pads smaller than the pitch).
-  Endpoint pad_cells(const Window& w, int pad) {
+  Endpoint pad_cells(const Window& w, int pad, int target_pad = -1, int target_zone = -1) {
     Endpoint e;
     const auto& p = b.pads[static_cast<std::size_t>(pad)];
     const int item = pad_item[static_cast<std::size_t>(pad)];
@@ -693,7 +826,7 @@ struct Router::Impl {
         break;
       }
     }
-    if (!any_free || force_escapes || local_access) add_escapes(w, pad, e);
+    if (!any_free || force_escapes || local_access) add_escapes(w, pad, target_pad, target_zone, e);
     return e;
   }
 
@@ -769,12 +902,30 @@ struct Router::Impl {
   bool search(const Connection& c, const Window& w, std::vector<PathNode>& path) {
     last_miss = Miss::None;
     reach_said_no = false;
+    finished_access = nullptr;
+    finished_access_reverse = false;
     bool touched_edge = false;
     const NetId net = c.net;
     const Coord width = track_width(net);
     const Coord hw = width / 2;
     const Coord vd = via_diameter(net);
     const Coord vdrill = via_drill(net);
+    const Endpoint src = pad_cells(w, c.pad_a, c.pad_b, c.zone_b);
+    if (src.finished) {
+      finished_access = src.finished;
+      path.clear();
+      ++n_ok;
+      return true;
+    }
+    const Endpoint dst = c.pad_b >= 0 ? pad_cells(w, c.pad_b, c.pad_a) : Endpoint{};
+    if (dst.finished) {
+      finished_access = dst.finished;
+      finished_access_reverse = true;
+      path.clear();
+      ++n_ok;
+      return true;
+    }
+    if (src.cells.empty() || (c.pad_b >= 0 && dst.cells.empty())) return false;
     const std::size_t cells = static_cast<std::size_t>(w.w) * static_cast<std::size_t>(w.h);
     const std::size_t D = opt.bend_states ? 9 : 1;  // direction states per lattice point
     const std::size_t states = cells * static_cast<std::size_t>(nl) * D;
@@ -795,9 +946,6 @@ struct Router::Impl {
       std::fill(rstamp.begin(), rstamp.end(), 0u);
       gen = 1;
     }
-    const Endpoint src = pad_cells(w, c.pad_a);
-    const Endpoint dst = c.pad_b >= 0 ? pad_cells(w, c.pad_b) : Endpoint{};
-    if (src.cells.empty() || (c.pad_b >= 0 && dst.cells.empty())) return false;
     std::vector<std::uint8_t> is_target(cells * static_cast<std::size_t>(nl), 0);  // 1 target, 2 not (zone checks are lazy)
     for (auto [l, ci] : dst.cells) is_target[static_cast<std::size_t>(l) * cells + static_cast<std::size_t>(ci)] = 1;
     // Zone target: any cell inside the fill on its layer, with room for the track (tested lazily when reached).
@@ -1122,21 +1270,22 @@ struct Router::Impl {
     std::vector<Point> vias;
     std::vector<std::pair<int, int>> via_span;  // layers joined by each via
     const Point pa = b.pads[static_cast<std::size_t>(c.pad_a)].pos;
-    const Point pb = c.pad_b >= 0 ? b.pads[static_cast<std::size_t>(c.pad_b)].pos : at(path.back().gx, path.back().gy);
+    const Point pb = c.pad_b >= 0 ? b.pads[static_cast<std::size_t>(c.pad_b)].pos :
+        (finished_access ? finished_access->end : at(path.back().gx, path.back().gy));
     // Corner points: pad centre, direction changes and layer changes, pad centre.
     Point cur = pa;
-    int layer = path.front().layer;
+    int layer = finished_access ? finished_access->layer : path.front().layer;
     auto P = [&](const PathNode& n) { return at(n.gx, n.gy); };
     auto append_access = [&](const AccessPath& access, bool reverse) {
       if (!reverse) for (const auto& s : access.steps) segs.push_back({s.a, s.b, s.layer, s.width});
       else for (auto it = access.steps.rbegin(); it != access.steps.rend(); ++it) segs.push_back({it->b, it->a, it->layer, it->width});
     };
-    const auto skey = cell_key(path.front().layer, path.front().gx, path.front().gy);
-    const auto tkey = cell_key(path.back().layer, path.back().gx, path.back().gy);
-    const AccessPath* leading = start_access.count(skey) ? start_access.at(skey) : nullptr;
-    const AccessPath* trailing = target_access.count(tkey) ? target_access.at(tkey) : nullptr;
+    const auto skey = finished_access ? 0 : cell_key(path.front().layer, path.front().gx, path.front().gy);
+    const auto tkey = finished_access ? 0 : cell_key(path.back().layer, path.back().gx, path.back().gy);
+    const AccessPath* leading = finished_access ? finished_access : (start_access.count(skey) ? start_access.at(skey) : nullptr);
+    const AccessPath* trailing = !finished_access && target_access.count(tkey) ? target_access.at(tkey) : nullptr;
     if (leading) {
-      append_access(*leading, false);
+      append_access(*leading, finished_access && finished_access_reverse);
       cur = leading->end;
     } else if (auto it = start_stub.find(skey); it != start_stub.end() && !(it->second == pa)) {
       segs.push_back({pa, it->second, layer});
@@ -1161,7 +1310,9 @@ struct Router::Impl {
       if (!(cur == p)) segs.push_back({cur, p, layer});
       cur = p;
     }
-    if (trailing) {
+    if (finished_access) {
+      cur = pb;  // Exact graph copper already touches the requested component; no invented pad leg.
+    } else if (trailing) {
       append_access(*trailing, true);
       cur = pb;
     } else {
@@ -1225,7 +1376,7 @@ struct Router::Impl {
     for (const auto* access : {leading, trailing}) {
       if (!access) continue;
       for (const auto& v : access->vias) {
-        if (obs->via_state_span(v.pos, v.size, v.drill, net, 0, soft, &victims, v.layer_top, v.layer_bottom) == 2) ok = false;
+        if (obs->via_state_span(v.pos, v.size, v.drill, net, 0, soft, &victims, v.layer_top, v.layer_bottom, v.type) == 2) ok = false;
         access_vias.push_back(v);
       }
     }
@@ -3044,7 +3195,7 @@ struct Router::Impl {
             width_override = 0;
             via_override = false;
           }
-          if (!ok && !out_of_budget()) {
+          if (!ok && !out_of_budget() && access_remaining() > 0) {
             local_access = true;
             st.dead = false;
             access_incomplete = false;
@@ -3062,8 +3213,9 @@ struct Router::Impl {
             force_escapes = true;
             if (neck_width(st.c.net) > 0) width_override = neck_width(st.c.net);
             via_override = true;
-            local_access = true;
+            local_access = access_remaining() > 0;
             ok = search_and_commit(st.c, true);
+            if (!local_access) access_incomplete = true;
             if (ok) ++res.necked;
             width_override = 0;
             via_override = false;
@@ -3170,6 +3322,9 @@ struct Router::Impl {
     res.nogood_skips = nogood_skips;
     std::fprintf(stderr, "searches: %ld ok (%ld expansions), %ld failed (%ld expansions); fields %ld GPU + %ld CPU (%.2f s, %ld GPU fallbacks)\n",
                  n_ok, exp_ok, n_fail, exp_fail, field_runs, field_cpu_runs, field_seconds, field_gpu_fail);
+    std::fprintf(stderr, "local access work: %ld total = %ld generation + %ld neighbors + %ld exact checks + %ld graph expansions + %ld lattice exits\n",
+                 res.access_work, res.access_generation_work, res.access_neighbor_work, res.access_check_work,
+                 res.access_expansion_work, res.access_lattice_work);
     std::fprintf(stderr, "clean-up: %d connections improved\n", res.optimized);
     std::fprintf(stderr, "restarts %d; legality checks %ld; rips %d, passes %d, boxed-in %d, nogood skips %ld, history cells %zu\n", res.restarts, obs->checks, res.rips,
                  res.passes, res.enclosed, nogood_skips, history.size());

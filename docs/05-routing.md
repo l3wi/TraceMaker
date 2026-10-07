@@ -191,13 +191,28 @@ and through/blind via sites, rather than one straight stub or a via forced onto 
 Pad-aligned rays, interstitial/channel candidates and geometry-derived boundary/pocket portals are candidate
 generators, not proofs of complete geometric reachability. Every accepted segment and via is checked against
 the exact obstacle predicates; the router rechecks access copper against current routed copper at commit.
-Locked input copper remains fixed. The default local radius is 4 mm and the result carries deterministic
-integer costs; the reference enumerates the same candidates without the local item-bounds pruning.
+Locked input copper remains fixed. The default local radius is 4 mm and costs are deterministic integers.
+The linear, uncached reference searches the same finite candidate domain as the layer-separated spatial index.
 Boundary samples on near-straight runs (normal dot product above 0.99) are not separate corners; rounded
 pockets retain their recovered centres. Channel midpoints pair the nearest eight samples in each coordinate
 order. The source keeps every direct candidate; later visibility edges retain sixteen nearest portals per
 octant within 1.5 mm. These bounds define the reported finite domain and avoid quadratic fill-tessellation
 graphs. Analysis stops after its first exact witness; routing retains multiple checked exits.
+
+Generation/metadata loops, neighbour enumeration, exact width/via/goal checks, reconstruction and graph
+expansions all consume deterministic work units. Analysis defaults to 5M units per pin. Router access,
+including its bounded lattice-exit preparation, shares a strict 10% pool of the route work budget (5M when
+the global budget is unlimited), and every access unit also counts in total `expansions`. Per-pin graph
+work is capped by the remaining pool and the 5M pin cap, reserving work for current-copper revalidation.
+Interrupted results remain incomplete, never a cached dead proof. Indexed/reference searches need not
+spend identical work; completed domains must yield identical geometry.
+
+Routing goals are an exact-legal full-requested-width lattice node with a bounded outward visibility
+step, contact with the requested connection's other terminal, or contact with its existing same-net
+copper/plane component. Narrow local steps can therefore carry a path through a channel to a useful
+lattice handoff or finish a nearby target directly. Direct target contact need not widen first; commit
+retains the actual path widths and via subtype/span. An incomplete local access search cannot consume
+the whole job or prevent an unrelated ordinary connection from being searched.
 
 The access width floor is the board's positive hard minimum, or, when that is zero, the narrowest positive
 track width the designer declared in any net class. This is an explicit finite candidate policy, not a new
@@ -213,8 +228,8 @@ warnings, per-pin domain and exact witnesses (doc 08 §4). `pins` counts outstan
 `escapable` counts witnessed ones; satisfied pins remain visible in `results` without a dead finding.
 `exhausted` means only that the configured finite graph found no escape, while bounded/unsupported searches
 return `unknown`. Neither is a certificate of physical impossibility. Soft-zone witnesses are provisional
-until zone refill, plane/thermal connectivity and KiCad DRC sign-off; individual pin access never proves
-that all pins can be routed simultaneously.
+until zone refill, plane/thermal connectivity and KiCad DRC sign-off. Individual pin access proves neither
+simultaneous routing nor that the global lattice can traverse a thin channel after the local witness.
 
 The previous lattice-only run reported 789 findings among 46,628 pins across 708 dense-package PCBench
 boards (42 boards with findings), and the historical BGA run was 41.2% clean / 46.7% on its 15 boards without
@@ -224,18 +239,31 @@ they never replace full-board clean pass. Permanent synthetic tests cover connec
 rotated/flipped pad contact, hard/soft fills, exact witness legality, off-grid via pockets, legal narrowing,
 long multibend paths, locked copper, budgets and indexed/reference equality.
 
-**D66 measurements (2026-10-07).** Original CM5 reports 457 satisfied pad items and no outstanding dense-pin
-obligations. Preserved-hard-fill stripped CM5 reports 340 exact witnesses, including all 18 previously
-reported dead pins; no exhausted or unknown results. A one-variant, CPU, 5M-work route with escape planning
-connects 91/212 obligations (previously 89/212), using geometry access on 11 connections and narrower local
-tracks on two. This bounded global run does not attempt every outstanding connection or prove completion.
-KiCad 10.0.3 refilled input/output DRC adds no clearance, short, thermal or other routing errors; isolated
-copper warnings decrease from six to four. The 30-board quick tier remains 43.3% clean and 89.3% mean
-completion with no added DRC errors; every output is byte-identical to the supplied same-base binary when
-routing the same inputs/options. Synthetic access tests pass 27,178 assertions across 14 cases.
-StickHub's original input reports 48 satisfied items, its stripped input 44 witnesses and two finite-domain
-exhaustions; RoyalBlue's original reports 259 satisfied items. RoyalBlue stripped exceeded a 240 s external
-diagnostic deadline: no completed verdict is asserted.
+**D66 limitation and regression evidence.** The final fully charged 5M-per-pin diagnostic finds 340
+stripped-CM5 local witnesses, including all 18 reported pins (117 satisfied, no exhausted/unknown results;
+157.68 s). Local witnesses are not end-to-end routing proof. The earlier unaccounted 5M router took
+127.9 s; the final bounded-pool run takes 41.54 s and routes 88/212, versus the previously measured supplied
+baseline's 43.11 s. Exact saved-output connectivity is **0/18** affected pins before and after native
+refill; all 189 new tracks and four vias pass exact leave-one-out legality. A prior priority-instrumented
+200M Router run also reached only 0/18 while routing 100/212; it is not a success claim.
+The open limitation is global thin-channel traversal: the CM5 PWM witness can reach a legal local exterior
+while its narrow private channel has no usable full-width global-lattice continuation. No automatic
+off-lattice global router or global 10-µm fallback is introduced. Permanent real-Router synthetic consumers
+retain hard local tunnel/pocket geometry and demonstrate both direct narrow-target completion and a
+narrow-width lattice handoff to a target beyond the access radius (123 assertions); these are supplementary
+behavioural regressions, not substitutes for the honest stripped-CM5 result.
+
+StickHub's U1-courtyard via-disallow plus 15×15-mm track-keepout experiment retains **36/133**, two
+negotiated passes, three rips and 2,149,942 total work units at the 2M option (3.09 s; exactly 200,000
+access units), restoring the D65-only result rather than starving negotiation. KiCad 10.0.3
+`ZONE_FILLER.Fill` returned true and the refilled input/output boards were explicitly saved before DRC:
+StickHub has no error violations and zero `items_not_allowed`; CM5 adds no errors (the same two existing
+copper-edge and two courtyard-overlap errors remain), no clearance/short/thermal errors, and six isolated
+copper warnings on both sides. Native unconnected counts fall 128→93 for StickHub and 208→124 for CM5.
+The final 30-board quick tier uses `TM_ROUTE_ARGS="--work 1000000 --variants 1"` with default GPU/KB policy:
+**30/30 outputs are byte-identical** to fresh same-input runs of the supplied baseline, 43.3% clean,
+89.3% mean completion and zero boards with added DRC errors. Integrated CTest has 216 passes, three
+environment/data skips and two explicitly excluded KiCad-version parity cases; no executed failures.
 
 **Tried and dropped.** Routing connections that touch dense-package pins first (then shortest first) in the
 strict pass: logicbone 964 → 750, decelerator 479 → 431 (one variant, same budget) — the many short connections

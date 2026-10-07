@@ -13,6 +13,7 @@
 #include "route/escape_flow.hpp"
 #include "route/obstacles.hpp"
 #include "drc/copper.hpp"
+#include "drc/connectivity.hpp"
 
 using namespace tmk;
 using geom::Point;
@@ -93,6 +94,43 @@ void fill_rectangle(model::Board& b, int layer, Coord x0, Coord y0, Coord x1, Co
   b.zones.push_back(std::move(zone));
 }
 
+void track_keepout(model::Board& b, model::LayerMask layers, Coord x0, Coord y0, Coord x1, Coord y1) {
+  model::Zone zone;
+  zone.copper = layers;
+  zone.rule_area = true;
+  zone.keepout_tracks = true;
+  zone.keepout_vias = true;
+  zone.outline.push_back({{x0, y0}, {x1, y0}, {x1, y1}, {x0, y1}});
+  b.zones.push_back(std::move(zone));
+}
+
+// Equivalence compares a completed search domain, not two different enumeration costs.
+constexpr long equivalence_work = 50'000'000;
+
+void check_access_work(const route::AccessSearchResult& result, long budget = 0) {
+  CHECK(result.work >= 0);
+  CHECK(result.generation_work >= 0);
+  CHECK(result.neighbor_work >= 0);
+  CHECK(result.check_work >= 0);
+  CHECK(result.expansion_work >= 0);
+  CHECK(result.work == result.generation_work + result.neighbor_work + result.check_work + result.expansion_work);
+  if (budget > 0) CHECK(result.work <= budget);
+}
+
+void check_router_access_work(const route::RouteResult& result, long budget) {
+  CHECK(result.access_work >= 0);
+  CHECK(result.access_generation_work >= 0);
+  CHECK(result.access_neighbor_work >= 0);
+  CHECK(result.access_check_work >= 0);
+  CHECK(result.access_expansion_work >= 0);
+  CHECK(result.access_lattice_work >= 0);
+  CHECK(result.access_work == result.access_generation_work + result.access_neighbor_work +
+        result.access_check_work + result.access_expansion_work + result.access_lattice_work);
+  CHECK(result.access_work <= result.expansions);
+  CHECK(result.access_work <= budget / 10);
+  CHECK(result.expansions <= budget);
+}
+
 const route::PartEscape& dense_part(const std::vector<route::PartEscape>& parts) {
   const auto found = std::find_if(parts.begin(), parts.end(), [](const auto& part) { return part.footprint == 0; });
   REQUIRE(found != parts.end());
@@ -143,7 +181,7 @@ void check_access_witness(const model::Board& b, route::Obstacles& obs, int pad,
   for (const auto& via : path.vias) {
     CHECK(via.net == source.net);
     CHECK(obs.via_state_span(via.pos, via.size, via.drill, via.net, 0, false, nullptr,
-                             via.layer_top, via.layer_bottom) == 0);
+                             via.layer_top, via.layer_bottom, via.type) == 0);
     CHECK(((path.steps.empty() && via.pos == path.end) || std::any_of(path.steps.begin(), path.steps.end(), [&](const auto& step) {
       return step.a == via.pos || step.b == via.pos;
     })));
@@ -151,13 +189,14 @@ void check_access_witness(const model::Board& b, route::Obstacles& obs, int pad,
 }
 
 void check_same_access(const route::AccessSearchResult& indexed, const route::AccessSearchResult& reference) {
+  check_access_work(indexed);
+  check_access_work(reference);
   REQUIRE(indexed.candidates.size() == reference.candidates.size());
   for (std::size_t i = 0; i < indexed.candidates.size(); ++i) {
     CHECK(indexed.candidates[i].first == reference.candidates[i].first);
     CHECK(indexed.candidates[i].second == reference.candidates[i].second);
   }
   CHECK(indexed.exhausted == reference.exhausted);
-  CHECK(indexed.work == reference.work);
   REQUIRE(indexed.paths.size() == reference.paths.size());
   for (std::size_t i = 0; i < indexed.paths.size(); ++i) {
     const auto& a = indexed.paths[i];
@@ -345,7 +384,7 @@ TEST_CASE("escape analysis distinguishes immutable fills from refillable zones",
     fill_rectangle(b, layer, -400'000, 1'600'000, 1'600'000, 3'000'000);
   }
   route::EscapeAnalysisOptions options;
-  options.work_budget = 2'000'000;
+  options.work_budget = equivalence_work;
   options.routing.allow_vias = false;
   route::Obstacles hard(b, rules);
   const auto hard_parts = route::analyse_escapes(b, rules, hard, options);
@@ -378,14 +417,20 @@ TEST_CASE("escape analysis work exhaustion is unknown, never a dead-pin proof", 
   const auto rules = access_rules();
   route::Obstacles obs(b, rules);
   route::EscapeAnalysisOptions options;
-  options.work_budget = 1;
-  const auto parts = route::analyse_escapes(b, rules, obs, options);
-  const auto& part = dense_part(parts);
-  REQUIRE(part.results.size() == 1);
-  CHECK(part.results[0].status == "unknown");
-  CHECK_FALSE(part.results[0].reason.empty());
-  CHECK_FALSE(part.results[0].domain.empty());
-  CHECK(part.dead.empty());
+  for (bool reference : {false, true}) {
+    options.reference = reference;
+    for (long cap : {1L, 16L, 64L}) {
+      CAPTURE(reference, cap);
+      options.work_budget = cap;
+      const auto parts = route::analyse_escapes(b, rules, obs, options);
+      const auto& part = dense_part(parts);
+      REQUIRE(part.results.size() == 1);
+      CHECK(part.results[0].status == "unknown");
+      CHECK_FALSE(part.results[0].reason.empty());
+      CHECK_FALSE(part.results[0].domain.empty());
+      CHECK(part.dead.empty());
+    }
+  }
 }
 
 TEST_CASE("escape analysis seeds only real copper after package rotation and side changes", "[escape]") {
@@ -413,6 +458,7 @@ TEST_CASE("escape analysis seeds only real copper after package rotation and sid
   b.pads[0].size_y = 200'000;
   route::Obstacles obs(b, rules);
   route::EscapeAnalysisOptions options;
+  options.work_budget = equivalence_work;
   options.routing.allow_vias = false;
   const auto parts = route::analyse_escapes(b, rules, obs, options);
   const auto& part = dense_part(parts);
@@ -446,15 +492,17 @@ TEST_CASE("access graph seeds rotated and flipped pads on their real copper", "[
   for (std::size_t i = 1; i < b.pads.size(); ++i) b.pads[i].pos.x += 20'000'000;
   route::Obstacles obs(b, rules);
   route::AccessSearchOptions options;
+  options.work_budget = equivalence_work;
+  options.record_candidates = true;
   options.routing.allow_vias = false;
-  options.target = [centre = pad.pos](Point p, int) {
-    return std::llabs(p.x - centre.x) >= 600'000 || std::llabs(p.y - centre.y) >= 600'000;
+  options.target = [centre = pad.pos](Point p, int, const std::function<bool()>&) {
+    return std::llabs(p.x - centre.x) >= 600'000 || std::llabs(p.y - centre.y) >= 600'000 ? route::AccessGoal::Endpoint : route::AccessGoal::None;
   };
   const auto indexed = route::generate_access_paths(b, rules, obs, 0, options);
   REQUIRE_FALSE(indexed.paths.empty());
   for (const auto& path : indexed.paths) {
     check_access_witness(b, obs, 0, path);
-    CHECK(options.target(path.end, path.layer));
+    CHECK(options.target(path.end, path.layer, [] { return true; }) != route::AccessGoal::None);
   }
   options.reference = true;
   const auto reference = route::generate_access_paths(b, rules, obs, 0, options);
@@ -483,9 +531,10 @@ TEST_CASE("access graph finds a via pocket between global lattice sites", "[esca
   REQUIRE(obs.via_state(pocket, 450'000, 300'000, 1, 0, false) == 0);
   CHECK(obs.via_state({1'000'000, 1'000'000}, 450'000, 300'000, 1, 0, false) == 2);
   route::AccessSearchOptions options;
+  options.work_budget = equivalence_work;
   options.record_candidates = true;
   options.origin = {0, 0};
-  options.target = [](Point, int layer) { return layer == 1; };
+  options.target = [](Point, int layer, const std::function<bool()>&) { return layer == 1 ? route::AccessGoal::Endpoint : route::AccessGoal::None; };
   const auto indexed = route::generate_access_paths(b, rules, obs, 0, options);
   REQUIRE_FALSE(indexed.paths.empty());
   for (const auto& path : indexed.paths) {
@@ -513,6 +562,7 @@ TEST_CASE("access graph finds a via pocket between global lattice sites", "[esca
     REQUIRE(routed.routed == 1);
     REQUIRE(routed.access_connections == 1);
     REQUIRE_FALSE(routed.vias.empty());
+    check_router_access_work(routed, routing.work_budget);
     CHECK(std::any_of(routed.vias.begin(), routed.vias.end(), [&](const auto& v) {
       return v.pos.x % options.pitch != 0 || v.pos.y % options.pitch != 0;
     }));
@@ -521,6 +571,135 @@ TEST_CASE("access graph finds a via pocket between global lattice sites", "[esca
     for (const auto& v : routed.vias)
       CHECK(obs.via_state(v.pos, v.size, v.drill, v.net, 0, false) == 0);
   }
+}
+
+TEST_CASE("router carries off-grid via access through a narrow corridor to a real lattice exit",
+          "[escape][access][route][access-consumer]") {
+  auto b = access_board();
+  auto rules = access_rules(147'000, 10'000);
+  auto fine = rules.classes[0];
+  fine.name = "declared fine width";
+  fine.track_width = 127'000;
+  rules.classes.push_back(fine);
+  model::CustomRule through_only;
+  through_only.name = "access vias must retain their actual subtype";
+  through_only.condition = "A.Type == 'Via'";
+  model::Constraint via_constraint;
+  via_constraint.type = "disallow";
+  via_constraint.items = {"blind_via", "buried_via"};
+  through_only.constraints.push_back(via_constraint);
+  rules.custom.push_back(through_only);
+  const Point pocket{1'010'010, 1'005'010};
+  const Coord corridor_end = pocket.x + 2'400'000;
+  const Coord footprint_exit = pocket.x + 2'000'000;
+  auto source = b.pads[0];
+  source.pos = {pocket.x - 500'000, pocket.y};
+  source.size_x = source.size_y = 100'000;
+  auto terminal = b.pads.back();
+  terminal.pos = {pocket.x + 2'800'000, pocket.y};
+  terminal.size_x = terminal.size_y = 100'000;
+  terminal.copper = model::layer_bit(1);
+  // A same-plane package pad makes the required exit extend beyond the via pocket and narrow corridor.
+  // Unlike a disconnected dummy signal pin, it creates no additional routing obligation.
+  auto plane_pad = source;
+  plane_pad.number = "GND";
+  plane_pad.net = 2;
+  plane_pad.pos = {pocket.x + 1'500'000, pocket.y + 2'000'000};
+  b.pads = {source, terminal, plane_pad};
+  b.footprints[0].pads = {0, 2};
+  b.footprints[1].pads = {1};
+  bool requires_neck_endpoint = false;
+  SECTION("variable-width access exits into preferred-width free space") {}
+  SECTION("the only lattice endpoint needs a freshly generated neck-width access") {
+    requires_neck_endpoint = true;
+    b.pads[1].pos.x = pocket.x + 4'500'000;  // Beyond the four-millimetre graph, so a lattice hand-off is required.
+  }
+  const Coord left = pocket.x - 235'000, right = pocket.x + 235'000;
+  const Coord bottom = pocket.y - 235'000, top = pocket.y + 235'000;
+  // F.Cu is a closed 0.2 mm tunnel ending in a cavity that fits the legal via only off-grid.
+  fill_rectangle(b, 0, -4'000'000, -4'000'000, source.pos.x - 235'000, 6'000'000);
+  fill_rectangle(b, 0, source.pos.x - 235'000, pocket.y + 100'000, left, 6'000'000);
+  fill_rectangle(b, 0, source.pos.x - 235'000, -4'000'000, left, pocket.y - 100'000);
+  fill_rectangle(b, 0, left, top, 6'000'000, 6'000'000);
+  fill_rectangle(b, 0, left, -4'000'000, 6'000'000, bottom);
+  fill_rectangle(b, 0, right, bottom, 6'000'000, top);
+  // B.Cu has the same cavity, followed by a 0.16 mm corridor: 0.147 mm + 2*0.01 mm cannot fit,
+  // but the explicitly declared 0.127 mm width can. Keep every saved fill immutable.
+  fill_rectangle(b, 1, -4'000'000, -4'000'000, left, 6'000'000);
+  fill_rectangle(b, 1, left, -4'000'000, right, bottom);
+  fill_rectangle(b, 1, left, top, right, 6'000'000);
+  const Coord wall_end = requires_neck_endpoint ? 6'000'000 : corridor_end;
+  fill_rectangle(b, 1, right, -4'000'000, wall_end, pocket.y - 80'000);
+  fill_rectangle(b, 1, right, pocket.y + 80'000, wall_end, 6'000'000);
+  const auto original_zones = b.zones;
+  route::Obstacles obs(b, rules);
+  REQUIRE(obs.via_state(pocket, 450'000, 300'000, 1, 0, false) == 0);
+  REQUIRE(obs.via_state({1'000'000, 1'000'000}, 450'000, 300'000, 1, 0, false) == 2);
+  REQUIRE(obs.segment_state({right + 100'000, pocket.y}, {footprint_exit + 100'000, pocket.y},
+                            1, 147'000, 1, false) == 2);
+  REQUIRE(obs.segment_state({right + 100'000, pocket.y}, {footprint_exit + 100'000, pocket.y},
+                            1, 127'000, 1, false) == 0);
+  if (requires_neck_endpoint) {
+    REQUIRE(obs.disk_state({3'200'000, 1'000'000}, 1, 147'000 / 2, 1, 0, false) == 2);
+    REQUIRE(obs.disk_state({3'200'000, 1'000'000}, 1, 127'000 / 2, 1, 0, false) == 0);
+  }
+  route::RouterOptions options;
+  options.pitch = 40'000;
+  options.work_budget = 20'000'000;
+  options.time_limit_s = 600;
+  options.gpu_device = -1;
+  options.optimize = false;
+  options.soft_zones = false;
+  const auto result = route::Router(b, rules, options).run();
+  REQUIRE(result.connections == 1);
+  REQUIRE(result.routed == 1);
+  REQUIRE(result.access_connections == 1);
+  CHECK(result.narrowed_access == 1);
+  CHECK(result.failures.empty());
+  CHECK(result.unrouted.empty());
+  CHECK(result.rips == 0);
+  REQUIRE_FALSE(result.vias.empty());
+  CHECK(std::any_of(result.vias.begin(), result.vias.end(), [](const auto& via) {
+    return via.pos.x % 40'000 != 0 || via.pos.y % 40'000 != 0;
+  }));
+  CHECK(std::any_of(result.tracks.begin(), result.tracks.end(), [&](const auto& track) {
+    return track.layer == 1 && track.width < 147'000 && std::max(track.a.x, track.b.x) > footprint_exit;
+  }));
+  if (requires_neck_endpoint) CHECK(result.necked > 0);
+  check_router_access_work(result, options.work_budget);
+  for (const auto& track : result.tracks) {
+    CHECK(track.net == 1);
+    CHECK(track.width >= 127'000);
+    CHECK(obs.segment_state(track.a, track.b, track.layer, track.width, track.net, false) == 0);
+  }
+  for (const auto& via : result.vias) {
+    CHECK(via.net == 1);
+    CHECK(obs.via_state_span(via.pos, via.size, via.drill, via.net, 0, false, nullptr,
+                             via.layer_top, via.layer_bottom, via.type) == 0);
+  }
+  auto routed = b;
+  routed.tracks.insert(routed.tracks.end(), result.tracks.begin(), result.tracks.end());
+  routed.vias.insert(routed.vias.end(), result.vias.begin(), result.vias.end());
+  REQUIRE(routed.zones.size() == original_zones.size());
+  for (std::size_t i = 0; i < original_zones.size(); ++i)
+    CHECK(routed.zones[i].fills == original_zones[i].fills);
+  route::Obstacles committed(routed, rules);
+  const auto connected = drc::compute_connectivity(routed, committed.copper(), committed.grid());
+  int source_root = -1, terminal_root = -1;
+  for (std::size_t i = 0; i < committed.copper().items.size(); ++i) {
+    const auto& item = committed.copper().items[i];
+    if (item.kind != drc::ItemKind::Pad) continue;
+    if (item.index == 0) source_root = connected.root[i];
+    if (item.index == 1) terminal_root = connected.root[i];
+  }
+  REQUIRE(source_root >= 0);
+  REQUIRE(terminal_root >= 0);
+  CHECK(source_root == terminal_root);
+  // A reported success consisting only of the access prefix cannot satisfy the actual copper topology.
+  for (std::size_t i = 0; i < committed.copper().items.size(); ++i)
+    if (committed.copper().items[i].net == 1) CHECK(connected.root[i] == source_root);
+  CHECK(b.tracks.empty());
+  CHECK(b.vias.empty());
 }
 
 TEST_CASE("access widths use hard constraints, not the 0.147 mm class target as a floor", "[escape][access]") {
@@ -569,14 +748,18 @@ TEST_CASE("access widths use hard constraints, not the 0.147 mm class target as 
   CHECK((obs.segment_state({0, 0}, {1'000'000, 0}, 0, 140'000, 1, false) == 0) == narrowing_allowed);
   CHECK(obs.segment_state({0, 0}, {1'000'000, 0}, 0, 140'002, 1, false) == 2);
   route::AccessSearchOptions options;
+  options.work_budget = equivalence_work;
+  options.record_candidates = true;
   options.routing.allow_vias = false;
-  options.target = [](Point p, int layer) { return layer == 0 && p.x >= 1'000'000; };
+  options.target = [](Point p, int layer, const std::function<bool()>&) {
+    return layer == 0 && p.x >= 1'000'000 ? route::AccessGoal::Endpoint : route::AccessGoal::None;
+  };
   const auto indexed = route::generate_access_paths(b, rules, obs, 0, options);
   if (narrowing_allowed) {
     REQUIRE_FALSE(indexed.paths.empty());
     for (const auto& path : indexed.paths) {
       check_access_witness(b, obs, 0, path);
-      CHECK(options.target(path.end, path.layer));
+      CHECK(options.target(path.end, path.layer, [] { return true; }) != route::AccessGoal::None);
       // An odd integer width shares the same width/2 exact radius; the next radius (140002) is blocked.
       CHECK(std::any_of(path.steps.begin(), path.steps.end(), [](const auto& step) { return step.width <= 140'001; }));
     }
@@ -600,14 +783,18 @@ TEST_CASE("access graph retains multibend escapes beyond 0.8 mm and never rips l
   route::Obstacles obs(b, rules);
   CHECK(obs.segment_state({0, 0}, {2'000'000, 0}, 0, 150'000, 1, false) == 2);
   route::AccessSearchOptions options;
+  options.work_budget = equivalence_work;
+  options.record_candidates = true;
   options.radius = 4'000'000;
   options.routing.allow_vias = false;
-  options.target = [](Point p, int layer) { return layer == 0 && p.x >= 2'000'000 && std::llabs(p.y) < 200'000; };
+  options.target = [](Point p, int layer, const std::function<bool()>&) {
+    return layer == 0 && p.x >= 2'000'000 && std::llabs(p.y) < 200'000 ? route::AccessGoal::Endpoint : route::AccessGoal::None;
+  };
   const auto indexed = route::generate_access_paths(b, rules, obs, 0, options);
   REQUIRE_FALSE(indexed.paths.empty());
   for (const auto& path : indexed.paths) {
     check_access_witness(b, obs, 0, path);
-    CHECK(options.target(path.end, path.layer));
+    CHECK(options.target(path.end, path.layer, [] { return true; }) != route::AccessGoal::None);
     REQUIRE(path.steps.size() >= 3);
     bool below = false, above = false;
     for (const auto& step : path.steps) {
@@ -629,6 +816,282 @@ TEST_CASE("access graph retains multibend escapes beyond 0.8 mm and never rips l
     CHECK(b.tracks[i].net == original[i].net);
     CHECK(b.tracks[i].locked);
   }
+}
+
+TEST_CASE("access graph hard source keepouts reject before generating candidates", "[escape][access][budget]") {
+  auto b = access_board();
+  const auto rules = access_rules();
+  SECTION("single copper source layer") {}
+  SECTION("every copper source layer") {
+    b.pads[0].copper |= model::layer_bit(1);
+  }
+  track_keepout(b, model::layer_bit(0) | model::layer_bit(1),
+                -7'500'000, -7'500'000, 7'500'000, 7'500'000);
+  route::Obstacles obs(b, rules);
+  for (bool reference : {false, true}) {
+    for (bool allow_vias : {false, true}) {
+      CAPTURE(reference, allow_vias);
+      route::AccessSearchOptions options;
+      options.reference = reference;
+      options.routing.allow_vias = allow_vias;
+      options.record_candidates = true;
+      options.work_budget = 64;
+      const auto complete = route::generate_access_paths(b, rules, obs, 0, options);
+      REQUIRE(complete.exhausted);
+      CHECK(complete.paths.empty());
+      CHECK(complete.candidates.empty());
+      CHECK(complete.generation_work == 0);
+      CHECK(complete.neighbor_work == 0);
+      CHECK(complete.expansion_work == 0);
+      CHECK(complete.check_work > 0);
+      check_access_work(complete, options.work_budget);
+      REQUIRE(complete.work > 1);
+      // Even a cheap geometric proof must not claim exhaustion if its predicates were interrupted.
+      options.work_budget = complete.work - 1;
+      const auto interrupted = route::generate_access_paths(b, rules, obs, 0, options);
+      CHECK_FALSE(interrupted.exhausted);
+      CHECK(interrupted.paths.empty());
+      CHECK(interrupted.candidates.empty());
+      check_access_work(interrupted, options.work_budget);
+      options.work_budget = complete.work;
+      const auto exact_cap = route::generate_access_paths(b, rules, obs, 0, options);
+      CHECK(exact_cap.exhausted);
+      CHECK(exact_cap.work == complete.work);
+      check_access_work(exact_cap, options.work_budget);
+    }
+  }
+}
+
+TEST_CASE("access graph searches an uncovered source layer instead of declaring the pad dead", "[escape][access]") {
+  auto b = access_board();
+  const auto rules = access_rules();
+  b.pads[0].copper |= model::layer_bit(1);
+  for (std::size_t i = 1; i < b.pads.size(); ++i) b.pads[i].pos.x += 20'000'000;
+  track_keepout(b, model::layer_bit(0), -7'500'000, -7'500'000, 7'500'000, 7'500'000);
+  route::Obstacles obs(b, rules);
+  route::AccessSearchOptions options;
+  options.work_budget = equivalence_work;
+  options.record_candidates = true;
+  options.routing.allow_vias = false;
+  options.target = [](Point p, int layer, const std::function<bool()>&) {
+    return layer == 1 && p.x >= 600'000 ? route::AccessGoal::Endpoint : route::AccessGoal::None;
+  };
+  const auto indexed = route::generate_access_paths(b, rules, obs, 0, options);
+  REQUIRE_FALSE(indexed.paths.empty());
+  CHECK(indexed.generation_work > 0);
+  for (const auto& path : indexed.paths) {
+    check_access_witness(b, obs, 0, path);
+    CHECK(options.target(path.end, path.layer, [] { return true; }) != route::AccessGoal::None);
+    CHECK(path.vias.empty());
+    for (const auto& step : path.steps) CHECK(step.layer == 1);
+  }
+  options.reference = true;
+  check_same_access(indexed, route::generate_access_paths(b, rules, obs, 0, options));
+}
+
+TEST_CASE("access graph permits an exact source via through a track-forbidden pad layer", "[escape][access]") {
+  auto b = access_board();
+  auto rules = access_rules();
+  for (std::size_t i = 1; i < b.pads.size(); ++i) b.pads[i].pos.x += 20'000'000;
+  SECTION("a saved rule area forbids tracks but permits vias") {
+    track_keepout(b, model::layer_bit(0), -7'500'000, -7'500'000, 7'500'000, 7'500'000);
+    b.zones.back().keepout_vias = false;
+  }
+  SECTION("a static custom rule forbids tracks but permits vias") {
+    model::CustomRule rule;
+    rule.name = "source layer tracks forbidden";
+    rule.layer = "F.Cu";
+    model::Constraint constraint;
+    constraint.type = "disallow";
+    constraint.items = {"track"};
+    rule.constraints.push_back(constraint);
+    rules.custom.push_back(rule);
+  }
+  SECTION("only a legal blind source via can bypass the forbidden layer") {
+    b.layers = {{0, "F.Cu", "F.Cu", "signal", "", 0},
+                {1, "In1.Cu", "In1.Cu", "signal", "", 1},
+                {2, "In2.Cu", "In2.Cu", "signal", "", 2},
+                {31, "B.Cu", "B.Cu", "signal", "", 3}};
+    b.copper = {0, 1, 2, 3};
+    rules.minimums.allow_blind_buried_vias = true;
+    track_keepout(b, model::layer_bit(0), -7'500'000, -7'500'000, 7'500'000, 7'500'000);
+    b.zones.back().keepout_vias = false;
+    track_keepout(b, model::layer_bit(3), -7'500'000, -7'500'000, 7'500'000, 7'500'000);
+  }
+  route::Obstacles obs(b, rules);
+  REQUIRE(obs.segment_state(b.pads[0].pos, {600'000, 0}, 0, 150'000, 1, false) == 2);
+  if (b.copper_count() == 2) {
+    REQUIRE(obs.via_state(b.pads[0].pos, 450'000, 300'000, 1, 0, false) == 0);
+  } else {
+    REQUIRE(obs.via_state(b.pads[0].pos, 450'000, 300'000, 1, 0, false) == 2);
+    REQUIRE(obs.via_state_span(b.pads[0].pos, 450'000, 300'000, 1, 0, false, nullptr, 0, 1) == 0);
+  }
+  route::AccessSearchOptions options;
+  options.work_budget = equivalence_work;
+  options.record_candidates = true;
+  options.target = [](Point p, int layer, const std::function<bool()>&) {
+    return layer == 1 && p.x >= 600'000 ? route::AccessGoal::Endpoint : route::AccessGoal::None;
+  };
+  for (int mode : {0, 1, 2}) {
+    if (mode == 2 && !rules.minimums.allow_blind_buried_vias) continue;
+    CAPTURE(mode);
+    options.routing.allow_vias = mode == 1;
+    options.routing.blind_vias = mode > 0 && rules.minimums.allow_blind_buried_vias;
+    options.reference = false;
+    const auto indexed = route::generate_access_paths(b, rules, obs, 0, options);
+    if (mode > 0) {
+      REQUIRE_FALSE(indexed.paths.empty());
+      for (const auto& path : indexed.paths) {
+        check_access_witness(b, obs, 0, path);
+        REQUIRE_FALSE(path.vias.empty());
+        CHECK(path.vias.front().pos == b.pads[0].pos);
+        if (b.copper_count() > 2) CHECK(path.vias.front().type == model::ViaType::Blind);
+        for (const auto& step : path.steps) CHECK(step.layer == 1);
+        CHECK(options.target(path.end, path.layer, [] { return true; }) != route::AccessGoal::None);
+      }
+    } else {
+      CHECK(indexed.exhausted);
+      CHECK(indexed.paths.empty());
+      CHECK(indexed.candidates.empty());
+      CHECK(indexed.work <= 64);
+    }
+    options.reference = true;
+    check_same_access(indexed, route::generate_access_paths(b, rules, obs, 0, options));
+  }
+}
+
+TEST_CASE("access graph source rejection uses exact keepout geometry, not its bounding box", "[escape][access]") {
+  auto b = access_board();
+  const auto rules = access_rules();
+  for (std::size_t i = 1; i < b.pads.size(); ++i) b.pads[i].pos.x += 20'000'000;
+  track_keepout(b, model::layer_bit(0), -1'000'000, -1'000'000, 1'000'000, 1'000'000);
+  // The origin is inside the triangle's bounding box but outside its actual copper prohibition.
+  b.zones.back().outline.front() = {{-1'000'000, 1'000'000}, {1'000'000, 1'000'000}, {1'000'000, -200'000}};
+  route::Obstacles obs(b, rules);
+  REQUIRE(obs.segment_state({0, 0}, {-600'000, 0}, 0, 150'000, 1, false) == 0);
+  route::AccessSearchOptions options;
+  options.work_budget = equivalence_work;
+  options.record_candidates = true;
+  options.routing.allow_vias = false;
+  options.target = [](Point p, int layer, const std::function<bool()>&) {
+    return layer == 0 && p.x <= -600'000 ? route::AccessGoal::Endpoint : route::AccessGoal::None;
+  };
+  const auto indexed = route::generate_access_paths(b, rules, obs, 0, options);
+  REQUIRE_FALSE(indexed.paths.empty());
+  for (const auto& path : indexed.paths) check_access_witness(b, obs, 0, path);
+  options.reference = true;
+  check_same_access(indexed, route::generate_access_paths(b, rules, obs, 0, options));
+}
+
+TEST_CASE("access graph caps generation, neighbors, predicates and expansion without a false proof", "[escape][access][budget]") {
+  auto b = access_board();
+  const auto rules = access_rules();
+  for (std::size_t i = 1; i < b.pads.size(); ++i) b.pads[i].pos.x += 20'000'000;
+  route::Obstacles obs(b, rules);
+  route::AccessSearchOptions options;
+  options.radius = 600'000;
+  options.routing.allow_vias = false;
+  options.record_candidates = true;
+  options.target = [](Point, int, const std::function<bool()>&) { return route::AccessGoal::None; };  // exhaust the finite domain, not the max-path limit
+  route::AccessSearchResult indexed;
+  for (bool reference : {false, true}) {
+    CAPTURE(reference);
+    options.reference = reference;
+    options.work_budget = equivalence_work;
+    const auto complete = route::generate_access_paths(b, rules, obs, 0, options);
+    REQUIRE(complete.exhausted);
+    CHECK(complete.paths.empty());
+    REQUIRE_FALSE(complete.candidates.empty());
+    // Lower bounds count known ray/pad generation and one rule/exact predicate per candidate layer;
+    // counter self-consistency alone would miss work silently omitted from every counter.
+    CHECK(complete.generation_work >= 8 * (options.radius / 100'000) + static_cast<long>(b.pads.size()));
+    CHECK(complete.neighbor_work >= static_cast<long>(complete.candidates.size()));
+    CHECK(complete.check_work >= static_cast<long>(complete.candidates.size()) * b.copper_count());
+    CHECK(complete.expansion_work > 0);
+    check_access_work(complete, options.work_budget);
+    REQUIRE(complete.work > 64);
+    if (reference) check_same_access(indexed, complete);
+    else indexed = complete;
+    for (long cap : {1L, 2L, 16L, 64L, complete.work - 1}) {
+      CAPTURE(cap);
+      options.work_budget = cap;
+      const auto limited = route::generate_access_paths(b, rules, obs, 0, options);
+      CHECK_FALSE(limited.exhausted);
+      CHECK(limited.paths.empty());
+      CHECK(limited.work == cap);
+      check_access_work(limited, cap);
+      if (cap <= 16) CHECK(limited.candidates.empty());
+    }
+    options.work_budget = complete.work;
+    const auto exact_cap = route::generate_access_paths(b, rules, obs, 0, options);
+    REQUIRE(exact_cap.exhausted);
+    check_access_work(exact_cap, options.work_budget);
+    check_same_access(complete, exact_cap);
+  }
+}
+
+TEST_CASE("router access preparation cannot starve an unrelated route behind hard-boxed pads", "[escape][access][budget][route]") {
+  auto b = access_board();
+  const auto rules = access_rules();
+  route::RouterOptions options;
+  // Nine impossible dense-package obligations are deliberately scheduled before the ordinary connection.
+  for (std::size_t i = 0; i < 9; ++i) {
+    b.pads[i].net = static_cast<model::NetId>(i + 1);
+    auto terminal = b.pads[i];
+    terminal.footprint = 1;
+    terminal.pos = {10'000'000, static_cast<Coord>(i) * 600'000};
+    if (i == 0) b.pads[9] = terminal;
+    else {
+      b.footprints[1].pads.push_back(static_cast<int>(b.pads.size()));
+      b.pads.push_back(terminal);
+    }
+    options.priority.emplace_back("U1." + terminal.number, "J1." + terminal.number);
+  }
+  model::Net free_net;
+  free_net.id = static_cast<model::NetId>(b.nets.size());
+  free_net.name = "unrelated";
+  b.nets.push_back(free_net);
+  b.footprints.push_back({});
+  b.footprints.back().reference = "J2";
+  for (int i = 0; i < 2; ++i) {
+    auto pad = b.pads[0];
+    pad.footprint = 2;
+    pad.net = free_net.id;
+    pad.number = std::to_string(i + 1);
+    pad.pos = {static_cast<Coord>(i) * 2'000'000, 10'000'000};
+    b.footprints.back().pads.push_back(static_cast<int>(b.pads.size()));
+    b.pads.push_back(pad);
+  }
+  track_keepout(b, model::layer_bit(0) | model::layer_bit(1),
+                -7'500'000, -7'500'000, 7'500'000, 7'500'000);
+  route::Obstacles obs(b, rules);
+  options.work_budget = 50'000;
+  options.pitch = 100'000;
+  options.max_expansions = 1'000;
+  options.max_attempts = 1;
+  options.max_passes = 2;
+  options.max_restarts = 0;
+  options.allow_vias = false;
+  options.rip_up = false;
+  options.optimize = false;
+  options.gpu_device = -1;
+  options.time_limit_s = 600;
+  const auto result = route::Router(b, rules, options).run();
+  REQUIRE(result.connections == 10);
+  REQUIRE(result.routed == 1);
+  REQUIRE_FALSE(result.tracks.empty());
+  CHECK(result.vias.empty());
+  CHECK(result.access_work > 0);
+  CHECK(result.access_lattice_work > 0);
+  check_router_access_work(result, options.work_budget);
+  for (const auto& track : result.tracks) {
+    CHECK(track.net == free_net.id);
+    CHECK(obs.segment_state(track.a, track.b, track.layer, track.width, track.net, false) == 0);
+  }
+  REQUIRE(result.unrouted.size() == 9);
+  for (const auto& pending : result.unrouted) CHECK(pending.net != free_net.name);
+  CHECK(b.tracks.empty());
+  CHECK(b.vias.empty());
 }
 
 // ---- Escape planning v2: min-cost-flow channel and layer assignment (route/escape_flow.hpp) ----
@@ -766,4 +1229,27 @@ TEST_CASE("escape flow: shallow packages are planned exactly as version 1", "[es
   const auto rings = route::array_rings(deep, all);
   CHECK(rings[0] == 1);
   CHECK(rings[static_cast<std::size_t>(3 * 7 + 3)] == 4);
+}
+
+TEST_CASE("blind-only access does not fabricate a full-stack through via", "[escape][access][via]") {
+  auto b = access_board();
+  auto rules = access_rules();
+  b.layers = {{0, "F.Cu", "F.Cu", "signal", "", 0}, {1, "In1.Cu", "In1.Cu", "signal", "", 1},
+              {2, "In2.Cu", "In2.Cu", "signal", "", 2}, {31, "B.Cu", "B.Cu", "signal", "", 3}};
+  b.copper = {0, 1, 2, 3};
+  rules.minimums.allow_blind_buried_vias = true;
+  track_keepout(b, model::layer_bit(0) | model::layer_bit(1) | model::layer_bit(2),
+                -7'500'000, -7'500'000, 7'500'000, 7'500'000);
+  b.zones.back().keepout_vias = false;
+  route::Obstacles obs(b, rules);
+  route::AccessSearchOptions options;
+  options.routing.allow_vias = false;
+  options.routing.blind_vias = true;
+  for (bool reference : {false, true}) {
+    options.reference = reference;
+    const auto result = route::generate_access_paths(b, rules, obs, 0, options);
+    CHECK(result.paths.empty());
+    CHECK(result.exhausted);
+    check_access_work(result, options.work_budget);
+  }
 }

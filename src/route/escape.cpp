@@ -401,7 +401,9 @@ std::vector<PartEscape> analyse_escapes(const model::Board& b, const model::Desi
         ao.reference = o.reference;
         ao.max_paths = 1;
         ao.work_budget = o.work_budget;
-        ao.target = [&](Point point, int) { return outside(point); };
+        ao.target = [&](Point point, int, const std::function<bool()>&) {
+          return outside(point) ? AccessGoal::Endpoint : AccessGoal::None;
+        };
         auto access = generate_access_paths(b, r, obs, pi, ao);
         if (!access.paths.empty()) {
           pin.status = "witness";

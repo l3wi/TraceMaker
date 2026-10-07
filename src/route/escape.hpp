@@ -74,12 +74,14 @@ struct AccessStep {
   int layer = -1;
   Coord width = 0;
 };
+enum class AccessGoal { None, Endpoint, Connected };
 struct AccessPath {
   std::vector<AccessStep> steps;
   std::vector<model::Via> vias;
   int layer = -1;
   Point end;
   std::int64_t cost = 0;
+  bool target_connected = false;
 };
 struct AccessSearchOptions {
   Point origin;
@@ -87,17 +89,23 @@ struct AccessSearchOptions {
   Coord radius = 4'000'000;
   Coord width = 0;
   int max_paths = 16;
-  long work_budget = 500'000;
+  long work_budget = 5'000'000;
   bool reference = false;
   bool record_candidates = false;  // reference-equivalence diagnostics; no production storage
+  bool lattice_target = false;  // Custom endpoint goals may also accept an exact-checked lattice join.
   RouterOptions routing;
-  std::function<bool(Point, int)> target;
+  // Exact target probes must spend before each query; refusal leaves the finite domain incomplete.
+  std::function<AccessGoal(Point, int, const std::function<bool()>&)> target;
 };
 struct AccessSearchResult {
   std::vector<AccessPath> paths;
   bool exhausted = false;
   long work = 0;
   std::vector<std::pair<Point, model::LayerMask>> candidates;
+  long generation_work = 0;
+  long neighbor_work = 0;
+  long check_work = 0;
+  long expansion_work = 0;
 };
 // A zero board floor uses the narrowest positive designer-declared class width, not an algorithmic size.
 Coord access_width_floor(const model::DesignRules& rules);
@@ -127,7 +135,7 @@ struct EscapeAnalysisOptions {
   Coord window = 1'500'000;      // search area around the package
   RouterOptions routing;
   bool reference = false;
-  long work_budget = 500'000;
+  long work_budget = 5'000'000;
 };
 std::vector<PartEscape> analyse_escapes(const model::Board& b, const model::DesignRules& r, Obstacles& obs,
                                         const EscapeAnalysisOptions& o = {}, const EscapeOptions& eo = {});
