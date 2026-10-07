@@ -255,7 +255,10 @@ class width and the hand-drawn 0.14 mm (13 boxed in, 5 unattempted, 0/212 overal
 budget) at either width, 179/222 (0.14 mm) or 174/222 (0.147 mm) overall in 65 s, no errors beyond the
 hand layout's two copper-edge errors. The local access graph did no generation work in those runs: the
 plain router found the paths. Without the priority order, 9 of the 18 were never attempted at 30M. The
-"thin channel" seen earlier is the void left in the retained fills, not a lattice limit. Separately,
+"thin channel" seen earlier is the void left in the retained fills, not a lattice limit. Under soft zones the
+18 are not shown to be hard: of the connections left open at 30M, 41/43 (priority) and 44/48 (default order)
+were never attempted; only PWM (search budget, priority run), HDMI_PI.SDA to Module302.199 (boxed in at
+target, both runs, not one of the 18) and two plane connections failed an attempt. Separately,
 `--diff-pairs` with hard fills spent 1,048 s wall time on 130,247 counted expansions (2/212 routed): pair
 search work is not fully charged to the work budget (rule 5), an open defect. Artifacts:
 `/tmp/tmk-merge/cm5/fair-*`.

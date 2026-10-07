@@ -58,9 +58,9 @@ provisional until refill and plane/thermal sign-off. An individual witness does 
 lattice can continue through a thin channel, that its other terminal is reached, or that all pins route.
 
 **After deleting routing, the old zone fills are traps.** Their voids hug the removed tracks, so under hard
-zones only the old geometry fits. Route stripped boards with `--soft-zones` (or refill first). On CM5 this
-was the difference between 0/18 and 17/18 of its hardest connector pins; track width (0.147 vs 0.14 mm) made
-no difference.
+zones only the old geometry fits. Route stripped boards with `--soft-zones` (or refill first). On CM5, 18
+connector pins that hard-fill analysis called dead connected 17/18 with soft zones; track width (0.147 vs
+0.14 mm) made no difference.
 
 **Position/footprint `disallow track/via` rules are enforced before insertion**, including final track
 segments and actual via types/spans. Area, courtyard, coordinate and item-dimension predicates use the
