@@ -121,6 +121,8 @@ struct RouteResult {
   int enclosed = 0;             // searches that proved the source boxed in (no larger window tried)
   long nogood_skips = 0;        // attempts skipped because an identical attempt already failed
   int necked = 0;               // connections routed at the neck-down width
+  int access_connections = 0;   // committed off-lattice geometry accesses
+  int narrowed_access = 0;      // those with local tracks narrower than their class target
   int restarts = 0;
   int optimized = 0;
   int pairs = 0;

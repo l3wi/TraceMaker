@@ -483,7 +483,15 @@
      "done": true
     },
     {
-     "text": "Escape feasibility analysis: tracemaker escape, dead pins with reasons and hints; benchmark dead_pins / clean_pass_feasible",
+     "text": "Connectivity-aware escape analysis with exact witnesses and satisfied/exhausted/unknown statuses; benchmark diagnostics remain supplementary (D66)",
+     "done": true
+    },
+    {
+     "text": "Shared off-grid multibend access graph with legal width selection, exact via spans and router commit integration (D66)",
+     "done": true
+    },
+    {
+     "text": "Permanent synthetic escape legality/reference tests and CLI/preflight contracts added; execution and CM5/quick/KiCad gates pending integration",
      "done": true
     },
     {
@@ -491,7 +499,7 @@
      "done": true
     },
     {
-     "text": "Dead pins: not retried after a negotiated neck-down check",
+     "text": "Configured search-domain failures suppressed after negotiated escape escalation, never physical-impossibility proofs (D66)",
      "done": true
     },
     {

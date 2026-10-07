@@ -18,6 +18,7 @@
 
 #include "model/board.hpp"
 #include "model/rules.hpp"
+#include "route/router.hpp"
 
 namespace tmk::route {
 
@@ -66,12 +67,47 @@ std::vector<EscapeCorridor> plan_escapes(const model::Board& b, const std::vecto
 
 class Obstacles;
 
-// Escape feasibility (M9 analysis): can each pin of a dense package leave it at all under the board's rules?
-// A breadth-first search from the pad over a lattice of the package area, against fixed copper only (nothing
-// routed), at the narrowest legal width (the router's neck-down width), changing layers wherever that net's
-// via passes every fixed check. A pin escapes when it reaches `margin` outside the box of the package's pad
-// centres. On a lattice, so "dead" means "no escape on this lattice": an off-lattice path can exist in rare
-// cases; the router keeps trying those pins.
+// Positive results carry exact-checked copper. Negative results describe a finite search domain, never
+// physical impossibility. The router consumes the same local access graph on its escape escalation rung.
+struct AccessStep {
+  Point a, b;
+  int layer = -1;
+  Coord width = 0;
+};
+struct AccessPath {
+  std::vector<AccessStep> steps;
+  std::vector<model::Via> vias;
+  int layer = -1;
+  Point end;
+  std::int64_t cost = 0;
+};
+struct AccessSearchOptions {
+  Point origin;
+  Coord pitch = 40'000;
+  Coord radius = 4'000'000;
+  Coord width = 0;
+  int max_paths = 16;
+  long work_budget = 500'000;
+  bool reference = false;
+  bool record_candidates = false;  // reference-equivalence diagnostics; no production storage
+  RouterOptions routing;
+  std::function<bool(Point, int)> target;
+};
+struct AccessSearchResult {
+  std::vector<AccessPath> paths;
+  bool exhausted = false;
+  long work = 0;
+  std::vector<std::pair<Point, model::LayerMask>> candidates;
+};
+// A zero board floor uses the narrowest positive designer-declared class width, not an algorithmic size.
+Coord access_width_floor(const model::DesignRules& rules);
+AccessSearchResult generate_access_paths(const model::Board& b, const model::DesignRules& rules, Obstacles& obs,
+                                        int pad, const AccessSearchOptions& options = {});
+struct PinEscape {
+  int pad = -1;
+  std::string status, reason, domain;
+  AccessPath witness;
+};
 struct DeadPin {
   int pad = -1;
   std::string reason;
@@ -82,12 +118,16 @@ struct PartEscape {
   Coord pitch = 0;
   int pins = 0, escapable = 0;
   std::vector<DeadPin> dead;
+  std::vector<PinEscape> results;
   std::string hint;              // what would make the dead pins escapable, when it can be told
 };
 struct EscapeAnalysisOptions {
   Coord lattice = 40'000;        // search pitch
   Coord margin = 500'000;        // how far outside the package a pin must get
   Coord window = 1'500'000;      // search area around the package
+  RouterOptions routing;
+  bool reference = false;
+  long work_budget = 500'000;
 };
 std::vector<PartEscape> analyse_escapes(const model::Board& b, const model::DesignRules& r, Obstacles& obs,
                                         const EscapeAnalysisOptions& o = {}, const EscapeOptions& eo = {});

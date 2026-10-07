@@ -16,6 +16,7 @@
 #include "core/rng.hpp"
 #include "crules/engine.hpp"
 #include "drc/drc.hpp"
+#include "drc/rule_engine.hpp"
 #include "io/kicad/project_reader.hpp"
 #include "route/router.hpp"
 #include "learn/knowledge_base.hpp"
@@ -266,19 +267,58 @@ int cmd_pairs(const std::string& path, const std::vector<std::string>& extra, co
   return 0;
 }
 
-int cmd_escape(const std::string& path, const std::string& json_path, bool flow) {
+int cmd_escape(const std::string& path, const std::string& json_path, bool flow, tmk::app::RouteJob job,
+               tmk::route::EscapeAnalysisOptions options) {
   auto lb = tmk::io::read_board_file(path);
-  const auto rules = tmk::io::read_design_rules(path);
-  tmk::model::Board b = lb.board;
-  tmk::route::Obstacles obs(b, rules);
-  const auto parts = tmk::route::analyse_escapes(b, rules, obs);
+  const auto project_rules = tmk::io::read_design_rules(path);
+  job.opt = options.routing;
+  std::vector<std::string> preparation_warnings;
+  job.log = [&](const std::string& line) {
+    std::printf("%s\n", line.c_str());
+    if (line.find("warning:") != std::string::npos) preparation_warnings.push_back(line);
+  };
+  auto domain = tmk::app::prepare_route_domain(lb.board, project_rules, job);
+  auto& b = domain.board(lb.board);
+  const auto& rules = domain.rules(project_rules);
+  options.routing = job.opt;
+  tmk::route::Obstacles obs(b, rules, options.routing.soft_zones);
+  std::vector<std::string> warnings = rules.warnings;
+  warnings.insert(warnings.end(), b.warnings.begin(), b.warnings.end());
+  warnings.insert(warnings.end(), obs.rules().warnings().begin(), obs.rules().warnings().end());
+  for (const auto& warning : warnings) std::printf("warning: %s\n", warning.c_str());
+  warnings.insert(warnings.end(), preparation_warnings.begin(), preparation_warnings.end());
+  const auto parts = tmk::route::analyse_escapes(b, rules, obs, options);
   nlohmann::json j = nlohmann::json::array();
+  std::map<std::string, int> counts{{"satisfied", 0}, {"witness", 0}, {"exhausted", 0}, {"unknown", 0}};
   int dead = 0, pins = 0;
   for (const auto& pe : parts) {
     pins += pe.pins;
     dead += static_cast<int>(pe.dead.size());
-    std::printf("%-10s pitch %.3f mm: %d of %d pins escape%s%s\n", pe.ref.c_str(), tmk::nm_to_mm(pe.pitch), pe.escapable, pe.pins,
-                pe.dead.empty() ? "" : "; dead:", pe.dead.empty() ? "" : "");
+    std::map<std::string, int> part_counts{{"satisfied", 0}, {"witness", 0}, {"exhausted", 0}, {"unknown", 0}};
+    nlohmann::json results = nlohmann::json::array();
+    for (const auto& pin : pe.results) {
+      ++counts[pin.status];
+      ++part_counts[pin.status];
+      const auto& pad = b.pads[static_cast<std::size_t>(pin.pad)];
+      nlohmann::json steps = nlohmann::json::array(), vias = nlohmann::json::array();
+      for (const auto& step : pin.witness.steps)
+        steps.push_back({{"a", {step.a.x, step.a.y}}, {"b", {step.b.x, step.b.y}},
+                         {"layer", step.layer}, {"width", step.width}});
+      for (const auto& via : pin.witness.vias)
+        vias.push_back({{"position", {via.pos.x, via.pos.y}}, {"diameter", via.size}, {"drill", via.drill},
+                        {"top", via.layer_top}, {"bottom", via.layer_bottom}, {"type", static_cast<int>(via.type)}});
+      results.push_back({{"pad", pin.pad}, {"pin", pad.number}, {"status", pin.status},
+                         {"reason", pin.reason}, {"domain", pin.domain},
+                         {"witness", {{"units", "nm"}, {"steps", std::move(steps)}, {"vias", std::move(vias)},
+                                      {"layer", pin.witness.layer}, {"end", {pin.witness.end.x, pin.witness.end.y}},
+                                      {"cost", pin.witness.cost}}}});
+      if (pin.status == "exhausted" || pin.status == "unknown")
+        std::printf("    pin %s: %s: %s; domain: %s\n", pad.number.c_str(), pin.status.c_str(),
+                    pin.reason.c_str(), pin.domain.c_str());
+    }
+    std::printf("%-10s pitch %.3f mm: %d satisfied, %d exact witnesses, %d domain exhausted, %d unknown (%d checked)\n",
+                pe.ref.c_str(), tmk::nm_to_mm(pe.pitch), part_counts["satisfied"], part_counts["witness"],
+                part_counts["exhausted"], part_counts["unknown"], pe.pins);
     std::map<std::string, std::vector<std::string>> by_reason;
     for (const auto& d : pe.dead) by_reason[d.reason].push_back(b.pads[static_cast<std::size_t>(d.pad)].number);
     nlohmann::json jd = nlohmann::json::array();
@@ -290,9 +330,11 @@ int cmd_escape(const std::string& path, const std::string& json_path, bool flow)
       jd.push_back({{"reason", why}, {"pins", nums}});
     }
     if (!pe.hint.empty()) std::printf("    hint: %s\n", pe.hint.c_str());
-    j.push_back({{"ref", pe.ref}, {"pitch_mm", tmk::nm_to_mm(pe.pitch)}, {"pins", pe.pins}, {"escapable", pe.escapable}, {"dead", jd}, {"hint", pe.hint}});
+    j.push_back({{"ref", pe.ref}, {"pitch_mm", tmk::nm_to_mm(pe.pitch)}, {"pins", pe.pins}, {"escapable", pe.escapable},
+                 {"dead", std::move(jd)}, {"hint", pe.hint}, {"results", std::move(results)}, {"statuses", part_counts}});
   }
-  std::printf("%zu dense packages, %d pins to route, %d cannot escape\n", parts.size(), pins, dead);
+  std::printf("%zu dense packages, %d pins checked: %d satisfied, %d exact witnesses, %d domain exhausted, %d unknown\n",
+              parts.size(), pins, counts["satisfied"], counts["witness"], counts["exhausted"], counts["unknown"]);
   nlohmann::json jf;
   if (flow) {
     // Escape plan v2 at the net classes' rules (the router's strict-pass width, clearance and class via).
@@ -301,6 +343,9 @@ int cmd_escape(const std::string& path, const std::string& json_path, bool flow)
       if (p.net > 0) ++on_net[p.net];
     std::vector<char> needs(b.pads.size(), 0);
     for (std::size_t i = 0; i < b.pads.size(); ++i) needs[i] = b.pads[i].net > 0 && on_net[b.pads[i].net] > 1;
+    for (const auto& part : parts)
+      for (const auto& pin : part.results)
+        if (pin.status == "satisfied") needs[static_cast<std::size_t>(pin.pad)] = 0;
     auto nc = [&](tmk::model::NetId n) -> const tmk::model::NetClass& { return rules.class_for(b.nets[static_cast<std::size_t>(n)].name); };
     auto width = [&](tmk::model::NetId n) { return std::max(nc(n).track_width, rules.minimums.track_width); };
     auto via_d = [&](tmk::model::NetId n) {
@@ -314,8 +359,12 @@ int cmd_escape(const std::string& path, const std::string& json_path, bool flow)
     in.clearance = [&](tmk::model::NetId n) { return std::max(nc(n).clearance, rules.minimums.clearance); };
     in.via = via_d;
     in.keep = [&](tmk::model::NetId n) { return width(n) + std::max(nc(n).clearance, rules.minimums.clearance); };
-    in.track_free = [&](int l, tmk::geom::Point p, tmk::model::NetId n) { return ok(obs.fixed_code(p, l, width(n) / 2, 0, n), n); };
-    in.via_free = [&](tmk::geom::Point p, tmk::model::NetId n) { return ok(obs.fixed_via_code(p, via_d(n), via_drill(n), 0, n), n); };
+    in.track_free = [&](int l, tmk::geom::Point p, tmk::model::NetId n) {
+      return obs.rules().track_allowed(n, l) && ok(obs.fixed_code(p, l, width(n) / 2, 0, n), n);
+    };
+    in.via_free = [&](tmk::geom::Point p, tmk::model::NetId n) {
+      return obs.rules().via_allowed(n) && ok(obs.fixed_via_code(p, via_d(n), via_drill(n), 0, n), n);
+    };
     in.layers = b.copper_count();
     tmk::route::FlowEscapeStats fs;
     tmk::route::plan_escapes_flow(b, needs, in, {}, &fs);
@@ -332,7 +381,13 @@ int cmd_escape(const std::string& path, const std::string& json_path, bool flow)
     std::printf("\n");
   }
   if (!json_path.empty()) {
-    nlohmann::json out{{"board", path}, {"parts", j}, {"pins", pins}, {"dead", dead}};
+    nlohmann::json out{{"board", path}, {"parts", j}, {"pins", pins}, {"dead", dead}, {"statuses", counts},
+                       {"warnings", warnings},
+                       {"configuration", {{"soft_zones", options.routing.soft_zones}, {"blind_vias", options.routing.blind_vias},
+                                           {"keep_vias_off_pads_mm", tmk::nm_to_mm(options.routing.keep_vias_off_pads)},
+                                           {"component_rules", job.component_rules}, {"rules_override", job.rules_override},
+                                           {"pitch_um", options.routing.pitch / 1000.0}, {"reference", options.reference},
+                                           {"work_budget", options.work_budget}}}};
     if (flow) out["flow"] = jf;
     std::ofstream(json_path) << out.dump(1) << "\n";
   }
@@ -506,10 +561,25 @@ int main(int argc, char** argv) {
   std::string r_items;
   route->add_option("--emit-items", r_items, "Write the new tracks and vias as JSON (for the KiCad plugin)");
 
-  auto* esc = app.add_subcommand("escape", "Escape feasibility of dense packages: pins that cannot leave their package under the board's rules");
+  auto* esc = app.add_subcommand("escape", "Dense-package access: satisfied pins, exact witnesses, exhausted router domains and unknowns");
   std::string esc_board, esc_json;
+  tmk::app::RouteJob esc_job;
+  tmk::route::EscapeAnalysisOptions esc_options;
+  double esc_pitch_um = 0, esc_keep_vias_off_pads_mm = 2;
   esc->add_option("board", esc_board)->required()->check(CLI::ExistingFile);
-  esc->add_option("--json", esc_json, "Write the analysis as JSON");
+  esc->add_option("--json", esc_json, "Write statuses, exact witnesses and search domains as JSON");
+  esc->add_flag("--soft-zones", esc_options.routing.soft_zones, "Analyse refillable planes using the routing zone policy");
+  esc->add_flag("--blind-vias", esc_options.routing.blind_vias, "Allow blind/buried vias only when board settings permit them");
+  auto* esc_keep_vias = esc->add_flag("--keep-vias-off-pads{2}", esc_keep_vias_off_pads_mm,
+      "Keep via copper clear of SMD pads smaller than MM on both axes (default 2 mm; same as route)")
+      ->expected(0, 1)->check(CLI::PositiveNumber);
+  esc->validate_optional_arguments();
+  esc->add_option("--component-rules", esc_job.component_rules, "Component rules: off/report/soft/on, same preparation as route")
+      ->check(CLI::IsMember({"off", "report", "soft", "on"}));
+  esc->add_option("--rules-override", esc_job.rules_override, "Component-rule override JSON, same as route")->check(CLI::ExistingFile);
+  esc->add_option("--pitch-um", esc_pitch_um, "Router lattice pitch in micrometres (default: automatic)")->check(CLI::NonNegativeNumber);
+  esc->add_option("--work", esc_options.work_budget, "Deterministic access-search work budget per pin")->check(CLI::NonNegativeNumber);
+  esc->add_flag("--reference", esc_options.reference, "Use the uncached exact reference access search");
   bool esc_flow = false;
   esc->add_flag("--flow", esc_flow, "Also plan deep BGA arrays by min-cost flow and report the channel/layer assignment per ring");
   auto* pairs_cmd = app.add_subcommand("pairs", "Differential pairs of a routed board: coupled share, gap, intra-pair skew");
@@ -561,7 +631,17 @@ int main(int argc, char** argv) {
     if (*crules_cmd) return cmd_rules(cr_path, cr_mode, cr_json, cr_dru, cr_roles_from, cr_cat, cr_override);
     if (*selftest) return cmd_selftest_edit(st_in, st_out);
     if (*dseg) return cmd_debug_seg(ds_board, ds_pts, ds_layer, ds_width, ds_net);
-    if (*esc) return cmd_escape(esc_board, esc_json, esc_flow);
+    if (*esc) {
+      if (!std::isfinite(esc_pitch_um) || esc_pitch_um > 1e12 || (esc_pitch_um > 0 && esc_pitch_um < 0.001))
+        throw std::invalid_argument("--pitch-um must be zero (automatic) or a positive finite pitch of at least 1 nm");
+      esc_options.routing.pitch = static_cast<tmk::Coord>(esc_pitch_um * 1000.0);
+      if (*esc_keep_vias) {
+        if (!std::isfinite(esc_keep_vias_off_pads_mm) || esc_keep_vias_off_pads_mm > 1e9 || esc_keep_vias_off_pads_mm < 0.000001)
+          throw std::invalid_argument("--keep-vias-off-pads requires a positive finite size of at least 1 nm");
+        esc_options.routing.keep_vias_off_pads = tmk::mm_to_nm(esc_keep_vias_off_pads_mm);
+      }
+      return cmd_escape(esc_board, esc_json, esc_flow, std::move(esc_job), esc_options);
+    }
     if (*pairs_cmd) return cmd_pairs(pr_board, pr_extra, pr_json);
     if (*dbg) return cmd_debug_pad(d_board, d_ref, d_num, d_pitch, d_radius, d_width, d_via);
     if (*drc) return cmd_drc(drc_path, drc_json, static_cast<tmk::Coord>(drc_eps_um * 1000.0));

@@ -55,6 +55,31 @@
   route-only rules copy. Project files, the output board's rules and `tracemaker drc` are unchanged.
   Compilation failure of a synthetic rule is an error, not an ignored warning. KiCad checks this preference
   only when the user adds the equivalent rule in doc 05 §19 to the board's `.kicad_dru`.
+- `escape` uses the same route-domain preparation and accepts the rule/configuration options that change
+  access, including soft zones, blind vias, component rules, a rules override and the small-pad via-hole
+  preference (doc 05 §12, D66). Original input tracks/vias remain present; exact connectivity marks already
+  joined pad obligations `satisfied`, rather than analysing them as unrouted pins.
+
+### Escape JSON contract
+
+`escape <board> --json <file>` retains the top-level `board`, `parts`, `pins` and `dead` fields. Each part
+retains `ref`, `pitch_mm`, `pins`, `escapable`, `dead` and `hint`, and adds `results` and a `statuses` count
+map; the top level also carries `statuses`. `pins` counts outstanding obligations, `escapable` counts exact
+witnesses, and `dead` contains only searches exhausted in their configured finite domain.
+
+A result identifies the board pad index (`pad`) and its logical pad number (`pin`), with `status`, `reason`,
+`domain` and `witness`. Statuses are `satisfied`, `witness`, `exhausted` or `unknown`; exhaustion is not a
+physical-impossibility proof and bounded/unsupported searches do not enter `dead`. A witness uses integer
+nanometres (`units: "nm"`), `steps` with `a`/`b` coordinate pairs, copper-stack `layer` index and `width`,
+and `vias` with `position`, `diameter`, `drill`, stack `top`/`bottom` and numeric `type`
+(through=0, blind=1, micro=2). Its final `layer`, `end` and integer `cost` are also reported.
+
+The top-level `configuration` records `soft_zones`, `blind_vias`, `keep_vias_off_pads_mm`,
+`component_rules`, `rules_override`, `pitch_um`, `reference` and `work_budget`; `warnings` contains rule/domain
+warnings. Keep these alongside the input project/rules when comparing verdicts. A soft-zone witness is
+provisional until refill and plane/thermal/DRC sign-off. This report describes individual access, not
+simultaneous full-board routability; the clean-pass judge remains authoritative.
+
 
 ## 5. IPC plugin (`kicad_plugin/`)
 

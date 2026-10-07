@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Clean pass of finished runs split by escape feasibility (doc 05 §12): boards whose dense-package pins can all
-escape under the board's own rules vs boards with pins no router can get out (`tracemaker escape`).
+"""Clean pass split by configured escape-search findings (doc 05 §12): exact witnessed/satisfied
+obligations vs finite-domain exhaustion or unknown work/unsupported results; never physical impossibility.
 
   bench/feasibility.py RUN [RUN ...] [--analysis build/escape_all]
 
@@ -21,19 +21,24 @@ def main() -> int:
     ap.add_argument("--analysis", default=str(ROOT / "build/escape_all"))
     a = ap.parse_args()
     an = pathlib.Path(a.analysis)
-    print("| Run | Boards | Clean | Feasible boards | Clean (feasible) | Infeasible boards |")
+    print("| Run | Boards | Clean | Witnessed boards | Clean (witnessed) | Domain exhausted / unknown boards |")
     print("|---|--:|--:|--:|--:|---|")
     for rid in a.runs:
         rows = [json.loads(l) for l in (ROOT / "bench/results" / rid / "boards.jsonl").read_text().splitlines() if l.strip()]
         rows = [r for r in rows if "clean" in r]
-        dead = {}
+        states = {}
         for r in rows:
-            if r.get("dead_pins") is not None:
-                dead[r["board"]] = r["dead_pins"]
-            elif (an / f"{r['board']}.json").exists():
-                dead[r["board"]] = json.loads((an / f"{r['board']}.json").read_text())["dead"]
-        feas = [r for r in rows if dead.get(r["board"]) == 0]
-        bad = [f"{r['board']} ({dead[r['board']]})" for r in rows if dead.get(r["board"], 0) > 0]
+            path = an / f"{r['board']}.json"
+            if r.get("escape_unknown") is not None and r.get("dead_pins") is not None:
+                states[r["board"]] = (r["dead_pins"], r["escape_unknown"])
+            elif path.exists():
+                report = json.loads(path.read_text())
+                status = report.get("statuses")
+                if status is not None:
+                    states[r["board"]] = (status["exhausted"], status["unknown"])
+        feas = [r for r in rows if states.get(r["board"]) == (0, 0)]
+        bad = [f"{r['board']} ({states.get(r['board'], 'unknown legacy/missing domain')})"
+               for r in rows if states.get(r["board"]) != (0, 0)]
         cf = sum(r["clean"] for r in feas) / len(feas) if feas else 0
         print(f"| {rid} | {len(rows)} | {sum(r['clean'] for r in rows) / len(rows):.1%} | {len(feas)} | {cf:.1%} | {', '.join(bad)} |")
     return 0

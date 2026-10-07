@@ -158,7 +158,7 @@ them (KiCad 8+ generates teardrops itself; TraceMaker leaves them to KiCad by de
 | Portfolio of 8 variants on a thread pool, early stop when one is complete (wall-clock mode), 2x pitch for two variants on large boards; with `--work` all 8 run at any `--threads` and the winner is chosen by a total order ending in the variant index, so the output is bit-identical across thread counts (D47) | Done | `route_portfolio` |
 | Global routing, first CPU version: tile graph (8 pitches), exact edge capacities, negotiated congestion, soft corridors (`--global`, off by default) | Experimental: no gain yet. On AmpOne, USBI2C01 and motor-3xdrv8833 (60 s, one variant) corridors shortened track a little but did not raise completion and sometimes added vias. Missing: Steiner topology, via capacity, layer assignment without via columns, corridor-restricted windows | `route/global_router.cpp` |
 | Clean-up (section 8): via-saving re-routes, region rip-up around vias, path smoothing | Done | `optimize_vias`, `lns_vias`, `smooth_paths` |
-| Escape planning (section 3), version 1 (M9, 2026-10-04) | Partly done: escape corridors (opt-in), feasibility analysis, via neck-down, dead pins. Version 2 (2026-10-05): min-cost-flow channel and layer assignment for deep arrays, opt-in (`--escape-flow`), measured below version 1. Not built: NC fallback, escape templates. See §12, §14 | `route/escape.{hpp,cpp}`, `router.cpp` |
+| Escape planning (section 3), version 1 (M9, 2026-10-04; access update 2026-10-07) | Partly done: escape corridors (opt-in), connectivity-aware analysis with exact witnesses and domain-qualified negatives, via neck-down, shared off-grid multibend access graph. Version 2 (2026-10-05): min-cost-flow channel and layer assignment for deep arrays, opt-in (`--escape-flow`), measured below version 1. Not built: NC fallback, escape templates. See §12, §14 | `route/escape.{hpp,cpp}`, `route/access.cpp`, `router.cpp` |
 | Differential pairs (version 2, M12): coupled pair search with coupled vias, breakout/fan-in legs, re-coupling after rip-up, enclosed-pin check; length tuning (custom `length` rules) and skew tuning (custom `skew` rules, `--pair-skew-mm`) | Done, opt-in (`--diff-pairs`, D50). Not built: pair twists, pairs ending on routed copper, pair-aware global routing. See §15 | `route/router.cpp` (`route_pair`, `tune_skew`), `route/diff_pair.{hpp,cpp}` |
 
 ## 12. Escape planning, version 1 (M9, 2026-10-04)
@@ -166,11 +166,12 @@ them (KiCad 8+ generates teardrops itself; TraceMaker leaves them to KiCad by de
 **What failed.** On the 17 PCBench boards with BGAs and other dense packages (`bga-base`, 41 % clean), most
 unrouted connections were pins reported "boxed in". Two different causes hide behind that word:
 
-1. *Infeasible under the fixture's rules.* PCBench ships boards without their `.kicad_pro`, so KiCad's defaults
-   apply (track 0.25 mm, clearance 0.2 mm, via 0.8/0.4 mm), and old boards keep a large `pad_to_mask_clearance`
-   with untented vias. The designers' own routed boards (`raw.kicad_pcb`) fail KiCad's DRC under these rules by
-   hundreds of errors on OtterCast (clearance, track width, via diameter) and decelerator4030 (clearance). No
-   router can route those pins cleanly; Freerouting fails the same boards.
+1. *Rule/context mismatch or a search-domain limit.* PCBench ships boards without their `.kicad_pro`, so
+   KiCad's defaults apply (track 0.25 mm, clearance 0.2 mm, via 0.8/0.4 mm), and old boards keep a large
+   `pad_to_mask_clearance` with untented vias. The designers' own routed boards (`raw.kicad_pcb`) fail KiCad's
+   DRC under these rules by hundreds of errors on OtterCast and decelerator4030. These failures do not prove
+   that every legal escape is impossible: a finite grid can miss an off-grid site, legal narrower access or
+   a multibend path; immutable saved fills differ from a refillable-zone routing problem.
 2. *Feasible but taken.* On large boards (logicbone: 1,188 connections, 0.035 mm lattice) the strict first pass
    alone uses the whole 120 s budget; pins whose escape channel another net took first stay boxed in because
    negotiation never starts.
@@ -181,18 +182,71 @@ unrouted connections were pins reported "boxed in". Two different causes hide be
 |---|---|---|
 | Escape corridors (`--escape-plan`; on in two of the eight portfolio variants, D33) | Dense packages (≥ 8 copper pads, pin pitch ≤ 1.3 mm): perimeter pins get a corridor straight out of the package (2 mm past the pad edge; 0.5 / 1 / 2 / 3 mm gave logicbone 961 / 964 / 968 / 977 and decelerator 449 / 479 / 491 / 490 at a fixed budget); inner SMD balls get a dog-bone corridor to the diagonal via site pointing away from the package centre, reserved only where that net's via fits. Band ≤ ½ pitch (≤ 0.35 pitch for dog-bones) so neighbouring corridors never overlap. Other nets may not enter a corridor in strict searches and pay 2× the crossing cost in negotiated ones; a corridor is released when its pin is connected and planned again on every restart. Reservations only remove options, so they cannot create violations | logicbone (one variant, 160 M expansions): 938 → 964 routed, boxed-in 152 → 116; decelerator (200 M): 446 → 454. All 8 variants on, 120 s: BGA set 6,916 → 6,947 routed, tier B 5,163 → 5,171, tier C 9,521 → 9,514, tier A unchanged (100 %), clean pass unchanged everywhere, no added errors. As a portfolio arm (2 of 8 variants): tier B 5,166, tier C 9,526, clean pass unchanged |
 | Via neck-down rung | When the class via does not fit, the escalation rung (with the track neck-down) uses the smallest via the board minimums allow (KiCad checks vias against those, not the net class), drill ≥ 0.2 mm | d20_tri (80 M): 164 → 188 routed; OtterCast (60 M): 160 → 177; both with 0 added KiCad DRC errors |
-| Dead pins | A connection still boxed in by a negotiated search (which may cross all routed copper) at the neck-down width, neck-down via and with off-lattice escapes is enclosed by fixed copper: it is not retried in later passes or restarts and is reported as such | Same results at a fixed budget (retrying a sealed pocket is cheap); clearer failure reasons |
-| Feasibility analysis (`tracemaker escape <board> [--json]`) | Per dense package: breadth-first search from each pin over a 0.04 mm lattice of the package area, fixed copper only, at the neck-down width and via; a pin escapes when it gets 0.5 mm outside the package. Dead pins are explained ("no channel at W mm and no via site within reach", "only the solder-mask rule blocks via sites: untented vias") with a hint (tent vias / reduce `pad_to_mask_clearance`) | 0.1–2 s per board. Across all 1,157 PCBench boards: 708 have dense packages, 42 have pins that cannot escape even with the neck-down via (789 of 46,628 pins; tiers B 2/45, C 4/39: OtterCast, PCIE-to-MXM, sbc, zx-sizif, memsarray, a motor board). sbc: 22 DRAM balls blocked only by the mask rule. `bench/run.py` records `dead_pins` per board and `clean_pass_feasible`; `bench/feasibility.py` splits finished runs (BGA set: 41.2 % clean, 46.7 % on its 15 feasible boards) |
+| Search-domain failures | After the negotiated escape/neck-down/local-access rungs, a still boxed-in connection may be suppressed for the current configured graph. The report says "no escape in configured router search domain", not "enclosed by fixed copper" as a geometric proof. | Historical retry suppression remains a routing heuristic; graph changes must invalidate its failure memory. |
+| Escape analysis (`tracemaker escape <board> [--json]`, D66) | Exact initial connectivity skips already-satisfied pad obligations. Dense-package pins get exact-checked lattice witnesses, then the shared local access graph when needed; exterior means 0.5 mm beyond the package's pad-centre box. Results distinguish `satisfied`, `witness`, `exhausted` and `unknown`. Only finite-domain exhaustion enters the compatibility `dead` list. | Positive witnesses contain layer/width-resolved steps and via sites/spans. No new benchmark, CM5 completion or KiCad-sign-off claim accompanies this implementation change. |
+
+**Access correction (2026-10-07, D66).** `generate_access_paths` is shared by analysis and the router's
+escape escalation. Its finite local graph retains off-grid coordinates, multiple bends, per-segment widths
+and through/blind via sites, rather than one straight stub or a via forced onto the global lattice.
+Pad-aligned rays, interstitial/channel candidates and geometry-derived boundary/pocket portals are candidate
+generators, not proofs of complete geometric reachability. Every accepted segment and via is checked against
+the exact obstacle predicates; the router rechecks access copper against current routed copper at commit.
+Locked input copper remains fixed. The default local radius is 4 mm and the result carries deterministic
+integer costs; the reference enumerates the same candidates without the local item-bounds pruning.
+Boundary samples on near-straight runs (normal dot product above 0.99) are not separate corners; rounded
+pockets retain their recovered centres. Channel midpoints pair the nearest eight samples in each coordinate
+order. The source keeps every direct candidate; later visibility edges retain sixteen nearest portals per
+octant within 1.5 mm. These bounds define the reported finite domain and avoid quadratic fill-tessellation
+graphs. Analysis stops after its first exact witness; routing retains multiple checked exits.
+
+The access width floor is the board's positive hard minimum, or, when that is zero, the narrowest positive
+track width the designer declared in any net class. This is an explicit finite candidate policy, not a new
+manufacturing minimum. A 0.147 mm class can therefore use a geometrically legal 0.140 mm access when the
+project also declares a 0.127 mm class, as on CM5; access does not invent an infinitesimal width. The class
+target remains the preferred width outside constrained access. Board/custom hard constraints still take
+precedence. Lack of a meaningful positive floor is not permission to route at zero width.
+
+Analysis and routing select the same pitch/rule options, track-layer permissions, via permissions and
+hard/refillable-zone semantics. The CLI shares route-domain preparation, including rule overrides,
+component rules and the opt-in small-pad via-hole preference. JSON reports the selected configuration,
+warnings, per-pin domain and exact witnesses (doc 08 §4). `pins` counts outstanding obligations;
+`escapable` counts witnessed ones; satisfied pins remain visible in `results` without a dead finding.
+`exhausted` means only that the configured finite graph found no escape, while bounded/unsupported searches
+return `unknown`. Neither is a certificate of physical impossibility. Soft-zone witnesses are provisional
+until zone refill, plane/thermal connectivity and KiCad DRC sign-off; individual pin access never proves
+that all pins can be routed simultaneously.
+
+The previous lattice-only run reported 789 findings among 46,628 pins across 708 dense-package PCBench
+boards (42 boards with findings), and the historical BGA run was 41.2% clean / 46.7% on its 15 boards without
+findings. Those are measurements of the old search domain, **not** impossibility certificates or results
+for the corrected implementation. D35's `dead_pins` / `clean_pass_feasible` diagnostics remain supplemental:
+they never replace full-board clean pass. Permanent synthetic tests cover connected obligations, real
+rotated/flipped pad contact, hard/soft fills, exact witness legality, off-grid via pockets, legal narrowing,
+long multibend paths, locked copper, budgets and indexed/reference equality.
+
+**D66 measurements (2026-10-07).** Original CM5 reports 457 satisfied pad items and no outstanding dense-pin
+obligations. Preserved-hard-fill stripped CM5 reports 340 exact witnesses, including all 18 previously
+reported dead pins; no exhausted or unknown results. A one-variant, CPU, 5M-work route with escape planning
+connects 91/212 obligations (previously 89/212), using geometry access on 11 connections and narrower local
+tracks on two. This bounded global run does not attempt every outstanding connection or prove completion.
+KiCad 10.0.3 refilled input/output DRC adds no clearance, short, thermal or other routing errors; isolated
+copper warnings decrease from six to four. The 30-board quick tier remains 43.3% clean and 89.3% mean
+completion with no added DRC errors; every output is byte-identical to the supplied same-base binary when
+routing the same inputs/options. Synthetic access tests pass 27,178 assertions across 14 cases.
+StickHub's original input reports 48 satisfied items, its stripped input 44 witnesses and two finite-domain
+exhaustions; RoyalBlue's original reports 259 satisfied items. RoyalBlue stripped exceeded a 240 s external
+diagnostic deadline: no completed verdict is asserted.
 
 **Tried and dropped.** Routing connections that touch dense-package pins first (then shortest first) in the
 strict pass: logicbone 964 → 750, decelerator 479 → 431 (one variant, same budget) — the many short connections
 finish first under shortest-first. Second-ring channel corridors: mixed (logicbone 964 → 954, decelerator
 479 → 484), kept behind `--escape-second-ring`.
 
-**What limits the feasible large boards now.** logicbone (all 908 dense-package pins can escape) routes 999 of
-1,188 connections in 120 s and only 1,005 in 600 s: in 600 s each variant completes just two passes (the negotiated
-pass on a 2,754 × 1,847 × 2 lattice at 0.035 mm takes the rest), and the remaining failures are mostly nogood skips
-and windows without a path. That is negotiation speed on large lattices (global routing, M6), not escape.
+**Historical large-board result.** logicbone (all 908 dense-package pins passed the then-current escape
+analysis) routed 999 of 1,188 connections in 120 s and only 1,005 in 600 s: in 600 s each variant completed
+just two passes (the negotiated pass on a 2,754 × 1,847 × 2 lattice at 0.035 mm took the rest). Remaining
+failures were mostly nogood skips and windows without a path. This identifies negotiation throughput in
+that run, not a guarantee that local pin access is complete on other geometries.
 
 **Not built yet (rest of M9).** ~~Min-cost-flow channel assignment for arrays deeper than two rings (Yan & Wong),
 layer assignment per ring~~ (built 2026-10-05, opt-in, §14), escape templates in the knowledge base (doc 06 T3), and completion over escapable

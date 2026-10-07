@@ -4,6 +4,7 @@
 // (bindings/), so both take exactly the same code path (design doc 08 §5).
 #include <functional>
 #include <string>
+#include <optional>
 
 #include <nlohmann/json.hpp>
 
@@ -47,6 +48,19 @@ struct RouteJobResult {
 // Reads the board and its rules, routes (a portfolio when more than one variant runs), writes the requested outputs.
 // Throws std::exception on unreadable input.
 RouteJobResult run_route_job(RouteJob job);
+
+// Route and escape use the same project, synthetic and component-rule preparation. Overrides are only
+// allocated when needed; callers retain the original board/rules for byte-preserving output and DRC.
+struct PreparedRouteDomain {
+  std::optional<model::Board> board_override;
+  model::Board& board(model::Board& original) { return board_override ? *board_override : original; }
+  std::optional<model::DesignRules> rules_override;
+  const model::Board& board(const model::Board& original) const { return board_override ? *board_override : original; }
+  const model::DesignRules& rules(const model::DesignRules& original) const { return rules_override ? *rules_override : original; }
+};
+
+// Mutates job.opt for detected pair preferences; publishes events/logs and writes a sidecar only if job.out is set.
+PreparedRouteDomain prepare_route_domain(const model::Board& board, const model::DesignRules& rules, RouteJob& job);
 
 // Route-only synthetic physical-hole constraint; threshold is the local SMD size limit in nm (D62).
 model::CustomRule keep_vias_off_pads_rule(const model::DesignRules& rules, Coord threshold);

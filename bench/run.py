@@ -151,14 +151,38 @@ def place_added(human: dict, moved: dict) -> dict:
     return {t: n - hc.get(t, 0) for t, n in mc.items() if t in PLACEMENT_ERRORS and n - hc.get(t, 0) > 0}
 
 
-def dead_pins(board: pathlib.Path, out_json: pathlib.Path) -> int | None:
-    """Pins of dense packages that cannot escape under the board's own rules (`tracemaker escape`, doc 05 §12):
-    a board with any is not routable clean by any router."""
+def escape_options() -> list[str]:
+    """Forward only the route options that change the shared access/rule domain."""
+    out = []
+    valued = {"--rules-override", "--component-rules", "--pitch-um"}
+    flags = {"--soft-zones", "--blind-vias"}
+    i = 0
+    while i < len(EXTRA):
+        option = EXTRA[i]
+        if option in flags:
+            out.append(option)
+        elif option in valued:
+            out.extend(EXTRA[i:i + 2])
+            i += 1
+        elif option == "--keep-vias-off-pads":
+            out.append(option)
+            if i + 1 < len(EXTRA) and not EXTRA[i + 1].startswith("--"):
+                out.append(EXTRA[i + 1])
+                i += 1
+        i += 1
+    return out
+
+def escape_statuses(board: pathlib.Path, out_json: pathlib.Path) -> dict:
+    """Finite configured-domain access findings, never a physical impossibility certificate."""
     try:
-        subprocess.run([str(TM), "escape", str(board), "--json", str(out_json)], capture_output=True, timeout=300)
-        return int(json.loads(out_json.read_text())["dead"])
+        subprocess.run([str(TM), "escape", str(board), "--json", str(out_json)] + escape_options(), capture_output=True, timeout=300)
+        report = json.loads(out_json.read_text())
+        statuses = report.get("statuses")
+        if statuses is None:
+            return {"dead_pins": int(report["dead"]), "escape_unknown": None}
+        return {"dead_pins": int(statuses["exhausted"]), "escape_unknown": int(statuses["unknown"])}
     except (subprocess.TimeoutExpired, OSError, ValueError, KeyError):
-        return None
+        return {"dead_pins": None, "escape_unknown": None}
 
 
 def run_board(name: str, outdir: pathlib.Path, time_limit: float) -> dict:
@@ -167,7 +191,7 @@ def run_board(name: str, outdir: pathlib.Path, time_limit: float) -> dict:
     out.parent.mkdir(parents=True, exist_ok=True)
     res = {"board": name}
     src = place_board(name, src0, outdir, res) if PLACE_MODE else src0
-    res["dead_pins"] = dead_pins(src, outdir / "boards" / f"{name}.escape.json")
+    res.update(escape_statuses(src, outdir / "boards" / f"{name}.escape.json"))
     t0 = time.time()
     try:
         p = subprocess.run([str(TM), "route", str(src), "-o", str(out), "--time", str(time_limit), "--threads", str(THREADS), "--kb", str(outdir / "kb.sqlite"), "--json", str(out) + ".route.json"] + EXTRA,
@@ -281,7 +305,7 @@ def main() -> int:
         "added_error_types": dict(added_types),
         "judge_failures": len(rows) - n,
     }
-    feasible = [r for r in judged if r.get("dead_pins") == 0]
+    feasible = [r for r in judged if r.get("dead_pins") == 0 and r.get("escape_unknown") == 0]
     summary["feasible_boards"] = len(feasible)
     summary["clean_pass_feasible"] = round(sum(r["clean"] for r in feasible) / len(feasible), 4) if feasible else None
     (outdir / "summary.json").write_text(json.dumps(summary, indent=1))
