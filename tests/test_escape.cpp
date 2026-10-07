@@ -565,9 +565,9 @@ TEST_CASE("access widths use hard constraints, not the 0.147 mm class target as 
   }
   route::Obstacles obs(b, rules);
   CHECK(obs.segment_state({0, 0}, {1'000'000, 0}, 0, 147'000, 1, false) == 2);
-  CHECK(obs.segment_state({0, 0}, {1'000'000, 0}, 0, 140'000, 1, false) == 0);
+  // Exact checks enforce hard width minima (D65), so 0.140 mm is legal only where narrowing is allowed.
+  CHECK((obs.segment_state({0, 0}, {1'000'000, 0}, 0, 140'000, 1, false) == 0) == narrowing_allowed);
   CHECK(obs.segment_state({0, 0}, {1'000'000, 0}, 0, 140'002, 1, false) == 2);
-  // The obstacle geometry fits 0.140 mm; width constraints are enforced separately by access policy.
   route::AccessSearchOptions options;
   options.routing.allow_vias = false;
   options.target = [](Point p, int layer) { return layer == 0 && p.x >= 1'000'000; };
