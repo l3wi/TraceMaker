@@ -78,3 +78,6 @@ add_test(NAME protect_planes COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integra
 set_tests_properties(protect_planes PROPERTIES LABELS "route;integration" TIMEOUT 600)
 add_test(NAME no_project_defaults COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/no_project_defaults.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/no_project_defaults)
 set_tests_properties(no_project_defaults PROPERTIES SKIP_RETURN_CODE 77 LABELS "route;kicad;integration" TIMEOUT 600)
+# Persistent KB reporting must not change route order, work or the configured portfolio (D99).
+add_test(NAME kb_repeat COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/kb_repeat.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/kb_repeat)
+set_tests_properties(kb_repeat PROPERTIES LABELS "route;integration;learn" TIMEOUT 120)

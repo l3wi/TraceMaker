@@ -482,19 +482,6 @@ struct Router::Impl {
     } else {
       std::stable_sort(out.begin(), out.end(), [](const Connection& a, const Connection& c) { return a.length < c.length; });
     }
-    if (!opt.priority.empty()) {
-      std::set<std::pair<std::string, std::string>> pri;
-      for (const auto& [x, y] : opt.priority) {
-        pri.insert({x, y});
-        pri.insert({y, x});
-      }
-      auto label = [&](int pad) {
-        if (pad < 0) return std::string("zone");
-        const auto& p = b.pads[static_cast<std::size_t>(pad)];
-        return b.footprints[static_cast<std::size_t>(p.footprint)].reference + "." + p.number;
-      };
-      std::stable_partition(out.begin(), out.end(), [&](const Connection& c) { return pri.count({label(c.pad_a), label(c.pad_b)}) > 0; });
-    }
     if (!first_net_ids.empty())
       std::stable_partition(out.begin(), out.end(), [&](const Connection& c) { return first_net_ids.count(c.net) > 0; });
     return out;

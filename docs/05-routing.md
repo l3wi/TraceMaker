@@ -636,8 +636,8 @@ returned, and the selection is deterministic with a work budget.
 
 Halving loses a little: its finalists run on a third (two threads) or half (four) of the budget, and choosing among
 eight variants does not make up for that. With eight or more threads there is nothing to allocate. It would need
-resumable runs to pay; kept off (D59). The knowledge base's variant choice (doc 06 T3) remains the way fewer
-threads pick their variants.
+resumable runs to pay; kept off (D59). The requested first variants are fixed regardless of thread count or
+persistent history; KB variant selection was removed for repeat-run safety (D99, doc 06 §4.1).
 
 ## 23. Escape planning: what is left of M9 (2026-10-06)
 
@@ -709,7 +709,8 @@ resolution (§17, §20). It would be a second router; the finer variant takes mo
 **Learned ordering and congestion models are not built.** What they would learn is measured to matter little here:
 every order of small conflict groups changed no board (§17), jittered and reversed orders are already portfolio
 arms whose wins are spread evenly (each of the eight variants wins between 9 and 46 of 172 boards), tile congestion
-is absent (§16, §20), and the knowledge base's bandit already chooses variants per board from past runs (doc 06).
+is absent (§16, §20). Persistent variant statistics remain available for analysis but no longer choose the
+configured arms (D99, doc 06 §4.1).
 
 ## 26. Plane-aware routing of all-SMD boards (2026-10-07)
 

@@ -197,7 +197,9 @@ down beside the board and reported.
   and fine-pitch packages still connect (doc 05 §43). Opt-in; use with `--soft-zones` on plane boards.
 - The route log ends with `stopped: complete|work|time|deadline|exhausted` (JSON `stop`). `time` means the
   `--time` limit (default 120 s) ended the run before `--work` did: the result then depends on machine load.
-- `--kb FILE` / `--no-kb`: the knowledge base of earlier runs.
+- `--kb FILE` / `--no-kb`: persistent run and failure history, enabled by default at
+  `~/.local/share/tracemaker/kb.sqlite`. Reporting only: earlier failures never change connection order or
+  the requested portfolio, so fixed-work repeat runs match a fresh run. `--no-kb` disables reads and writes.
 - All-SMD boards with inner planes (doc 05 §26; refill the zones afterwards, e.g. `kicad-cli pcb drc --refill-zones
   --save-board`): `--soft-zones` (zone fills do not block other nets; an inner plane no pad touches becomes a via
   target), `--keep-vias-off-pads` / `--vias-off-pads-below MM` (no via in an SMD pad narrower than 2 mm),
