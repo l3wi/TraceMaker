@@ -81,6 +81,46 @@ bool has_track(const route::RouteResult& r, model::NetId net, bool inner) {
 
 }  // namespace
 
+TEST_CASE("explicit project selects its custom rules for a renamed board", "[rules][io]") {
+  const Files f("project_source", board_text(""), kInnerGndOnly);
+  const auto project = f.dir / "original.kicad_pro";
+  std::ofstream(project) << R"({"net_settings":{"classes":[{"name":"Default","clearance":0.37}]}})";
+  std::ofstream(f.dir / "original.kicad_dru") << "(version 1)\n(rule \"explicit\" (constraint clearance (min 0.45mm)))";
+  const auto implicit = io::read_design_rules(f.pcb.string());
+  const auto explicit_rules = io::read_design_rules(f.pcb.string(), project.string());
+  REQUIRE(implicit.custom.size() == 1);
+  CHECK(implicit.custom.front().name == "inner GND only");
+  REQUIRE(explicit_rules.custom.size() == 1);
+  CHECK(explicit_rules.custom.front().name == "explicit");
+  CHECK(explicit_rules.classes.front().clearance == 370'000);
+  CHECK(io::design_rule_sources(f.pcb.string(), project.string()).dru == (f.dir / "original.kicad_dru").string());
+  CHECK_THROWS_AS(io::read_design_rules(f.pcb.string(), (f.dir / "missing.kicad_pro").string()), std::runtime_error);
+}
+
+TEST_CASE("unrouted categories follow final diagnostics without parsing pad references", "[route][failures]") {
+  const std::vector<std::pair<std::string, std::string>> cases{
+      {"", "not_attempted"}, {"boxed in", "boxed_in_source"}, {"boxed in (target)", "boxed_in_target"},
+      {"fixed copper encloses the pin", "enclosed_by_fixed_copper"}, {"no path in window", "no_path_in_window"},
+      {"corridor blocked (left to negotiation)", "no_path_in_window"}, {"search budget", "search_budget"},
+      {"skipped: identical earlier attempt failed (nogood)", "nogood_skip"},
+      {"would rip a connection already ripped too often", "rip_cap"}, {"would rip a --first-nets connection", "protected_net"},
+      {"exact check rejected the lattice path", "exact_check_rejected"},
+      {"track on a layer that takes no tracks", "layer_stranded"}, {"out of budget", "out_of_budget"},
+      {"ripped up by /SIG and not routed again", "ripped_not_rerouted"},
+      {"no common layer at an end", "layer_stranded"}, {"too short to couple", "pair_too_short"},
+      {"no coupled path", "no_coupled_path"}, {"exact check of the finished pair", "exact_check_rejected"},
+      {"pair search budget", "search_budget"}, {"would enclose pin U1.2 between the halves", "would_enclose_pin"},
+      {"boxed in; escapes/neck-down: no path in window; negotiated: out of budget", "out_of_budget"},
+      {"boxed in; negotiated: boxed in (target); fixed copper encloses the pin", "enclosed_by_fixed_copper"},
+      {"search budget; negotiated escapes/neck-down: skipped: identical earlier attempt failed (nogood)", "nogood_skip"},
+      {"future diagnostic", "unknown"}};
+  for (const auto& [detail, expected] : cases) {
+    INFO(detail);
+    CHECK(route::RouteResult::Unrouted::classify(detail) == expected);
+  }
+}
+
+
 TEST_CASE("disallow track on inner layers: other nets avoid them, GND may still use them", "[rules][route]") {
   const Files free_board("free", board_text(kOuterWall), "");
   const auto before = route_board(free_board);

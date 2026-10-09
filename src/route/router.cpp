@@ -3443,7 +3443,21 @@ struct Router::Impl {
       }
       res.failures.push_back(b.nets[static_cast<std::size_t>(st.c.net)].name + ": " + b.footprints[static_cast<std::size_t>(pa.footprint)].reference + "." +
                              pa.number + " -> " + to + "  (" + best_why[ci] + ")");
-      res.unrouted.push_back({b.nets[static_cast<std::size_t>(st.c.net)].name, b.footprints[static_cast<std::size_t>(pa.footprint)].reference + "." + pa.number, to});
+      RouteResult::Unrouted u;
+      u.net = b.nets[static_cast<std::size_t>(st.c.net)].name;
+      u.a = b.footprints[static_cast<std::size_t>(pa.footprint)].reference + "." + pa.number;
+      u.b = to;
+      u.reason = RouteResult::Unrouted::classify(best_why[ci]);
+      u.detail = best_why[ci].empty() ? "not attempted in retained routing state" : best_why[ci];
+      u.a_pos = pa.pos;
+      u.a_layers = pa.copper;
+      if (st.c.pad_b >= 0) {
+        const auto& pb = b.pads[static_cast<std::size_t>(st.c.pad_b)];
+        u.b_pos = pb.pos;
+        u.b_layers = pb.copper;
+        u.has_b_position = true;
+      }
+      res.unrouted.push_back(std::move(u));
     }
     res.seconds = elapsed();
     res.nogood_skips = nogood_skips;

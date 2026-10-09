@@ -7,9 +7,13 @@
 
 namespace tmk::io {
 
-// `board_path` is the .kicad_pcb; the project and rule files are looked up next to it with the same stem.
-// Missing files give KiCad's defaults and a warning, never an exception.
-model::DesignRules read_design_rules(const std::string& board_path);
+struct RuleSources {
+  std::string project, dru;  // resolved absolute paths, even when implicit files are absent
+};
+RuleSources design_rule_sources(const std::string& board_path, const std::string& project_path = {});
+
+// Explicit projects must exist. Without an override, missing files use board rules/defaults with a warning.
+model::DesignRules read_design_rules(const std::string& board_path, const std::string& project_path = {});
 
 // Parses a KiCad length with an optional unit suffix ("0.2mm", "8mil", "0.01in", "150um", "0.2") to nm.
 std::optional<Coord> parse_length(std::string_view s);

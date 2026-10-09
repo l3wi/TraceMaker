@@ -32,6 +32,11 @@
 - **Project rules**: `.kicad_pro` (JSON) holds net classes, net-class patterns/assignments, board design
   settings (min track width, clearances, via sizes, hole clearances), and severity settings. `.kicad_dru`
   holds custom rules (constraint keywords in the research note §A). The rule compiler (doc 03) consumes both.
+  By default both files use the board's stem. `--project FILE.kicad_pro` overrides that source on `route`,
+  `drc`, `escape`, `rules`, and `inspect --json`; its same-stem `.kicad_dru` wins too, never the renamed
+  board's rules. An explicit project that is missing/unreadable is an error. Routing logs the absolute
+  project/DRU paths (loaded or absent) and every reader/compiler warning before routing, and includes
+  `rules: {project, dru, warnings, project_loaded, dru_loaded}` in its JSON summary.
 - **Schematic**: netlist from the hierarchical `.kicad_sch` set (symbols, pins, labels, power symbols, net
   class directives, DNP / exclude-from-board flags). Cross-checked in tests against
   `kicad-cli sch export netlist --format kicadsexpr`.
@@ -95,6 +100,9 @@ kicad-cli pcb drc --format json --severity-all --all-track-errors --exit-code-vi
   violation type and location ("added errors"), so pre-existing problems are not blamed on the router.
 - Unconnected items are counted separately (they measure completion, not legality).
 - Exit code 5 means violations exist; parse the JSON for the details.
+- TraceMaker's `drc` uses the same status convention: 0 no reported violations/unconnected items, 5 either
+  present, 1 runtime error. Its checks do not replace KiCad's sign-off. CLI usage errors return CLI11's
+  nonzero usage status.
 
 ## 7. Pitfalls to design around
 
@@ -132,6 +140,26 @@ kicad-cli pcb drc --format json --severity-all --all-track-errors --exit-code-vi
   `tmk::app::run_route_job` (`src/app/route_job.hpp`), the function behind the CLI's `route` subcommand, so both
   give byte-identical boards (ctest `python_bindings` checks this on a PCBench board). The GIL is released while
   routing and checking. The module is built into `build/<preset>/python/` (D18).
+  The CLI and Python also share option registration/parsing in `route_job.cpp` (D94): `route()` and
+  `emit_items()` accept `args=[...]` in CLI spelling, including project overrides, component rules, zone/
+  layer options, escape/differential-pair options and selective rerouting. Omitted values come from the
+  shared job/router defaults; existing keywords remain compatible and `args` override them. The plugin
+  forwards `TRACEMAKER_ARGS` directly; no second partial option parser remains.
+  `--reroute-nets NET[,NET...]` validates all names, removes only the chosen nets' unlocked tracks/arcs/vias,
+  and routes the board's remaining connections. Full `--reroute` retains its prior behaviour (arcs stay).
+  Both preserve locked copper and all untouched file content.
+  The summary/Python `unrouted` array includes net and pad references, `reason` (stable snake_case category),
+  `detail` (the existing diagnostic), pad positions in mm (`a_mm`, nullable `b_mm` for zone targets) and
+  copper layer names (`a_layers`, `b_layers`). Human `failures` strings remain. Classification uses the
+  final outcome in the retained routing state's diagnostic, without changing routing decisions; a pad not
+  attempted in that retained state is `not_attempted`, and an unrecognised future diagnostic is `unknown`.
+  Categories include `boxed_in_source`, `boxed_in_target`, `enclosed_by_fixed_copper`, `no_path_in_window`,
+  `search_budget`, `nogood_skip`, `rip_cap`, `protected_net`, `exact_check_rejected`, `layer_stranded`,
+  `out_of_budget`, and `ripped_not_rerouted`. Pair diagnostics also classify as `pair_too_short`,
+  `no_coupled_path`, or `would_enclose_pin`; all known router diagnostics are covered by unit tests.
+  `route` returns 0 when every planned connection routes, 3 when output is written with unrouted
+  connections, 1 on runtime error; CLI usage errors return CLI11's nonzero usage status.
+  Completion (0) is **not** KiCad DRC sign-off.
 - **PCM package**: `scripts/make_pcm_package.py` writes `build/pcm/tracemaker-<version>.zip` (metadata schema v2
   as shipped with KiCad 10, `type: plugin`, `runtime: ipc`, `kicad_version: 10.0`, the plugin under `plugins/`, a
   generated 64×64 `resources/icon.png`; reproducible archive). `scripts/validate_pcm.py` checks the layout and

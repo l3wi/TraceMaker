@@ -9,12 +9,59 @@ import os
 import subprocess
 import sys
 import tempfile
+from collections import Counter
+import re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BOARD = os.path.join(ROOT, "bench/data/freerouting/scripts/benchmark/fixtures/PCBench/C-BISCUIT_buck-reg-5v/unrouted.kicad_pcb")
 # Deterministic run: a work budget instead of wall time, no knowledge base, CPU fields (the GPU may be busy).
 ROUTE = dict(work=2_000_000, threads=8, seed=1, kb=False, gpu=False)
 CLI = ["--work", "2000000", "--threads", "8", "--seed", "1", "--no-kb", "--no-gpu"]
+
+
+def selective_reroute(tracemaker, tmp, exe):
+    board = os.path.join(tmp, "selective.kicad_pcb")
+    original = []
+    removable = []
+    for net in (1, 2):
+        for locked in (False, True):
+            x = 2 + net * 5 + int(locked)
+            lock = " (locked)" if locked else ""
+            original.extend([
+                f'(segment (start {x} 2) (end {x} 3) (width 0.25) (layer "F.Cu"){lock} (net {net}))',
+                f'(arc (start {x} 5) (mid {x + 0.5} 5.5) (end {x + 1} 5) (width 0.25) (layer "F.Cu"){lock} (net {net}))',
+                f'(via (at {x} 8) (size 0.6) (drill 0.3) (layers "F.Cu" "B.Cu"){lock} (net {net}))'])
+            if net == 1 and not locked:
+                removable.extend(original[-3:])
+    text = ('(kicad_pcb (version 20240108) (generator "pcbnew") '
+            '(layers (0 "F.Cu" signal) (31 "B.Cu" signal) (44 "Edge.Cuts" user)) '
+            '(net 0 "") (net 1 "SIG") (net 2 "GND") '
+            '(gr_rect (start 0 0) (end 20 12) (layer "Edge.Cuts") (stroke (width 0.1) (type solid)))\n'
+            + "\n".join(original) + "\n)")
+    with open(board, "w") as f:
+        f.write(text)
+    out = os.path.join(tmp, "selective-out.kicad_pcb")
+    options = ["--reroute-nets", "SIG", "--variants", "1", "--work", "1", "--no-kb", "--no-gpu"]
+    result = tracemaker.route(board, out, args=options)
+    assert result["exit_code"] == 0
+    with open(out) as f:
+        after = f.read()
+    for node in original:
+        assert (node in after) == (node not in removable), node
+    counts = lambda content: Counter(re.findall(r'\((segment|arc|via)\b.*?\(net (\d+)\)', content, flags=re.S))
+    assert counts(text) == Counter({(kind, net): 2 for kind in ("segment", "arc", "via") for net in ("1", "2")})
+    assert counts(after) == Counter({(kind, net): 1 if net == "1" else 2 for kind in ("segment", "arc", "via") for net in ("1", "2")})
+    try:
+        tracemaker.route(board, args=options + ["--reroute-nets", "MISSING"])
+        raise AssertionError("unknown net accepted")
+    except ValueError as e:
+        assert "unknown net" in str(e)
+    if exe:
+        cli = os.path.join(tmp, "selective-cli.kicad_pcb")
+        p = subprocess.run([exe, "route", board, "-o", cli] + options, capture_output=True, text=True)
+        assert p.returncode == 0, p.stdout + p.stderr
+        with open(cli) as f:
+            assert f.read() == after
 
 
 def main() -> int:
@@ -76,6 +123,37 @@ def main() -> int:
                 d = json.load(f)
             assert len(d["violations"]) + len(d["unconnected_items"]) == len(violations), "drc() differs from `tracemaker drc`"
             print("CLI parity: identical board, items and DRC count")
+
+            # Non-default options exercise the shared parser, not just run_route_job.
+            args = CLI + ["--variants", "1", "--soft-zones", "--no-tracks-on", "B.Cu", "--layer-cost", "F.Cu=2",
+                          "--first-nets", b.net_names[0], "--escape-plan", "--diff-pairs", "--no-pair-twists",
+                          "--component-rules", "report", "--no-optimize"]
+            py_args_out = os.path.join(tmp, "args-py.kicad_pcb")
+            cli_args_out = os.path.join(tmp, "args-cli.kicad_pcb")
+            args_json = os.path.join(tmp, "args-cli.json")
+            py_result = tracemaker.route(BOARD, py_args_out, args=args)
+            p = subprocess.run([exe, "route", BOARD, "-o", cli_args_out, "--json", args_json] + args, capture_output=True, text=True)
+            assert p.returncode == py_result["exit_code"], p.stdout + p.stderr
+            with open(py_args_out, "rb") as f1, open(cli_args_out, "rb") as f2:
+                assert f1.read() == f2.read(), "non-default CLI/Python options differ"
+            with open(args_json) as f:
+                cli_result = json.load(f)
+            for key in ("routed", "connections", "failures", "unrouted", "rules"):
+                assert cli_result[key] == py_result[key], key
+            args_items = tracemaker.emit_items(BOARD, args=args)
+            assert len(args_items["tracks"]) == py_result["tracks"]
+
+        sparse = tracemaker.route(BOARD, work=2_000_000, args=["--work", "1", "--variants", "1", "--no-kb", "--no-gpu"])
+        assert sparse["exit_code"] == 3 and sparse["unrouted"]
+        for u in sparse["unrouted"]:
+            assert {"net", "a", "b", "reason", "detail", "a_mm", "b_mm", "a_layers", "b_layers"} <= u.keys()
+            assert u["reason"] and u["detail"] and len(u["a_mm"]) == 2
+        try:
+            tracemaker.route(BOARD, args=["--unsupported-route-option"])
+            raise AssertionError("unsupported option accepted")
+        except ValueError:
+            pass
+        selective_reroute(tracemaker, tmp, exe)
 
     print("OK")
     return 0

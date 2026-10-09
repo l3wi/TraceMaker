@@ -241,13 +241,24 @@ void read_legacy_board_rules(const fs::path& board, model::DesignRules& r) {
 
 }  // namespace
 
-model::DesignRules read_design_rules(const std::string& board_path) {
+RuleSources design_rule_sources(const std::string& board_path, const std::string& project_path) {
+  const fs::path pro = project_path.empty() ? fs::path(board_path).replace_extension(".kicad_pro") : fs::path(project_path);
+  if (!project_path.empty() && !fs::is_regular_file(pro))
+    throw std::runtime_error("project file does not exist or is not a regular file: " + project_path);
+  return {fs::absolute(pro).lexically_normal().string(),
+          fs::absolute(fs::path(pro).replace_extension(".kicad_dru")).lexically_normal().string()};
+}
+
+model::DesignRules read_design_rules(const std::string& board_path, const std::string& project_path) {
   model::DesignRules r;
   const fs::path b(board_path);
-  const fs::path pro = fs::path(b).replace_extension(".kicad_pro");
-  const fs::path dru = fs::path(b).replace_extension(".kicad_dru");
+  const auto sources = design_rule_sources(board_path, project_path);
+  const fs::path pro(sources.project), dru(sources.dru);
   if (fs::exists(pro)) {
     read_pro(pro, r);
+    if (!project_path.empty())
+      for (const auto& warning : r.warnings)
+        if (warning.starts_with("cannot parse ")) throw std::runtime_error(warning);
   } else {
     r.warnings.push_back("no project file " + pro.filename().string() + "; using KiCad defaults and rules stored in the board");
     kicad_defaults(r);

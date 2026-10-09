@@ -116,10 +116,44 @@ Every command below starts with `build/release/src/app/tracemaker` unless it say
 | Get the same result every time | `route board.kicad_pcb -o out.kicad_pcb --work 50000000` |
 | Watch the routing live | `route board.kicad_pcb -o out.kicad_pcb --view --hold` |
 | Route everything again, old tracks removed | `route board.kicad_pcb -o out.kicad_pcb --reroute` |
+| Re-route selected nets only | `route board.kicad_pcb -o out.kicad_pcb --reroute-nets GND,+3V3` |
+| Route a renamed copy with its original project rules | `route pre_route.kicad_pcb -o out.kicad_pcb --project original.kicad_pro --json result.json` |
 | Run a design-rule check | `drc board.kicad_pcb --json report.json` |
 | See a summary of a board | `inspect board.kicad_pcb` |
 | Find pins that cannot escape their package | `escape board.kicad_pcb` |
 | See which parts and layout rules it detects | `rules board.kicad_pcb --mode on` |
+
+
+Rules normally come from the board's same-stem `.kicad_pro` and `.kicad_dru`. Use `--project FILE.kicad_pro`
+when a wrapper renames the board: both rule files then come from the specified project's stem. A missing
+explicit project is an error. `drc`, `escape`, `rules` and `inspect --json` accept the same override.
+Routing logs the resolved paths and every rule warning; `--json` includes `rules: {project, dru, warnings,
+project_loaded, dru_loaded}`. Unknown or unsupported rules still need KiCad's judgement.
+
+`route` exit codes: **0** every planned connection routed; **3** output written but connections remain
+unrouted; **1** runtime error (for example unreadable input/project). CLI usage errors return CLI11's
+nonzero usage status. **0 is not KiCad DRC sign-off.** `drc` returns **0** when it reports no violations or
+unconnected items, **5** when it reports either, and **1** on runtime errors (usage errors as above).
+
+For repair scripts, use the JSON `unrouted` array rather than parsing human `failures` strings. Each entry
+contains `net`, `a`/`b` (`REF.NUM`, or `zone`), `reason` (machine-readable category), `detail` (full diagnostic),
+`a_mm`/`b_mm` (pad positions, `null` for a zone), and `a_layers`/`b_layers` (copper-layer names).
+`--reroute-nets` validates every name and removes only those nets' unlocked tracks, arcs and vias; all other
+copper and all locked items remain. It then routes the remaining connections of the whole board.
+
+Python uses the same option parser and defaults as the CLI:
+
+```python
+import tracemaker
+result = tracemaker.route("pre_route.kicad_pcb", "out.kicad_pcb",
+    args=["--project", "original.kicad_pro", "--soft-zones", "--no-tracks-on", "In1.Cu",
+          "--reroute-nets", "GND,+3V3", "--work", "50000000", "--no-kb"])
+print(result["rules"], result["unrouted"], result["exit_code"])
+```
+
+`emit_items()` accepts the same `args` list. Existing keywords (`work`, `time_s`, `gpu`, `kb`, etc.) still
+work; explicit `args` are applied afterwards and override keywords. The plugin forwards `TRACEMAKER_ARGS`
+unchanged to this parser instead of silently dropping unrecognised options.
 
 <details>
 <summary><b>Placing components</b></summary>

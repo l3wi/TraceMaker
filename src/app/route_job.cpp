@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "app/route_job.hpp"
+#include <CLI/CLI.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -92,28 +93,161 @@ int default_gpu_device(bool use_gpu) {
   return devs.empty() ? -1 : devs.front().index;
 }
 
+RouteJob::RouteJob() : kb_path(learn::KnowledgeBase::default_path()) {}
+
+void add_route_options(CLI::App& app, RouteJob& job, bool require_paths) {
+  auto* route = &app;
+  struct ParseState {
+    double pitch_um, pair_skew_mm;
+    bool no_kb = false;
+  };
+  const auto state = std::make_shared<ParseState>(ParseState{job.opt.pitch / 1000.0, job.opt.pair_skew / 1e6});
+  auto& ropt = job.opt;
+  auto& r_job = job;
+  auto& r_pitch_um = state->pitch_um;
+  auto& r_pair_skew_mm = state->pair_skew_mm;
+  auto& r_nokb = state->no_kb;
+  auto& r_threads = job.threads;
+  auto& r_variants = job.variants;
+  auto& r_kb = job.kb_path;
+  auto& r_json = job.json_out;
+  auto& r_items = job.items_out;
+  auto* board = route->add_option("board", job.in)->check(CLI::ExistingFile);
+  auto* output = route->add_option("-o,--output", job.out, "Output .kicad_pcb");
+  if (require_paths) board->required(), output->required();
+  route->add_option("--project", job.project, "Read this project and its same-stem .kicad_dru instead of the board's stem");
+  route->add_option("--time", ropt.time_limit_s, "Time limit, seconds (safety net; results then depend on machine speed)");
+  route->add_option("--work", ropt.work_budget, "Deterministic work budget in search expansions per router (e.g. 50000000)");
+  route->add_option("--pitch-um", r_pitch_um, "Lattice pitch in micrometres (default: automatic)");
+  route->add_option("--via-cost-mm", ropt.via_cost_mm, "Cost of a via as equivalent track length");
+  route->add_option("--seed", ropt.seed);
+  route->add_option("--only-net", ropt.only_net, "Debugging: route only this net")->group("");
+  route->add_option("--skip-net", ropt.skip_nets, "Experiments: leave this net unrouted (repeatable)")->group("");
+  route->add_option("--soft-attempts", ropt.soft_attempts, "Window sizes tried by negotiated searches (1-4)")->group("");
+  route->add_option("--heuristic-weight", ropt.heuristic_weight, "Weighted A* factor (1.0 = optimal searches)");
+  route->add_flag("!--no-rip-up", ropt.rip_up, "Disable negotiated rip-up and reroute");
+  route->add_flag("--micro-vias", ropt.micro_vias, "Use micro vias (outer layer to the next) where a through via is blocked (only on boards that allow them)");
+  route->add_flag("--blind-vias", ropt.blind_vias, "Use blind/buried vias where a through via is blocked (only on boards that allow them)");
+  route->add_flag("--diff-pairs", ropt.diff_pairs, "Route differential pairs (KiCad P/N or +/- names) as coupled pairs first (doc 05 §15)");
+  route->add_flag("--pair-twists,!--no-pair-twists", ropt.pair_twists, "Coupled pairs may swap sides at a layer change, for pairs whose pin order is mirrored between the ends (default on; only with pair routing)");
+  route->add_option("--pair-skew-mm", r_pair_skew_mm, "Intra-pair skew limit for coupled pairs: meanders on the shorter half (0 = custom skew rules only)");
+  route->add_flag("--global", ropt.global_route, "Global routing first: detailed search follows coarse corridors");
+  route->add_flag("--global-confine", ropt.global_confine, "With --global: confine each connection's first search to its corridor (experimental)")->group("");
+  route->add_flag("--global-corridor-only", ropt.global_strict_corridor_only, "With --global-confine: a corridor failure goes straight to negotiation (experimental)")->group("");
+  route->add_option("--max-expansions", ropt.max_expansions, "Search expansions per attempt")->group("");
+  route->add_flag("!--no-optimize", ropt.optimize, "Skip the post-routing clean-up pass (fewer vias, shorter tracks)");
+  route->add_flag("--plan-gap,!--no-plan-gap", ropt.plan_gap, "Plan connections by copper-to-copper distance between pads rather than centre to centre (default on)");
+  route->add_flag("--global-congestion", ropt.global_congestion, "Global plan as a congestion map: through traffic pays in tiles the plan fills (experimental)")->group("");
+  route->add_option("--global-congestion-from", ropt.global_congestion_from, "Congestion threshold, eighths of tile capacity")->group("");
+  route->add_option("--global-congestion-pen", ropt.global_congestion_pen, "Congestion cost, pitches per step per eighth above the threshold")->group("");
+  route->add_flag("--escape-plan,!--no-escape-plan", ropt.escape_plan, "Reserve escape corridors for the pins of dense packages (QFP, BGA) before routing");
+  route->add_flag("--escape-second-ring", ropt.escape_second_ring, "Escape plan: second-ring balls between two outer balls (else dog-bone vias)")->group("");
+  route->add_flag("--escape-flow", ropt.escape_flow,
+                  "Escape plan v2: min-cost-flow channel and layer assignment for deep BGA arrays (implies --escape-plan; experimental)");
+  route->add_flag("--reroute", job.reroute, "Remove every unlocked track and via first and route the whole board again");
+  route->add_option("--reroute-nets", job.reroute_nets, "Remove unlocked tracks, arcs and vias of these nets only before routing")->delimiter(',');
+  route->add_flag("--fine-variant,!--no-fine-variant", ropt.fine_variant, "Portfolio: one variant routes small boards at half the lattice pitch (default on)")->group("");
+  route->add_flag("--halving", ropt.halving, "With more --variants than --threads: successive halving over all the variants instead of running only the first ones");
+  route->add_flag("--cut-report", ropt.cut_report, "Report straight lines across the board that more nets must cross than tracks fit (proof that the placement cannot be routed)");
+  route->add_flag("--escape-report", ropt.escape_report, "Report the pins of deep BGA arrays per ring and how many were connected");
+  route->add_flag("!--fast-bends", ropt.bend_states, "Approximate bend costs (1 state per lattice point instead of 9)");
+  route->add_flag("!--no-gpu", job.use_gpu, "Compute cost-to-go fields on the CPU instead of the GPU (same results)");
+  route->add_flag("--reach-verify", ropt.reach_verify, "Test: check every unreachable verdict with the full A*")->group("");
+  route->add_option("--reach-check", ropt.reach_check, "Reachability check before strict searches: 0 off, 1 likely failures, 2 all")->group("");
+  route->add_flag("--soft-zones", ropt.soft_zones, "Zone fills do not block other nets (refill the zones afterwards); unused fills become plane targets");
+  route->add_flag("--via-in-pad", ropt.via_in_pad, "Inner balls / enclosed SMD pads may take a minimum-size via in the pad (needs filled, capped vias)");
+  route->add_flag("--keep-vias-off-pads", ropt.vias_off_pads, "Vias keep clear of SMD pads narrower than --vias-off-pads-below (via-in-pad excepted)");
+  route->add_option("--vias-off-pads-below", ropt.vias_off_pads_below_mm, "Pad width (mm) below which --keep-vias-off-pads applies (default 2)");
+  route->add_option("--first-nets", ropt.first_nets, "Comma-separated nets routed first, also after restarts; other nets do not rip them (e.g. crystal lines)")->delimiter(',');
+  route->add_flag("!--no-field", ropt.field_heuristic, "Use the octile heuristic only (no cost-to-go fields)");
+  route->add_option("--kb", r_kb, "Knowledge base file (failure memory across runs)");
+  route->add_flag("--no-kb", r_nokb, "Do not read or update the knowledge base");
+  route->add_option("--threads", r_threads,
+                    "Threads for the portfolio (differently configured routers, best kept). Without --variants it is also the portfolio "
+                    "size, except with --work, where all variants run and the output is identical for any thread count");
+  route->add_option("--variants", r_variants,
+                    "Portfolio size (1 = single router; default: all with --work, else --threads); the output never depends on --threads "
+                    "with --work. --time applies to each variant from its start");
+  route->add_option("--no-tracks-on", r_job.no_tracks_on, "Copper layers that get no new tracks, e.g. In1.Cu,In2.Cu (vias still pass through and reach zone fills there)")
+      ->delimiter(',');
+  route->add_option("--layer-cost", r_job.layer_costs, "Track cost per layer as LAYER=FACTOR, e.g. In1.Cu=4,In2.Cu=4 (1 = normal, at most 1000)")->delimiter(',');
+  route->add_flag("--view", r_job.view, "Stream the routing live to the browser viewer");
+  route->add_option("--record", r_job.record, "Write the routing events (JSON lines, time-stamped) to a file for replay; zstd-compressed if FILE ends in .zst");
+  route->add_option("--view-host", r_job.view_host, "Viewer bind address (default 0.0.0.0)");
+  route->add_option("--view-port", r_job.view_port, "Viewer port (default 8766)");
+  route->add_flag("--hold", r_job.hold, "Keep serving the viewer after routing finishes");
+  route->add_option("--json", r_json, "Write a result summary as JSON");
+  route->add_option("--component-rules", r_job.component_rules,
+                    "Component-aware rules (doc 15): off (default); report/soft write <output>.tracemaker.kicad_dru; on also routes "
+                    "with the generated keep-outs (crystal, switching-regulator inductor) as in-memory rule areas")
+      ->check(CLI::IsMember({"off", "report", "soft", "on"}));
+  route->add_option("--rules-override", r_job.rules_override,
+                    "User override file for --component-rules (JSON, doc 15 §6.3): disable rules, assert/deny categories, set parameters")
+      ->check(CLI::ExistingFile);
+  route->add_option("--emit-items", r_items, "Write the new tracks and vias as JSON (for the KiCad plugin)");
+  route->footer("Exit codes: 0 every planned connection routed (not KiCad DRC sign-off); "
+                "3 output written but connections remain unrouted; 1 runtime error. "
+                "CLI usage errors return CLI11's nonzero usage status.");
+  route->callback([&job, state] {
+    job.opt.pitch = static_cast<Coord>(state->pitch_um * 1000.0);
+    job.opt.pair_skew = static_cast<Coord>(state->pair_skew_mm * 1e6);
+    job.opt.gpu_device = default_gpu_device(job.use_gpu);
+    if (state->no_kb) job.kb_path.clear();
+  });
+}
+
+RouteJob parse_route_args(RouteJob job, const std::vector<std::string>& args) {
+  CLI::App app{"TraceMaker route options"};
+  add_route_options(app, job);
+  std::vector<const char*> argv{"route"};
+  for (const auto& arg : args) argv.push_back(arg.c_str());
+  try {
+    app.parse(static_cast<int>(argv.size()), argv.data());
+  } catch (const CLI::ParseError& e) {
+    throw std::invalid_argument(e.what());
+  }
+  return job;
+}
+
 RouteJobResult run_route_job(RouteJob job) {
   auto log = [&](const std::string& line) {
     if (job.log) job.log(line);
   };
   auto& opt = job.opt;
   auto lb = io::read_board_file(job.in);
-  if (job.reroute) {
+  const auto sources = io::design_rule_sources(job.in, job.project);
+  auto rules = io::read_design_rules(job.in, job.project);  // component rules may add net classes in memory
+  std::vector<std::string> rule_warnings = rules.warnings;
+  log("rules project: " + sources.project + (std::filesystem::exists(sources.project) ? " (loaded)" : " (absent; board/default rules)"));
+  log("rules dru: " + sources.dru + (std::filesystem::exists(sources.dru) ? " (loaded)" : " (absent)"));
+  for (const auto& warning : rule_warnings) log("warning: " + warning);
+  std::vector<bool> reroute_nets(job.reroute_nets.empty() ? 0 : lb.board.nets.size(), false);
+  for (const auto& name : job.reroute_nets) {
+    const auto it = std::find_if(lb.board.nets.begin(), lb.board.nets.end(), [&](const auto& net) { return net.name == name; });
+    if (it == lb.board.nets.end()) throw std::invalid_argument("--reroute-nets: unknown net '" + name + "'");
+    reroute_nets[static_cast<std::size_t>(it - lb.board.nets.begin())] = true;
+  }
+  if (job.reroute || !job.reroute_nets.empty()) {
     // Strip the unlocked tracks and vias from the document and read it again (the editor changes the document,
     // not the model).
     int removed = 0;
     {
       io::BoardEditor ed(lb, opt.seed);
       for (std::size_t i = 0; i < lb.board.tracks.size(); ++i)
-        if (!lb.board.tracks[i].locked) ed.remove_track(i), ++removed;
+        if (!lb.board.tracks[i].locked && (job.reroute || reroute_nets[static_cast<std::size_t>(lb.board.tracks[i].net)]))
+          ed.remove_track(i), ++removed;
       for (std::size_t i = 0; i < lb.board.vias.size(); ++i)
-        if (!lb.board.vias[i].locked) ed.remove_via(i), ++removed;
+        if (!lb.board.vias[i].locked && (job.reroute || reroute_nets[static_cast<std::size_t>(lb.board.vias[i].net)]))
+          ed.remove_via(i), ++removed;
+      if (!job.reroute_nets.empty())
+        for (const auto& arc : lb.board.arcs)
+          if (!arc.locked && reroute_nets[static_cast<std::size_t>(arc.net)]) lb.doc.remove(arc.node), ++removed;
       const std::string tmp = (job.out.empty() ? (std::filesystem::temp_directory_path() / "tracemaker-reroute.kicad_pcb").string() : job.out + ".reroute-tmp.kicad_pcb");
       ed.save(tmp);
       lb = io::read_board_file(tmp);
       std::filesystem::remove(tmp);
     }
-    log(fmt("reroute: %d unlocked tracks and vias removed", removed));
+    log(fmt("reroute: %d unlocked copper items removed%s", removed, job.reroute ? "" : " from selected nets"));
   }
   if (!job.no_tracks_on.empty() || !job.layer_costs.empty()) {
     const auto& bd = lb.board;
@@ -131,7 +265,6 @@ RouteJobResult run_route_job(RouteJob job) {
         log(fmt("track cost on %s: x%.3g", bd.copper_name(l).c_str(), lim.layer_cost_pm[static_cast<std::size_t>(l)] / 1000.0));
     if (stranded) log(fmt("warning: %d pads lie only on layers that take no tracks; their connections stay unrouted", stranded));
   }
-  auto rules = io::read_design_rules(job.in);  // component rules may add net classes (in memory only)
   if (opt.via_in_pad && (rules.minimums.via_diameter <= 0 || rules.minimums.through_hole_diameter <= 0))
     log("warning: --via-in-pad: the board's minimum via diameter or drill could not be read, so no via in pad is placed");
   const std::string name = std::filesystem::path(job.in).filename().string();
@@ -265,7 +398,10 @@ RouteJobResult run_route_job(RouteJob job) {
   // here, not only by `tracemaker drc`: the routed board may break them (rule 6).
   {
     const drc::RuleEngine re(*route_board, rules);
-    for (const auto& w : re.warnings()) log("warning: " + w);
+    for (const auto& w : re.warnings()) {
+      log("warning: " + w);
+      rule_warnings.push_back(w);
+    }
   }
   auto& res = out.result;
   std::vector<int> ran;
@@ -322,6 +458,20 @@ RouteJobResult run_route_job(RouteJob job) {
                  {"vias", res.vias.size()},  {"seconds", res.seconds},         {"expansions", res.expansions},
                  {"pitch_mm", nm_to_mm(res.pitch)}, {"failures", res.failures}, {"variant", best_index}, {"variant_name", best_name},
                  {"escape_corridors", res.escape_corridors}};
+  out.summary["rules"] = {{"project", sources.project}, {"dru", sources.dru}, {"warnings", rule_warnings},
+                          {"project_loaded", std::filesystem::exists(sources.project)}, {"dru_loaded", std::filesystem::exists(sources.dru)}};
+  out.summary["unrouted"] = nlohmann::json::array();
+  auto layer_names = [&](model::LayerMask mask) {
+    std::vector<std::string> names;
+    for (int l = 0; l < lb.board.copper_count(); ++l)
+      if (mask & model::layer_bit(l)) names.push_back(lb.board.copper_name(l));
+    return names;
+  };
+  for (const auto& u : res.unrouted)
+    out.summary["unrouted"].push_back({{"net", u.net}, {"a", u.a}, {"b", u.b}, {"reason", u.reason}, {"detail", u.detail},
+                                     {"a_mm", {nm_to_mm(u.a_pos.x), nm_to_mm(u.a_pos.y)}},
+                                     {"b_mm", u.has_b_position ? nlohmann::json{nm_to_mm(u.b_pos.x), nm_to_mm(u.b_pos.y)} : nlohmann::json(nullptr)},
+                                     {"a_layers", layer_names(u.a_layers)}, {"b_layers", layer_names(u.b_layers)}});
   if (!cr_classes.empty()) out.summary["component_rule_net_classes"] = cr_classes;
   // Differential pairs (doc 05 §15): how each wanted pair came out, measured on the new copper (only when pairs are on).
   if (opt.diff_pairs || !opt.pair_nets.empty()) {

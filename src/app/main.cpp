@@ -17,7 +17,6 @@
 #include "drc/drc.hpp"
 #include "io/kicad/project_reader.hpp"
 #include "route/router.hpp"
-#include "learn/knowledge_base.hpp"
 #include "route/diff_pair.hpp"
 #include "route/escape.hpp"
 #include "route/escape_flow.hpp"
@@ -118,9 +117,9 @@ int cmd_perturb(const std::string& in, const std::string& out, std::uint64_t see
   return 0;
 }
 
-int cmd_drc(const std::string& path, const std::string& json_out, tmk::Coord epsilon, bool linear_zones) {
+int cmd_drc(const std::string& path, const std::string& json_out, tmk::Coord epsilon, bool linear_zones, const std::string& project) {
   const auto lb = tmk::io::read_board_file(path);
-  const auto rules = tmk::io::read_design_rules(path);
+  const auto rules = tmk::io::read_design_rules(path, project);
   tmk::drc::DrcOptions opt;
   opt.epsilon = epsilon;
   opt.linear_zone_tests = linear_zones;
@@ -133,10 +132,10 @@ int cmd_drc(const std::string& path, const std::string& json_out, tmk::Coord eps
 
 // Component-aware layout rules (design doc 15 §7): detections, bound roles and every rule's status. Read-only.
 int cmd_rules(const std::string& path, const std::string& mode_s, const std::string& json_out, const std::string& dru_out, const std::string& roles_from,
-              const std::string& catalogue_path, const std::string& override_path) {
+              const std::string& catalogue_path, const std::string& override_path, const std::string& project) {
   namespace cr = tmk::crules;
   const auto lb = tmk::io::read_board_file(path);
-  const auto rules = tmk::io::read_design_rules(path);
+  const auto rules = tmk::io::read_design_rules(path, project);
   const cr::Mode mode = cr::parse_mode(mode_s);
   cr::Catalogue own;
   if (!catalogue_path.empty()) own = cr::load_catalogue_file(catalogue_path);
@@ -266,9 +265,10 @@ int cmd_pairs(const std::string& path, const std::vector<std::string>& extra, co
   return 0;
 }
 
-int cmd_escape(const std::string& path, const std::string& json_path, bool flow, bool soft_zones, double vias_off_pads_below_mm) {
+int cmd_escape(const std::string& path, const std::string& json_path, bool flow, bool soft_zones, double vias_off_pads_below_mm,
+               const std::string& project) {
   auto lb = tmk::io::read_board_file(path);
-  const auto rules = tmk::io::read_design_rules(path);
+  const auto rules = tmk::io::read_design_rules(path, project);
   tmk::model::Board b = lb.board;
   tmk::route::Obstacles obs(b, rules);
   // The same obstacle semantics as `route` with these options.
@@ -399,11 +399,15 @@ int main(int argc, char** argv) {
 
   auto* inspect = app.add_subcommand("inspect", "Read a .kicad_pcb and print a summary");
   std::string inspect_path, inspect_json;
+  std::string inspect_project;
+  inspect->add_option("--project", inspect_project, "Read this project and its same-stem .kicad_dru");
   inspect->add_option("board", inspect_path, "Board file")->required()->check(CLI::ExistingFile);
   inspect->add_option("--json", inspect_json, "Also write the board as JSON (KiCad truth schema)");
 
   auto* crules_cmd = app.add_subcommand("rules", "Detect component categories and report the component-aware layout rules (doc 15)");
   std::string cr_path, cr_json, cr_dru, cr_cat, cr_roles_from, cr_override, cr_mode = "soft";
+  std::string cr_project;
+  crules_cmd->add_option("--project", cr_project, "Read this project and its same-stem .kicad_dru");
   crules_cmd->add_option("board", cr_path, "Board file")->required()->check(CLI::ExistingFile);
   crules_cmd->add_option("--json", cr_json, "Write the full report (every rule of every instance) as JSON");
   crules_cmd->add_option("--mode", cr_mode, "Which statuses to report: report (check only), soft (as placement would apply them), on (with keep-outs)")
@@ -428,6 +432,10 @@ int main(int argc, char** argv) {
 
   auto* drc = app.add_subcommand("drc", "Check a board against its KiCad design rules");
   std::string drc_path, drc_json;
+  std::string drc_project;
+  drc->add_option("--project", drc_project, "Read this project and its same-stem .kicad_dru");
+  drc->footer("Exit codes: 0 no reported violations or unconnected items; 5 violations or unconnected items; "
+              "1 runtime error. CLI usage errors return CLI11's nonzero usage status. Not KiCad DRC sign-off.");
   double drc_eps_um = 0.5;
   drc->add_option("board", drc_path)->required()->check(CLI::ExistingFile);
   drc->add_option("--json", drc_json, "Write the report as JSON (kicad-cli layout)");
@@ -460,91 +468,13 @@ int main(int argc, char** argv) {
   brk->add_option("--manifest", bk_manifest, "Write the injected defects as JSON");
 
   auto* route = app.add_subcommand("route", "Route all unrouted connections of a board");
-  std::string r_in, r_out, r_json;
-  tmk::route::RouterOptions ropt;
-  double r_pitch_um = 0;
-  route->add_option("board", r_in)->required()->check(CLI::ExistingFile);
-  route->add_option("-o,--output", r_out, "Output .kicad_pcb")->required();
-  route->add_option("--time", ropt.time_limit_s, "Time limit, seconds (safety net; results then depend on machine speed)");
-  route->add_option("--work", ropt.work_budget, "Deterministic work budget in search expansions per router (e.g. 50000000)");
-  route->add_option("--pitch-um", r_pitch_um, "Lattice pitch in micrometres (default: automatic)");
-  route->add_option("--via-cost-mm", ropt.via_cost_mm, "Cost of a via as equivalent track length");
-  route->add_option("--seed", ropt.seed);
-  route->add_option("--only-net", ropt.only_net, "Debugging: route only this net")->group("");
-  route->add_option("--skip-net", ropt.skip_nets, "Experiments: leave this net unrouted (repeatable)")->group("");
-  route->add_option("--soft-attempts", ropt.soft_attempts, "Window sizes tried by negotiated searches (1-4)")->group("");
-  route->add_option("--heuristic-weight", ropt.heuristic_weight, "Weighted A* factor (1.0 = optimal searches)");
-  route->add_flag("!--no-rip-up", ropt.rip_up, "Disable negotiated rip-up and reroute");
-  route->add_flag("--micro-vias", ropt.micro_vias, "Use micro vias (outer layer to the next) where a through via is blocked (only on boards that allow them)");
-  route->add_flag("--blind-vias", ropt.blind_vias, "Use blind/buried vias where a through via is blocked (only on boards that allow them)");
-  route->add_flag("--diff-pairs", ropt.diff_pairs, "Route differential pairs (KiCad P/N or +/- names) as coupled pairs first (doc 05 §15)");
-  double r_pair_skew_mm = 0;
-  route->add_flag("--pair-twists,!--no-pair-twists", ropt.pair_twists, "Coupled pairs may swap sides at a layer change, for pairs whose pin order is mirrored between the ends (default on; only with pair routing)");
-  route->add_option("--pair-skew-mm", r_pair_skew_mm, "Intra-pair skew limit for coupled pairs: meanders on the shorter half (0 = custom skew rules only)");
-  route->add_flag("--global", ropt.global_route, "Global routing first: detailed search follows coarse corridors");
-  route->add_flag("--global-confine", ropt.global_confine, "With --global: confine each connection's first search to its corridor (experimental)")->group("");
-  route->add_flag("--global-corridor-only", ropt.global_strict_corridor_only, "With --global-confine: a corridor failure goes straight to negotiation (experimental)")->group("");
-  route->add_option("--max-expansions", ropt.max_expansions, "Search expansions per attempt")->group("");
-  route->add_flag("!--no-optimize", ropt.optimize, "Skip the post-routing clean-up pass (fewer vias, shorter tracks)");
-  route->add_flag("--plan-gap,!--no-plan-gap", ropt.plan_gap, "Plan connections by copper-to-copper distance between pads rather than centre to centre (default on)");
-  route->add_flag("--global-congestion", ropt.global_congestion, "Global plan as a congestion map: through traffic pays in tiles the plan fills (experimental)")->group("");
-  route->add_option("--global-congestion-from", ropt.global_congestion_from, "Congestion threshold, eighths of tile capacity")->group("");
-  route->add_option("--global-congestion-pen", ropt.global_congestion_pen, "Congestion cost, pitches per step per eighth above the threshold")->group("");
-  route->add_flag("--escape-plan,!--no-escape-plan", ropt.escape_plan, "Reserve escape corridors for the pins of dense packages (QFP, BGA) before routing");
-  route->add_flag("--escape-second-ring", ropt.escape_second_ring, "Escape plan: second-ring balls between two outer balls (else dog-bone vias)")->group("");
-  route->add_flag("--escape-flow", ropt.escape_flow,
-                  "Escape plan v2: min-cost-flow channel and layer assignment for deep BGA arrays (implies --escape-plan; experimental)");
-  bool r_reroute = false;
-  route->add_flag("--reroute", r_reroute, "Remove every unlocked track and via first and route the whole board again");
-  route->add_flag("--fine-variant,!--no-fine-variant", ropt.fine_variant, "Portfolio: one variant routes small boards at half the lattice pitch (default on)")->group("");
-  route->add_flag("--halving", ropt.halving, "With more --variants than --threads: successive halving over all the variants instead of running only the first ones");
-  route->add_flag("--cut-report", ropt.cut_report, "Report straight lines across the board that more nets must cross than tracks fit (proof that the placement cannot be routed)");
-  route->add_flag("--escape-report", ropt.escape_report, "Report the pins of deep BGA arrays per ring and how many were connected");
-  route->add_flag("!--fast-bends", ropt.bend_states, "Approximate bend costs (1 state per lattice point instead of 9)");
-  bool r_nogpu = false;
-  route->add_flag("--no-gpu", r_nogpu, "Compute cost-to-go fields on the CPU instead of the GPU (same results)");
-  route->add_flag("--reach-verify", ropt.reach_verify, "Test: check every unreachable verdict with the full A*")->group("");
-  route->add_option("--reach-check", ropt.reach_check, "Reachability check before strict searches: 0 off, 1 likely failures, 2 all")->group("");
-  route->add_flag("--soft-zones", ropt.soft_zones, "Zone fills do not block other nets (refill the zones afterwards); unused fills become plane targets");
-  route->add_flag("--via-in-pad", ropt.via_in_pad, "Inner balls / enclosed SMD pads may take a minimum-size via in the pad (needs filled, capped vias)");
-  route->add_flag("--keep-vias-off-pads", ropt.vias_off_pads, "Vias keep clear of SMD pads narrower than --vias-off-pads-below (via-in-pad excepted)");
-  route->add_option("--vias-off-pads-below", ropt.vias_off_pads_below_mm, "Pad width (mm) below which --keep-vias-off-pads applies (default 2)");
-  route->add_option("--first-nets", ropt.first_nets, "Comma-separated nets routed first, also after restarts; other nets do not rip them (e.g. crystal lines)")->delimiter(',');
-  route->add_flag("!--no-field", ropt.field_heuristic, "Use the octile heuristic only (no cost-to-go fields)");
-  int r_threads = 8;
-  std::string r_kb = tmk::learn::KnowledgeBase::default_path();
-  bool r_nokb = false;
-  route->add_option("--kb", r_kb, "Knowledge base file (failure memory across runs)");
-  route->add_flag("--no-kb", r_nokb, "Do not read or update the knowledge base");
-  route->add_option("--threads", r_threads,
-                    "Threads for the portfolio (differently configured routers, best kept). Without --variants it is also the portfolio "
-                    "size, except with --work, where all variants run and the output is identical for any thread count");
-  int r_variants = 0;
-  route->add_option("--variants", r_variants,
-                    "Portfolio size (1 = single router; default: all with --work, else --threads); the output never depends on --threads "
-                    "with --work. --time applies to each variant from its start");
   tmk::app::RouteJob r_job;
-  route->add_option("--no-tracks-on", r_job.no_tracks_on, "Copper layers that get no new tracks, e.g. In1.Cu,In2.Cu (vias still pass through and reach zone fills there)")
-      ->delimiter(',');
-  route->add_option("--layer-cost", r_job.layer_costs, "Track cost per layer as LAYER=FACTOR, e.g. In1.Cu=4,In2.Cu=4 (1 = normal, at most 1000)")->delimiter(',');
-  route->add_flag("--view", r_job.view, "Stream the routing live to the browser viewer");
-  route->add_option("--record", r_job.record, "Write the routing events (JSON lines, time-stamped) to a file for replay; zstd-compressed if FILE ends in .zst");
-  route->add_option("--view-host", r_job.view_host, "Viewer bind address (default 0.0.0.0)");
-  route->add_option("--view-port", r_job.view_port, "Viewer port (default 8766)");
-  route->add_flag("--hold", r_job.hold, "Keep serving the viewer after routing finishes");
-  route->add_option("--json", r_json, "Write a result summary as JSON");
-  route->add_option("--component-rules", r_job.component_rules,
-                    "Component-aware rules (doc 15): off (default); report/soft write <output>.tracemaker.kicad_dru; on also routes "
-                    "with the generated keep-outs (crystal, switching-regulator inductor) as in-memory rule areas")
-      ->check(CLI::IsMember({"off", "report", "soft", "on"}));
-  route->add_option("--rules-override", r_job.rules_override,
-                    "User override file for --component-rules (JSON, doc 15 §6.3): disable rules, assert/deny categories, set parameters")
-      ->check(CLI::ExistingFile);
-  std::string r_items;
-  route->add_option("--emit-items", r_items, "Write the new tracks and vias as JSON (for the KiCad plugin)");
+  tmk::app::add_route_options(*route, r_job, true);
 
   auto* esc = app.add_subcommand("escape", "Escape feasibility of dense packages: pins that cannot leave their package under the board's rules");
   std::string esc_board, esc_json;
+  std::string esc_project;
+  esc->add_option("--project", esc_project, "Read this project and its same-stem .kicad_dru");
   esc->add_option("board", esc_board)->required()->check(CLI::ExistingFile);
   esc->add_option("--json", esc_json, "Write the analysis as JSON");
   bool esc_flow = false, esc_soft = false, esc_vop = false;
@@ -594,18 +524,18 @@ int main(int argc, char** argv) {
       const auto lb = tmk::io::read_board_file(inspect_path);
       tmk::app::print_summary(lb.board, inspect_path);
       if (!inspect_json.empty()) {
-        const auto rules = tmk::io::read_design_rules(inspect_path);
+        const auto rules = tmk::io::read_design_rules(inspect_path, inspect_project);
         tmk::app::write_truth_json(lb.board, inspect_json, &rules);
       }
       return 0;
     }
-    if (*crules_cmd) return cmd_rules(cr_path, cr_mode, cr_json, cr_dru, cr_roles_from, cr_cat, cr_override);
+    if (*crules_cmd) return cmd_rules(cr_path, cr_mode, cr_json, cr_dru, cr_roles_from, cr_cat, cr_override, cr_project);
     if (*selftest) return cmd_selftest_edit(st_in, st_out);
     if (*dseg) return cmd_debug_seg(ds_board, ds_pts, ds_layer, ds_width, ds_net);
-    if (*esc) return cmd_escape(esc_board, esc_json, esc_flow, esc_soft, esc_vop ? esc_vop_below : 0.0);
+    if (*esc) return cmd_escape(esc_board, esc_json, esc_flow, esc_soft, esc_vop ? esc_vop_below : 0.0, esc_project);
     if (*pairs_cmd) return cmd_pairs(pr_board, pr_extra, pr_json);
     if (*dbg) return cmd_debug_pad(d_board, d_ref, d_num, d_pitch, d_radius, d_width, d_via);
-    if (*drc) return cmd_drc(drc_path, drc_json, static_cast<tmk::Coord>(drc_eps_um * 1000.0), drc_linear_zones);
+    if (*drc) return cmd_drc(drc_path, drc_json, static_cast<tmk::Coord>(drc_eps_um * 1000.0), drc_linear_zones, drc_project);
     if (*pert) return cmd_perturb(pin, pout, pseed, ptracks, pvias, pmoves);
     if (*brk) {
       const int n = tmk::app::inject_defects(bk_in, bk_out, bk_manifest, bk_kind, bk_seed, bk_count);
@@ -613,20 +543,7 @@ int main(int argc, char** argv) {
       return 0;
     }
     if (*route) {
-      ropt.pitch = static_cast<tmk::Coord>(r_pitch_um * 1000.0);
-      ropt.pair_skew = static_cast<tmk::Coord>(r_pair_skew_mm * 1e6);
-      ropt.gpu_device = tmk::app::default_gpu_device(!r_nogpu);
-      auto job = std::move(r_job);
-      job.in = r_in;
-      job.reroute = r_reroute;
-      job.out = r_out;
-      job.opt = ropt;
-      job.threads = r_threads;
-      job.variants = r_variants;
-      job.kb_path = r_nokb ? std::string() : r_kb;
-      job.items_out = r_items;
-      job.json_out = r_json;
-      return cmd_route(std::move(job));
+      return cmd_route(std::move(r_job));
     }
     if (*rt) {
       int bad = 0, ok = 0;
