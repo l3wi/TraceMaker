@@ -115,7 +115,11 @@ failure record (`ECO_REJECTED`) keyed by the cut signature, so the same move is 
 
 ## 4. T3 — the persistent knowledge base
 
-SQLite file (WAL mode) at `~/.local/share/tracemaker/kb.sqlite`, also exportable to share between machines.
+SQLite file (WAL mode) at `~/.local/share/tracemaker/kb.sqlite`, enabled by default; `--kb FILE` selects a
+private file and `--no-kb` disables both reads and writes. The implemented tables are `runs`,
+`variant_stats` (plays/wins per feature bucket) and `failed_connections` (historical counts per exact board
+content hash). They support reporting and offline analysis, **not routing decisions** (D99). The broader
+tables below remain design targets, not claims about the current schema.
 
 | Table | Key | Content | Used for |
 |---|---|---|---|
@@ -133,6 +137,69 @@ SQLite file (WAL mode) at `~/.local/share/tracemaker/kb.sqlite`, also exportable
 - **Net-order policy**: a GNN over the netlist/placement scoring "route this connection next"; used as one
   ordering arm in the bandit, never as the only one. (Prior art: DreamerV3+FR and PCBWorld show RL over
   ordering decisions can lift completion; TraceMaker keeps it optional and benchmark-gated.)
+
+### 4.1 Repeat-run safety (D99)
+
+The KB never changes connection order, the requested portfolio arms, or routing budgets. Given the same
+board bytes, rules, options and seed, fixed-work runs produce the same copper and work counts with a fresh,
+populated or disabled KB (provided the wall-clock safety stop is not reached). `--first-nets` and in-run
+failure learning retain their existing behaviour; they do not depend on the persistent KB.
+
+The removed policy promoted every historically unrouted connection ahead of shortest-first routing. Those
+records include **not attempted before the budget ran out**, not just failed searches, and accumulate forever:
+a later successful run did not erase them. Consequently expensive-but-routable connections can consume the
+next run's budget before cheap connections, even with no failed searches. Truly difficult connections can
+also spend most work on unsuccessful searches. As new failures accumulate, the priority set changes and can
+oscillate between good and poor outputs on an unchanged input. The old partial-portfolio bandit could also
+replace configured arms using statistics from other boards in the same coarse bucket; that selection is removed.
+
+`features_of` hashes the complete input file bytes, not merely layer count/density or a filename. An edited
+board therefore gets a different per-board failure key, including when reusing its filename. Project/custom
+rule files and route options are not part of that hash, so historical failures are deliberately only reports,
+never constraints or preferences; changes to those inputs cannot introduce stale routing decisions.
+
+Promoting only previously failed connections later observed successful cannot bootstrap a useful order on
+unchanged runs. Budget caps and delayed promotion still divert work from the reference path and cannot
+guarantee reference completion. Running both orders would preserve completion but doubles the route work.
+Reporting-only is the smallest safe default: preserve diagnostic/statistical value without penalising scripts.
+
+On the reporting 4-layer board, a fresh private KB at 200 M work routed 601/698, then only 60/698, then
+601/698 again. The poor second run spent 110.49 M expansions on 73 failed searches and left 615 connections
+not attempted. On RoyalBlue54L-Feather, failed searches used 3.290 M of 3.303 M expansions on the poor rerun.
+Conversely Inkjet and LogicBoxen's poor reruns had **zero failed searches**: prioritised long successful
+routes displaced many short ones. This is an ordering/budget regression, not only wasted hopeless searches.
+
+### 4.2 Repeat-run measurements (2026-10-10, native macOS/Metal)
+
+Each row used unchanged input bytes, a fresh private `--kb` file, three sequential runs against that file,
+and a separate `--no-kb` reference before and after the change. All used `--variants 1 --threads 1`.
+Plane fixtures used `--soft-zones`; the reporting board also used `--no-tracks-on In1.Cu` with copied
+project/custom rules. These are route-completion measurements, not refilled-plane DRC judgements.
+
+| Board | Connections | Work budget | Before `--no-kb` | Before KB runs 1 / 2 / 3 | After `--no-kb` and each KB run |
+|---|---:|---:|---:|---|---:|
+| Reporting board (`gbb`) | 698 | 200 M | 601 | 601 / 60 / 601 | 601 |
+| `655_testboard` | 57 | 1 M | 31 | 31 / 21 / 31 | 31 |
+| `Inkjet__autosave-InkjetDriver` | 65 | 1 M | 49 | 49 / 9 / 49 | 49 |
+| `LogicBoxen_LogicBoxen` | 116 | 1 M | 80 | 80 / 25 / 80 | 80 |
+| `RoyalBlue54L-Feather` | 171 | 3 M | 76 | 76 / 12 / 76 | 76 |
+| `multichannel_mixer` | 177 | 3 M | 175 | 175 / 176 / 177 | 175 |
+| `StickHub` | 134 | 3 M | 120 | 120 / 114 / 33 | 120 |
+
+HES-V2 and sonde xilinx were also measured but already complete at these budgets and unchanged on repeats.
+After the change, every repeat had reference-identical routed counts, search success/failure counts,
+expansions **and board bytes** on all nine boards. Every before/after `--no-kb` board was byte-identical.
+The mixer gain of two connections is deliberately relinquished rather than silently retaining an unsafe
+default. Exact search counters, expansions and elapsed seconds for every run are recorded in
+`bench/results/kb-repeat-measurements/summary.json`; elapsed times vary with concurrent machine load and
+are not evidence of a speed change.
+
+Default quick benchmark settings (eight variants, 1 M work, `--no-kb`, no extra route options): 30/30
+before/after boards byte-identical, 25/30 KiCad-clean, mean completion 99.0 %, no added DRC errors.
+Results: `bench/results/kb-repeat-quick-{before,after}/`. The fixture-free `kb_repeat` integration test fails
+against the old binary on its second run (10 → 1), passes after the change, exercises partial portfolios with
+populated variant statistics, and checks an edited same-filename board receives a different history hash.
+
 
 ## 5. Visibility
 
@@ -164,6 +231,6 @@ contribution, and their benefit must be shown by ablation in the benchmark (road
 | T1 | Activity ordering: failed connections retried hardest (most failures) first | Done | `run` |
 | T2 | Nogoods: (connection, mode, signature of routed copper in the window) attempts that failed are not repeated until the surroundings change | Done | `search_and_commit` |
 | T2 | Strategy selection: portfolio of 8 router variants in parallel threads, best kept | Done | `route_portfolio` |
-| T3 | Persistent SQLite knowledge base: Thompson-sampling bandit over variants per board-feature bucket; per-board failed connections routed first on re-runs | Done | `learn/knowledge_base.cpp`, `tracemaker route --kb` |
+| T3 | Persistent SQLite run/variant statistics and per-board historical unrouted counts; reporting only, no ordering or portfolio selection (D99) | Done | `learn/knowledge_base.cpp`, `tracemaker route --kb`; `kb_repeat` integration regression |
 | T3 | Learned models (congestion predictor, ordering policy) | Not started | |
 | — | Conflict graph between nets, precedence learning, Luby restarts | Not started | |

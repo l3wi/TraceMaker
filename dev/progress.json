@@ -756,6 +756,10 @@
      "done": true
     },
     {
+     "text": "Repeated-route KB safety: reporting-only history, no failed-first order or variant reselection; deterministic fixture-free integration regression; default quick 30/30 byte-identical (D99, doc 06 §4.1)",
+     "done": true
+    },
+    {
      "text": "Fine-pitch QFN fan-out among nearby decoupling (pins boxed in by the router's own earlier tracks)",
      "done": false
     },

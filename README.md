@@ -189,7 +189,9 @@ down beside the board and reported.
 - `--tree-attach`: a connection may branch off any copper already joined to its pads (a trunk, a via, another pad of
   the cluster) instead of running back to the planned pad. Less copper and fewer vias; on large boards it also
   routes more (doc 05 §40). Off by default: a few small boards lose a connection at small budgets.
-- `--kb FILE` / `--no-kb`: the knowledge base of earlier runs.
+- `--kb FILE` / `--no-kb`: persistent run and failure history, enabled by default at
+  `~/.local/share/tracemaker/kb.sqlite`. Reporting only: earlier failures never change connection order or
+  the requested portfolio, so fixed-work repeat runs match a fresh run. `--no-kb` disables reads and writes.
 - All-SMD boards with inner planes (doc 05 §26; refill the zones afterwards, e.g. `kicad-cli pcb drc --refill-zones
   --save-board`): `--soft-zones` (zone fills do not block other nets; an inner plane no pad touches becomes a via
   target), `--keep-vias-off-pads` / `--vias-off-pads-below MM` (no via in an SMD pad narrower than 2 mm),

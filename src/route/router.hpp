@@ -102,8 +102,6 @@ struct RouterOptions {
   double soft_cost_mm = 1.0;    // base cost of crossing another net's routed copper (before history)
   std::uint64_t seed = 1;
   int order = 0;                // connection order: 0 shortest first, 1 longest first, 2 shortest first with seeded jitter
-  // Connections to route first ("REF.NUM" pairs, either orientation): learned from earlier failures (doc 06 T3).
-  std::vector<std::pair<std::string, std::string>> priority;
   std::vector<std::string> first_nets;  // routed first, also after restarts; other nets do not rip them (crystal lines)
   std::string only_net;         // debugging: route only this net
   std::vector<std::string> skip_nets;  // experiments: leave these nets unrouted (e.g. nets a designer would pour)

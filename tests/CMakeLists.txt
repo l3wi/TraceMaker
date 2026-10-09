@@ -71,3 +71,6 @@ add_test(NAME rule_parity COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integratio
 set_tests_properties(rule_parity PROPERTIES LABELS "integration;rules" TIMEOUT 300)
 add_test(NAME net_tie COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/net_tie.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/net_tie)
 set_tests_properties(net_tie PROPERTIES SKIP_RETURN_CODE 77 LABELS "route;kicad;integration" TIMEOUT 600)
+# Persistent KB reporting must not change route order, work or the configured portfolio (D99).
+add_test(NAME kb_repeat COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/kb_repeat.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/kb_repeat)
+set_tests_properties(kb_repeat PROPERTIES LABELS "route;integration;learn" TIMEOUT 120)

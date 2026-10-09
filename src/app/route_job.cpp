@@ -289,7 +289,7 @@ RouteJobResult run_route_job(RouteJob job) {
     opt.sink = recorder.get();
     opt.buffer_events = true;
   }
-  // Knowledge base (failure memory T3): earlier failures on this board go first; variant choice by bandit.
+  // Knowledge base (T3, D99): report history, never spend routing work on an unproven order.
   std::unique_ptr<learn::KnowledgeBase> kb;
   if (!job.kb_path.empty()) {
     kb = std::make_unique<learn::KnowledgeBase>(job.kb_path);
@@ -299,8 +299,8 @@ RouteJobResult run_route_job(RouteJob job) {
   for (const auto& n : lb.board.nets) conn_estimate += !n.name.empty();
   const auto feat = learn::features_of(lb.board, lb.doc.text(), conn_estimate);
   if (kb) {
-    for (const auto& f : kb->failed_connections(feat.hash)) opt.priority.emplace_back(f.pad_a, f.pad_b);
-    if (!opt.priority.empty()) log(fmt("knowledge base: %zu connections that failed before are routed first", opt.priority.size()));
+    const int previous = kb->failed_connection_count(feat.hash);
+    if (previous > 0) log(fmt("knowledge base: %d connections left unrouted before (reporting only; routing order unchanged)", previous));
   }
   // Component rules (doc 15 §5.5): generated keep-outs are added to an in-memory copy of the board the router
   // sees; the output is written from the original document, so the user's board never gains them.
@@ -416,7 +416,6 @@ RouteJobResult run_route_job(RouteJob job) {
                                   route::portfolio_size());
   if (variants > 1) {
     std::vector<int> pick;
-    if (kb && variants < route::portfolio_size()) pick = kb->choose_variants(feat, route::portfolio_size(), variants, opt.seed);
     log(fmt("portfolio: %d variants on %d thread%s", variants, std::min(threads, variants), std::min(threads, variants) == 1 ? "" : "s"));
     auto pr = route::route_portfolio(*route_board, rules, opt, variants, pick, threads);
     for (std::size_t i = 0; i < pr.variants.size(); ++i)
@@ -433,7 +432,7 @@ RouteJobResult run_route_job(RouteJob job) {
   if (kb) {
     kb->record_run(feat, name, ran, best_index, res.routed, res.connections, res.seconds);
     std::vector<learn::FailedConnection> failed;
-    for (const auto& u : res.unrouted) failed.push_back({u.net, u.a, u.b, 1});
+    for (const auto& u : res.unrouted) failed.push_back({u.net, u.a, u.b});
     kb->record_failures(feat.hash, failed);
   }
   if (!job.out.empty()) {
