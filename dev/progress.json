@@ -764,6 +764,10 @@
      "done": true
     },
     {
+     "text": "Fix plane-search zero heuristic: mandatory via lower bound except with tree goals; OtterCast 76->257 protected and 259->294 off at 3 M; gndplane judged completion 75.6->78.0% protected, 76.5->77.0% off, DRC failures retained (D96)",
+     "done": true
+    },
+    {
      "text": "Fine-pitch QFN fan-out among nearby decoupling (pins boxed in by the router's own earlier tracks)",
      "done": false
     },

@@ -1363,12 +1363,40 @@ uses In2.Cu and no In1.Cu tracks, and an explicit duplicate ban changes nothing.
 same-net union, clipping outside the board, holes/cutouts, crossing edges, missing/stale fills, exclusions,
 and closed/open outline chains.
 
-**Measured checks.** On a temporary routing-stripped copy of PCBench `kitspace_OtterCastAudioV2/raw.kicad_pcb`
-(original zones/fills preserved; no fixture modified), one variant and 3 M work with `--soft-zones`:
-without protection **259/533** engine connections, **25** new In2.Cu tracks; with protection **76/533**,
-In2.Cu GND detected at **68.534963%**, **zero** new In2.Cu tracks. These are engine counts before refill,
-not a KiCad completion claim. The substantial loss at this small budget is why this policy is explicitly
-opt-in: keeping a plane intact can make signal routes harder, and the option does not claim to improve
-completion. The unchanged/default `quick` run (30 boards, 1 M work, `--variants 1`) was compared against
-an unmodified binary built from `924281c50079d1b84a13b175891038af62c02136`: all 30 output boards
-byte-identical, 89.2% mean completion, 12 clean, no added KiCad DRC errors (native KiCad 10.0.3).
+**Search-bound defect found while measuring.** The first OtterCast check at 3 M work routed 259/533
+without protection and only 76/533 with it; an explicit `--no-tracks-on In2.Cu` was identical, so detection
+was not the cause. Per-search diagnostics showed that the banned run spent 1.854 M expansions on 73
+successful In2.Cu plane drops, reaching no pad-to-pad searches before the budget expired. Across 75 matched
+successful attempts, expansions grew 652,509 → 1,881,307 while goal cost grew only 262.6 → 325.2 mm
+(+24%). The transitions correctly admitted a closed plane layer only at an immediate goal; neither wasted
+plane states nor window escalation explained the successful-search flood.
+
+The plane heuristic was zero even when changing layer required a via. This made it Dijkstra: before a
+landing at about 3 mm cost, it expanded all cheaper planar states, including states that still had to pay
+that via. The heuristic now uses the minimum mandatory via cost when the state is on another layer,
+and zero on the target layer. When `tree_end` has goals (including plane ties onto already-joined copper
+on other layers), the bound is zero: those goals may be reached without changing layer. Blind/micro
+transitions cost at least the through-via base cost, and all extras are nonnegative, so this remains an
+admissible lower bound. Geometry, lazy targets and legal landing semantics are unchanged. This applies
+to all plane-drop searches, not just protected planes. Temporary diagnostics were removed.
+
+A two-pad synthetic full-plane test with 10,000 work units now routes both pads with six expansions;
+the old bound routed only one and spent 22,800 expansions. It runs with and without plane protection.
+At 3 M work / one variant / `--soft-zones`, OtterCast now routes **294/533 off** and **257/533 protected**.
+The protected run detects In2.Cu GND at **68.534963%** and still emits no In2.Cu tracks.
+
+| `gndplane`, 14 boards, 3 M, one variant, soft zones, KiCad refill | Before bound | After bound |
+|---|---:|---:|
+| Protection off: mean KiCad completion | 76.5% | 77.0% |
+| Protection on: mean KiCad completion | 75.6% | 78.0% |
+| Protection off: clean boards | 1/14 | 1/14 |
+| Protection on: clean boards | 0/14 | 0/14 |
+
+All 13 other boards retain their routed counts and judged completion in both comparisons. Existing
+f4fc `items_not_allowed` failures remain; OtterCast gains more `track_width` violations as more routes
+are attempted (off 60 → 82, protected 12 → 63). This is not a clean-routing claim. Protection stays
+opt-in: the plane policy can make routes harder even with the corrected bound.
+
+The unchanged/default `quick` run (30 boards, 1 M work, `--variants 1`) was compared against an unmodified
+binary built from `924281c50079d1b84a13b175891038af62c02136`: all 30 output boards byte-identical,
+89.2% mean completion, 12 clean, no added KiCad DRC errors (native KiCad 10.0.3).

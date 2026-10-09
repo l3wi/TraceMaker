@@ -1237,7 +1237,9 @@ struct Router::Impl {
         // stays complete even if the field's view of blocked cells is stale or wrong.
         if (v < gpu::kFieldInf) return static_cast<std::int64_t>(static_cast<double>(v) * opt.heuristic_weight);
       }
-      if (zone_target) return std::int64_t{0};  // plane anywhere nearby: no useful lower bound
+      // A fill can be anywhere nearby, but changing to its layer costs at least one via.
+      // Tree goals may already reach the plane on this layer; then no via cost is mandatory.
+      if (zone_target) return tree_end.empty() && fl != zone_layer ? via_cost : std::int64_t{0};
       if (!goal_dist.empty())
         return static_cast<std::int64_t>(static_cast<double>(goal_dist[static_cast<std::size_t>(gy - w.y0) * static_cast<std::size_t>(w.w) + static_cast<std::size_t>(gx - w.x0)]) *
                                          opt.heuristic_weight);

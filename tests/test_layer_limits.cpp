@@ -240,3 +240,35 @@ TEST_CASE("protect planes: closed line chains; no bounding-box fallback for brok
   REQUIRE(broken.warnings.size() == 1);
   CHECK(broken.warnings[0].find("Edge.Cuts") != std::string::npos);
 }
+
+TEST_CASE("plane targets: mandatory via bound avoids planar floods at a small work budget", "[route][layers]") {
+  const auto b = io::read_board(sexpr::Document::parse(R"((kicad_pcb (version 20240108) (generator pcbnew)
+    (general (thickness 1.6))
+    (layers (0 "F.Cu" signal) (1 "In1.Cu" signal) (2 "In2.Cu" signal) (31 "B.Cu" signal) (44 "Edge.Cuts" user))
+    (setup (pad_to_mask_clearance 0)) (net 0 "") (net 1 "GND")
+    (footprint "T:A" (layer "F.Cu") (at 8 10) (property "Reference" "A")
+      (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "GND")))
+    (footprint "T:B" (layer "F.Cu") (at 22 10) (property "Reference" "B")
+      (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "GND")))
+    (zone (net 1) (net_name "GND") (layer "In1.Cu") (hatch edge 0.5)
+      (connect_pads (clearance 0.2)) (min_thickness 0.25)
+      (polygon (pts (xy 0 0) (xy 30 0) (xy 30 20) (xy 0 20)))
+      (filled_polygon (layer "In1.Cu") (pts (xy 0 0) (xy 30 0) (xy 30 20) (xy 0 20))))
+    (gr_rect (start 0 0) (end 30 20) (stroke (width 0.05) (type default)) (fill none) (layer "Edge.Cuts"))
+  ))"));
+  for (const bool protect : {false, true}) {
+    route::RouterOptions opt;
+    opt.soft_zones = true;
+    opt.gpu_device = -1;
+    opt.work_budget = 10'000;
+    opt.time_limit_s = 600;
+    opt.no_track_layers = route::layer_limits(b, {}, {}, protect).no_track_layers;
+    const auto result = route::Router(b, rules(), opt).run();
+    CAPTURE(protect);
+    CHECK(result.connections == 2);
+    CHECK(result.routed == 2);
+    CHECK(result.vias.size() == 2);
+    CHECK(result.expansions < opt.work_budget);
+    if (protect) CHECK(tracks_on(result, kIn1) == 0);
+  }
+}
