@@ -296,6 +296,7 @@ class Reader {
       fp.exclude_from_pos = has_symbol(at, "exclude_from_pos_files");
       fp.exclude_from_bom = has_symbol(at, "exclude_from_bom");
       fp.allow_missing_courtyard = has_symbol(at, "allow_missing_courtyard");
+      fp.allow_soldermask_bridges = has_symbol(at, "allow_soldermask_bridges");
       fp.dnp = has_symbol(at, "dnp");
     }
     if (NodeId dn = d_.find(f, "dnp"); dn != kNoNode) fp.dnp = yes(f, "dnp");
@@ -379,6 +380,15 @@ class Reader {
         std::vector<Point> poly;
         if (NodeId pts = d_.find(g, "pts"); pts != kNoNode) read_pts(pts, poly, Point{}, 0);
         pad.custom_polys.push_back(std::move(poly));
+      }
+      for (NodeId g : d_.find_all(prim, "gr_circle")) {
+        model::PadCircle circle;
+        circle.centre = child_xy(g, "center");
+        const Point end = child_xy(g, "end");
+        circle.radius = geom::kiround(std::hypot(static_cast<double>(end.x - circle.centre.x), static_cast<double>(end.y - circle.centre.y)));
+        circle.width = child_nm(g, "width");
+        circle.filled = yes(g, "fill");
+        pad.custom_circles.push_back(circle);
       }
     }
     if (NodeId pf = d_.find(p, "pinfunction"); pf != kNoNode) pad.pinfunction = d_.str_at(pf, 1);

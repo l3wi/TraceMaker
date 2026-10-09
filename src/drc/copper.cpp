@@ -82,6 +82,11 @@ std::vector<Shape> pad_shapes(const model::Pad& p) {
       out.push_back(rect(w / 2, h / 2, 0));
       for (const auto& cp : p.custom_polys)
         if (cp.size() >= 3) out.push_back(poly(cp, 0));
+      for (const auto& circle : p.custom_circles) {
+        const Point c = tf(circle.centre);
+        if (circle.filled) out.push_back(Shape::point(c, circle.radius + circle.width / 2));
+        else out.push_back(Shape::polyline(geom::circle_points(c, circle.radius, 100), circle.width / 2));
+      }
       break;
     }
   }
@@ -264,26 +269,134 @@ CopperModel build_copper(const model::Board& b) {
     it.shapes = std::move(shapes);
     it.footprint = g.footprint;
     it.pos = g.pts.empty() ? g.a : g.pts.front();
-    // Footprint copper graphics belong to the net of the pad they overlap (net ties are not modelled).
     finish(it);
     m.items.push_back(std::move(it));
   }
-  // Net-less copper graphics inside a footprint take the net of the footprint pad they touch.
-  for (auto& g : m.items) {
-    if (g.kind != ItemKind::Graphic || g.net != 0 || g.footprint < 0) continue;
-    for (const auto& p : m.items) {
-      if (p.kind != ItemKind::Pad || p.footprint != g.footprint || p.net == 0 || !(p.layers & g.layers)) continue;
-      bool touch = false;
-      for (const auto& s : g.shapes)
-        for (const auto& u : p.shapes)
-          if (geom::closer_than(s, u, 1)) touch = true;
-      if (touch) {
-        g.net = p.net;
+  // Footprint copper drawings stay net-less, including net ties: assigning the first touching
+  // pad's net would make the entire bridge legal for that net, outside KiCad's local exclusion.
+  if (std::any_of(b.footprints.begin(), b.footprints.end(), [](const auto& fp) { return !fp.net_tie_groups.empty(); }))
+    m.net_tie_pads.resize(b.footprints.size());
+  for (std::size_t i = 0; !m.net_tie_pads.empty() && i < m.items.size(); ++i) {
+    const auto& p = m.items[i];
+    if (p.kind != ItemKind::Pad || p.footprint < 0) continue;
+    const auto& fp = b.footprints[static_cast<std::size_t>(p.footprint)];
+    const auto& number = b.pads[static_cast<std::size_t>(p.index)].number;
+    for (const auto& group : fp.net_tie_groups)
+      if (std::find(group.begin(), group.end(), number) != group.end()) {
+        m.net_tie_pads[static_cast<std::size_t>(p.footprint)].push_back(static_cast<int>(i));
         break;
+      }
+  }
+  for (const auto& pads : m.net_tie_pads)
+    for (std::size_t a = 0; a < pads.size() && !m.overlapping_net_tie_pads; ++a)
+      for (std::size_t c = a + 1; c < pads.size() && !m.overlapping_net_tie_pads; ++c) {
+        const auto& first = m.items[static_cast<std::size_t>(pads[a])];
+        const auto& second = m.items[static_cast<std::size_t>(pads[c])];
+        if (first.net == 0 || second.net == 0 || first.net == second.net || !(first.layers & second.layers)) continue;
+        for (const auto& x : first.shapes)
+          for (const auto& y : second.shapes)
+            // Both pad-entry tests include the 500 nm KiCad collision tolerance.
+            if (geom::closer_than(x, y, 1'000)) m.overlapping_net_tie_pads = true;
+      }
+  return m;
+}
+
+namespace {
+
+Point nearest_point(Point p, Point a, Point b) {
+  const geom::i128 dx = b.x - a.x, dy = b.y - a.y;
+  const geom::i128 den = dx * dx + dy * dy;
+  if (den == 0) return a;
+  const geom::i128 num = std::clamp((p.x - a.x) * dx + (p.y - a.y) * dy, geom::i128{0}, den);
+  return {a.x + static_cast<Coord>(dx * num / den), a.y + static_cast<Coord>(dy * num / den)};
+}
+
+// KiCad's SHAPE_LINE_CHAIN/SHAPE_CIRCLE collision location is on the obstacle core, or the
+// contained probe point. SEG::NearestPoint picks the first minimum, so ties stay deterministic.
+Point collision_point(const Shape& probe, const Shape& obstacle) {
+  if (obstacle.closed && geom::point_in_polygon(probe.pts.front(), obstacle.pts)) return probe.pts.front();
+  if (probe.closed && geom::point_in_polygon(obstacle.pts.front(), probe.pts)) return obstacle.pts.front();
+  if (probe.pts.size() == 1 && obstacle.pts.size() == 1)
+    return {(probe.pts[0].x + obstacle.pts[0].x) / 2, (probe.pts[0].y + obstacle.pts[0].y) / 2};
+  if (obstacle.pts.size() == 1 && probe.pts.size() == 2) {
+    const Point centre = obstacle.pts.front(), a = probe.pts.front(), b = probe.pts.back();
+    const Point nearest = nearest_point(centre, a, b);
+    if (nearest == centre && a != b) {
+      // SHAPE_CIRCLE::Collide(SEG) uses its first on-segment circle intersection when the
+      // centre lies on the segment, not the centre itself (KiCad shape_circle.h).
+      const double length = std::hypot(static_cast<double>(b.x - a.x), static_cast<double>(b.y - a.y));
+      const Point offset{geom::kiround(static_cast<double>(b.x - a.x) * static_cast<double>(obstacle.r) / length),
+                         geom::kiround(static_cast<double>(b.y - a.y) * static_cast<double>(obstacle.r) / length)};
+      for (const Point p : {centre + offset, centre - offset})
+        if (geom::point_seg_closer(p, a, b, 2)) return p;
+    }
+    return nearest;
+  }
+  const std::size_t pn = probe.pts.size() == 1 ? 1 : probe.pts.size() - (probe.closed ? 0 : 1);
+  const std::size_t on = obstacle.pts.size() == 1 ? 1 : obstacle.pts.size() - (obstacle.closed ? 0 : 1);
+  Point nearest = obstacle.pts.front();
+  geom::i128 best = -1;
+  for (std::size_t j = 0; j < on; ++j) {
+    const Point a = obstacle.pts[j], b = obstacle.pts[(j + 1) % obstacle.pts.size()];
+    for (std::size_t i = 0; i < pn; ++i) {
+      const Point c = probe.pts[i], d = probe.pts[(i + 1) % probe.pts.size()];
+      if (geom::segments_intersect(a, b, c, d)) {
+        const geom::i128 den = geom::orient({0, 0}, b - a, d - c);
+        if (den != 0) {
+          const geom::i128 num = geom::orient({0, 0}, c - a, d - c);
+          return {a.x + static_cast<Coord>((b.x - a.x) * num / den),
+                  a.y + static_cast<Coord>((b.y - a.y) * num / den)};
+        }
+      }
+      const Point origins[] = {nearest_point(a, c, d), nearest_point(b, c, d), c, d};
+      const Point points[] = {a, b, nearest_point(c, a, b), nearest_point(d, a, b)};
+      for (int k = 0; k < 4; ++k) {
+        const geom::i128 dx = origins[k].x - points[k].x, dy = origins[k].y - points[k].y;
+        const geom::i128 dist = dx * dx + dy * dy;
+        if (best < 0 || dist < best) {
+          best = dist;
+          nearest = points[k];
+        }
       }
     }
   }
-  return m;
+  return nearest;
+}
+
+}  // namespace
+
+model::NetId net_tie_allowed_net(const CopperModel& copper, const Shape& probe,
+                               const CopperItem& obstacle, int layer, Coord epsilon, model::NetId requested_net) {
+  if (obstacle.footprint < 0 || static_cast<std::size_t>(obstacle.footprint) >= copper.net_tie_pads.size()) return 0;
+  const auto& pads = copper.net_tie_pads[static_cast<std::size_t>(obstacle.footprint)];
+  if (pads.empty() || obstacle.shapes.empty()) return 0;
+  const Shape* closest = &obstacle.shapes.front();
+  double best = std::max(0.0, geom::gap(probe, *closest));
+  for (std::size_t i = 1; i < obstacle.shapes.size() && best > 0; ++i) {
+    const auto& shape = obstacle.shapes[i];
+    const double distance = std::max(0.0, geom::gap(probe, shape));
+    if (distance < best) {
+      best = distance;
+      closest = &shape;
+    }
+  }
+  return net_tie_net_at(copper, obstacle.footprint, collision_point(probe, *closest), layer, epsilon, requested_net);
+}
+
+model::NetId net_tie_net_at(const CopperModel& copper, int footprint, Point pos, int layer, Coord epsilon, model::NetId requested_net) {
+  if (footprint < 0 || static_cast<std::size_t>(footprint) >= copper.net_tie_pads.size()) return 0;
+  model::NetId net = 0;
+  for (const int i : copper.net_tie_pads[static_cast<std::size_t>(footprint)]) {
+    const auto& pad = copper.items[static_cast<std::size_t>(i)];
+    if (!(pad.layers & model::layer_bit(layer)) || pad.net == 0 || (requested_net != 0 && pad.net != requested_net)) continue;
+    for (const auto& shape : pad.shapes)
+      if (geom::closer_than_disk(shape, pos, 0, epsilon)) {
+        if (net != 0 && net != pad.net) return 0;  // cannot encode two permitted nets in a fixed code
+        net = pad.net;
+        break;
+      }
+  }
+  return net;
 }
 
 }  // namespace tmk::drc

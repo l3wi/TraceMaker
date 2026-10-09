@@ -69,3 +69,5 @@ set_tests_properties(tree_attach PROPERTIES LABELS "route;integration" TIMEOUT 6
 # Frozen KiCad 10 custom-rule item/pair multisets (expected.json names the judging version); normal runs do not require KiCad.
 add_test(NAME rule_parity COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/rule_parity/run.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/rule_parity)
 set_tests_properties(rule_parity PROPERTIES LABELS "integration;rules" TIMEOUT 300)
+add_test(NAME net_tie COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/net_tie.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/net_tie)
+set_tests_properties(net_tie PROPERTIES SKIP_RETURN_CODE 77 LABELS "route;kicad;integration" TIMEOUT 600)

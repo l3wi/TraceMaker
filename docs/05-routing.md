@@ -133,6 +133,50 @@ them (KiCad 8+ generates teardrops itself; TraceMaker leaves them to KiCad by de
 | 2 | Zone connections (thermal reliefs to planes), solder-mask bridge awareness, blind/buried/micro vias |
 | 3 | Differential pairs (coupled routing as a single "pair" object in search: §15), length and skew targets (meander tuning in cleanup), max uncoupled length (`diff_pair_uncoupled`) |
 
+
+### Net-tie footprint obstacles (D93)
+
+Footprint copper drawings remain net-less. In a net-tie footprint, a track or via of net N may enter
+that drawing only when the collision location lies on a pad of net N listed in `net_tie_pad_groups`.
+Contact with a tied pad elsewhere on a long track is not an exemption for crossing the bridge.
+The tied nets keep their separate net IDs; the bridge is not blanket same-net copper. The untied third
+pad of a three-pad solder jumper and unrelated nets remain obstacles. Exact legality, fixed lattice
+codes (including the per-layer via reference) and the router's own DRC share this collision-local test.
+Where different tied pads overlap, either pad's net may enter that common region; the router uses
+exact per-net lattice checks because the normal fixed-obstacle cache can encode only one allowed net.
+
+KiCad's bridge hole-clearance test uses the drill centre instead of the copper collision point:
+a via's hole may enter the drawing when that centre is on its own tied pad. Hole-to-hole and custom
+physical-hole-clearance rules remain independent, and other nets' pad copper stays protected.
+
+Rounded custom pads also contribute their `gr_circle` primitives, with the same pad transform as
+their polygons. Omitting those circles made valid collision witnesses on a solder jumper's rounded
+lobe appear outside its pad (the `tinytapeout-demo` split-pad jumper exposed this in DRC parity).
+
+KiCad separately ignores mask apertures belonging to a footprint marked
+`(attr allow_soldermask_bridges)`. TraceMaker reads that attribute and omits those pad and graphic
+mask apertures from its routing obstacles; electrical copper and hole clearance are still enforced.
+This matters for the three-pad bridged solder-jumper footprint: its central F.Mask rectangle touches
+several pad nets. Treating that intentional aperture as a forbidden net-less opening boxed in pad 2
+even after the F.Cu bridge was removed.
+
+Sources, pinned to KiCad 10.0.6:
+[DRC_ENGINE::IsNetTieExclusion](https://github.com/KiCad/kicad-source-mirror/blob/10.0.6/pcbnew/drc/drc_engine.cpp),
+[track/via clearance checks](https://github.com/KiCad/kicad-source-mirror/blob/10.0.6/pcbnew/drc/drc_test_provider_copper_clearance.cpp),
+and [checkMaskAperture / checkItemMask](https://github.com/KiCad/kicad-source-mirror/blob/10.0.6/pcbnew/drc/drc_test_provider_solder_mask.cpp).
+
+Validation: the synthetic three-pad regression exercises both tied net entries, foreign and untied
+net rejection, via copper versus drill clearance, fixed-code/reference equality, separate propagated
+net IDs and KiCad DRC. On the `gpu-box-board` copy, each of `/psu/PSU_SYNC_SEL` (JP801.2) and
+`/psu/PSU_TRIP_GATE` (JP802.2) routes 1/1 with `--soft-zones --no-tracks-on In1.Cu`, one variant and
+3M work. KiCad 10.0.3 (the available native judge), after zone refill, reports no added violation
+signatures for either output or for the combined two-jumper output: the original 14 clearance and
+eight hole-clearance errors remain, while unconnected items drop from 26 to 25 individually and
+24 combined. The 30-board quick tier is byte-identical to the origin/main baseline (12 clean,
+89.2% mean completion). Full CTest: 198 passed, three skipped, two pre-existing parity failures;
+`tinytapeout-demo` differs only on annular width (16/0), and broken parity improves from 129/132
+baseline matches to 130/132. The dedicated net-tie unit and native KiCad integration tests pass.
+
 ## 10. Considered and not chosen as the core
 
 | Approach | Why not the core | Role |

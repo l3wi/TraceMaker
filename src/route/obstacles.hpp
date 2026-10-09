@@ -68,8 +68,8 @@ class Obstacles {
                    bool via_hole = false, Coord hole_r = 0) const;
   // Maximum routed_state over `layers` for a via and its hole; layer-independent hole checks run once.
   int routed_via_state(const geom::Shape& s, model::LayerMask layers, model::NetId net, bool soft, Coord hole_r) const;
-  // Rules outside the per-class cache require exact per-point checks.
-  bool needs_exact_routing() const { return re_->needs_exact_routing(); }
+  // Rules and overlapping net-tie pad entries cannot be represented in a single-net class cache.
+  bool needs_exact_routing() const { return re_->needs_exact_routing() || cm_.overlapping_net_tie_pads; }
   // Ids of live routed items whose box meets `box`.
   void routed_items_in(const geom::Box& box, std::vector<int>& out) const;
 

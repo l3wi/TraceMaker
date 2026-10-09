@@ -40,6 +40,12 @@ struct Net {
 enum class PadType : std::uint8_t { Smd, ThruHole, NpThruHole, Connect };
 enum class PadShape : std::uint8_t { Circle, Rect, Oval, Trapezoid, RoundRect, ChamferedRect, Custom };
 
+struct PadCircle {
+  Point centre;
+  Coord radius = 0, width = 0;
+  bool filled = false;
+};
+
 struct Pad {
   int footprint = -1;
   std::string number;
@@ -58,6 +64,7 @@ struct Pad {
   std::uint8_t chamfer_corners = 0;  // bit 0 TL, 1 TR, 2 BL, 3 BR
   Coord trapezoid_dx = 0, trapezoid_dy = 0;  // rect_delta
   std::vector<std::vector<Point>> custom_polys;  // custom primitives (gr_poly) in the pad frame
+  std::vector<PadCircle> custom_circles;  // gr_circle primitives in the pad frame
   Coord clearance = -1;      // local override, -1 = none
   Coord mask_margin = INT64_MIN;  // local solder-mask expansion (unset = INT64_MIN)
   // Schematic pin name and electrical type (KiCad 6+ boards; empty in older files). Read-only, used to
@@ -101,7 +108,7 @@ struct Footprint {
   bool back = false;
   bool locked = false;
   bool attr_smd = false, attr_through_hole = false, board_only = false, exclude_from_pos = false,
-       exclude_from_bom = false, dnp = false, allow_missing_courtyard = false;
+       exclude_from_bom = false, dnp = false, allow_missing_courtyard = false, allow_soldermask_bridges = false;
   std::vector<int> pads;
   std::vector<int> graphics;
   Coord clearance = -1;      // footprint-level clearance override, -1 = none
