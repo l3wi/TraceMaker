@@ -6,6 +6,7 @@
 #include <pybind11/stl.h>
 
 #include <cstdio>
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -16,7 +17,6 @@
 #include "drc/drc.hpp"
 #include "io/kicad/board_reader.hpp"
 #include "io/kicad/project_reader.hpp"
-#include "learn/knowledge_base.hpp"
 
 namespace py = pybind11;
 
@@ -81,34 +81,48 @@ py::object to_python(const nlohmann::json& j) {
 
 std::string opt_str(const std::optional<std::string>& s) { return s.value_or(std::string()); }
 
-// Runs one routing job with the CLI's defaults. `kb`: True = default knowledge base, False/None = none, str = file.
-tmk::app::RouteJobResult run_job(const std::string& in, const std::optional<std::string>& out, double time_s, int threads, int variants,
-                                 long work, std::uint64_t seed, bool view, const std::string& view_host, int view_port, bool gpu, const py::object& kb,
-                                 double pitch_um, double via_cost_mm, bool optimize, bool rip_up, bool global_route,
-                                 const std::optional<std::string>& items_out, const std::optional<std::string>& json_out,
-                                 const std::optional<std::string>& record, bool verbose, std::vector<std::string>& log) {
+// Keywords remain compatible; omitted values come from RouteJob/RouterOptions, not another default table.
+tmk::app::RouteJobResult run_job(const std::string& in, const std::optional<std::string>& out, const py::kwargs& kwargs,
+                                std::vector<std::string>& log) {
   tmk::app::RouteJob job;
   job.in = in;
   job.out = opt_str(out);
-  job.opt.time_limit_s = time_s;
-  job.opt.work_budget = work;
-  job.opt.seed = seed;
-  job.opt.pitch = static_cast<tmk::Coord>(pitch_um * 1000.0);
-  job.opt.via_cost_mm = via_cost_mm;
-  job.opt.optimize = optimize;
-  job.opt.rip_up = rip_up;
-  job.opt.global_route = global_route;
-  job.threads = threads;
-  job.variants = variants;
-  if (py::isinstance<py::str>(kb)) job.kb_path = kb.cast<std::string>();
-  else if (!kb.is_none() && kb.cast<bool>()) job.kb_path = tmk::learn::KnowledgeBase::default_path();
-  job.items_out = opt_str(items_out);
-  job.json_out = opt_str(json_out);
-  job.view = view;
-  job.view_host = view_host;
-  job.view_port = view_port;
-  job.record = opt_str(record);
-  // Called on this thread only, without the GIL: collect, and optionally echo like the CLI.
+  std::vector<std::string> args;
+  bool verbose = false;
+  static const std::map<std::string, std::string> values{
+      {"time_s", "--time"}, {"threads", "--threads"}, {"variants", "--variants"}, {"work", "--work"}, {"seed", "--seed"},
+      {"view_host", "--view-host"}, {"view_port", "--view-port"}, {"pitch_um", "--pitch-um"}, {"via_cost_mm", "--via-cost-mm"},
+      {"items_out", "--emit-items"}, {"json_out", "--json"}, {"record", "--record"}, {"project", "--project"}};
+  static const std::map<std::string, std::pair<std::string, std::string>> flags{
+      {"view", {"--view", ""}}, {"gpu", {"", "--no-gpu"}}, {"optimize", {"", "--no-optimize"}},
+      {"rip_up", {"", "--no-rip-up"}}, {"global_route", {"--global", ""}}};
+  for (const auto& entry : kwargs) {
+    const std::string key = py::str(entry.first);
+    const auto value = entry.second;
+    if (key == "args") continue;
+    if (key == "verbose") {
+      verbose = py::cast<bool>(value);
+    } else if (key == "kb") {
+      if (py::isinstance<py::str>(value)) {
+        args.insert(args.end(), {"--kb", py::cast<std::string>(value)});
+      } else if (value.is_none() || !py::cast<bool>(value)) {
+        args.push_back("--no-kb");
+      }
+    } else if (const auto it = values.find(key); it != values.end()) {
+      if (!value.is_none()) args.insert(args.end(), {it->second, py::str(value).cast<std::string>()});
+    } else if (const auto flag_it = flags.find(key); flag_it != flags.end()) {
+      const auto& flag = py::cast<bool>(value) ? flag_it->second.first : flag_it->second.second;
+      if (!flag.empty()) args.push_back(flag);
+    } else {
+      throw py::type_error("unknown route keyword: " + key);
+    }
+  }
+  job = tmk::app::parse_route_args(std::move(job), args);
+  // CLI-spelled arguments take precedence over legacy keywords.
+  if (kwargs.contains("args")) {
+    const auto extra = kwargs["args"].cast<std::vector<std::string>>();
+    job = tmk::app::parse_route_args(std::move(job), extra);
+  }
   job.log = [&log, verbose](const std::string& line) {
     log.push_back(line);
     if (verbose) {
@@ -117,58 +131,32 @@ tmk::app::RouteJobResult run_job(const std::string& in, const std::optional<std:
     }
   };
   py::gil_scoped_release nogil;
-  job.opt.gpu_device = tmk::app::default_gpu_device(gpu);
   return tmk::app::run_route_job(std::move(job));
 }
 
-#define TM_ROUTE_ARGS                                                                                                          \
-  py::arg("path_in"), py::arg("path_out") = py::none(), py::kw_only(), py::arg("time_s") = 120.0, py::arg("threads") = 8,       \
-      py::arg("variants") = 0, py::arg("work") = 0L, py::arg("seed") = 1ULL, py::arg("view") = false, py::arg("view_host") = "0.0.0.0",                 \
-      py::arg("view_port") = 8766, py::arg("gpu") = true, py::arg("kb") = true, py::arg("pitch_um") = 0.0,                      \
-      py::arg("via_cost_mm") = 3.0, py::arg("optimize") = true, py::arg("rip_up") = true, py::arg("global_route") = false,     \
-      py::arg("items_out") = py::none(), py::arg("json_out") = py::none(), py::arg("record") = py::none(),                    \
-      py::arg("verbose") = false
-
-py::dict route(const std::string& in, const std::optional<std::string>& out, double time_s, int threads, int variants, long work, std::uint64_t seed,
-               bool view, const std::string& view_host, int view_port, bool gpu, const py::object& kb, double pitch_um, double via_cost_mm,
-               bool optimize, bool rip_up, bool global_route, const std::optional<std::string>& items_out,
-               const std::optional<std::string>& json_out, const std::optional<std::string>& record, bool verbose) {
+py::dict route(const std::string& in, const std::optional<std::string>& out, const py::kwargs& kwargs) {
   std::vector<std::string> log;
-  const auto r = run_job(in, out, time_s, threads, variants, work, seed, view, view_host, view_port, gpu, kb, pitch_um, via_cost_mm, optimize, rip_up,
-                         global_route, items_out, json_out, record, verbose, log);
+  const auto r = run_job(in, out, kwargs, log);
   py::dict d = to_python(r.summary).cast<py::dict>();
-  py::list unrouted;
-  for (const auto& u : r.result.unrouted) {
-    py::dict e;
-    e["net"] = u.net;
-    e["a"] = u.a;
-    e["b"] = u.b;
-    unrouted.append(e);
-  }
-  d["unrouted"] = unrouted;
   d["exit_code"] = r.exit_code();
   d["viewer_url"] = r.viewer_url;
   d["log"] = log;
   return d;
 }
 
-py::dict emit_items(const std::string& in, const std::optional<std::string>& out, double time_s, int threads, int variants, long work, std::uint64_t seed,
-                    bool view, const std::string& view_host, int view_port, bool gpu, const py::object& kb, double pitch_um,
-                    double via_cost_mm, bool optimize, bool rip_up, bool global_route, const std::optional<std::string>& items_out,
-                    const std::optional<std::string>& json_out, const std::optional<std::string>& record, bool verbose) {
+py::dict emit_items(const std::string& in, const std::optional<std::string>& out, const py::kwargs& kwargs) {
   std::vector<std::string> log;
-  const auto r = run_job(in, out, time_s, threads, variants, work, seed, view, view_host, view_port, gpu, kb, pitch_um, via_cost_mm, optimize, rip_up,
-                         global_route, items_out, json_out, record, verbose, log);
+  const auto r = run_job(in, out, kwargs, log);
   return to_python(r.items).cast<py::dict>();
 }
 
-py::list drc(const std::string& path, double epsilon_um, bool unconnected) {
+py::list drc(const std::string& path, double epsilon_um, bool unconnected, const std::string& project) {
   tmk::drc::DrcReport rep;
   std::vector<std::string> copper;
   {
     py::gil_scoped_release nogil;
     const auto lb = tmk::io::read_board_file(path);
-    const auto rules = tmk::io::read_design_rules(path);
+    const auto rules = tmk::io::read_design_rules(path, project);
     tmk::drc::DrcOptions opt;
     opt.epsilon = static_cast<tmk::Coord>(epsilon_um * 1000.0);
     rep = tmk::drc::run_drc(lb.board, rules, opt);
@@ -228,14 +216,14 @@ PYBIND11_MODULE(tracemaker, m) {
       });
 
   m.def("read_board", &read_board, py::arg("path"), "Read a .kicad_pcb and return a Board summary");
-  m.def("route", &route, TM_ROUTE_ARGS,
+  m.def("route", &route, py::arg("path_in"), py::arg("path_out") = py::none(),
         "Route all unrouted connections (same code path as `tracemaker route`). Writes path_out when given and returns a dict "
-        "with routed, connections, tracks, vias, seconds, expansions, pitch_mm, failures, unrouted, exit_code, viewer_url, log. "
-        "The GIL is released while routing.");
-  m.def("emit_items", &emit_items, TM_ROUTE_ARGS,
+        "with routed, connections, tracks, vias, seconds, expansions, pitch_mm, failures, unrouted, rules, exit_code, viewer_url, log. "
+        "Pass args=[...] for every CLI option; existing keyword options remain supported. The GIL is released while routing.");
+  m.def("emit_items", &emit_items, py::arg("path_in"), py::arg("path_out") = py::none(),
         "Route like route() and return the new copper as {'tracks': [...], 'vias': [...]} (the `route --emit-items` layout: "
         "layer and net by name, coordinates in nm)");
-  m.def("drc", &drc, py::arg("path"), py::arg("epsilon_um") = 0.5, py::arg("unconnected") = true,
+  m.def("drc", &drc, py::arg("path"), py::arg("epsilon_um") = 0.5, py::arg("unconnected") = true, py::arg("project") = "",
         "Run TraceMaker's DRC on a board with its KiCad design rules; one dict per violation (KiCad type names), "
         "followed by the unconnected items when `unconnected` is true");
 }

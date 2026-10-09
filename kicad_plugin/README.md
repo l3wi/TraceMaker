@@ -74,13 +74,14 @@ tracemaker.drc("routed.kicad_pcb")                 # list of violations (KiCad t
 tracemaker.emit_items("board.kicad_pcb", work=2_000_000)   # new copper, `route --emit-items` layout
 ```
 
-`route()` takes `work=` (deterministic budget), `seed=`, `kb=` (knowledge base: True, False or a path), `gpu=`,
-`view=`, `verbose=` and the other CLI options; the GIL is released while routing.
+`route()` and `emit_items()` accept every CLI route option as `args=[...]`; existing keywords such as
+`work=`, `seed=`, `kb=`, `gpu=`, `view=` and `verbose=` still work. Explicit `args` override keywords.
+The GIL is released while routing.
 
 ## Tests
 
-- `test_offline.py ITEMS_JSON`: TraceMaker's `--emit-items` output becomes valid kipy Track/Via objects, and
-  `TRACEMAKER_ARGS` maps onto the module's keyword arguments (kicad-python 0.8, no KiCad needed).
+- `test_offline.py ITEMS_JSON`: TraceMaker's `--emit-items` output becomes valid kipy Track/Via objects
+  (kicad-python 0.8, no KiCad needed). `TRACEMAKER_ARGS` goes unchanged to the shared engine parser.
 - `bindings/test_bindings.py` (ctest `python_bindings`): module against CLI, byte-identical boards.
 - ctest `pcm_package`: builds and validates the PCM archive.
 

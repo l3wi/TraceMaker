@@ -160,6 +160,36 @@ struct RouteResult {
   std::vector<std::string> failures;  // one line per unrouted connection
   struct Unrouted {
     std::string net, a, b;  // "REF.NUM" (b = "zone" for plane connections)
+    std::string reason, detail;
+    model::Point a_pos{}, b_pos{};  // nm; b has no position/layers when it is a zone
+    model::LayerMask a_layers = 0, b_layers = 0;
+    bool has_b_position = false;
+
+    // Classify the final outcome, not an earlier attempt in a compound diagnostic.
+    static const char* classify(const std::string& detail) {
+      if (detail.empty()) return "not_attempted";
+      const auto sep = detail.rfind("; ");
+      std::size_t start = sep == std::string::npos ? 0 : sep + 2;
+      const auto colon = detail.find(": ", start);
+      if (sep != std::string::npos && colon != std::string::npos) start = colon + 2;
+      const auto is = [&](const char* text) { return detail.compare(start, std::char_traits<char>::length(text), text) == 0; };
+      if (is("fixed copper encloses the pin")) return "enclosed_by_fixed_copper";
+      if (is("boxed in (target)")) return "boxed_in_target";
+      if (is("boxed in")) return "boxed_in_source";
+      if (is("no path in window") || is("corridor blocked")) return "no_path_in_window";
+      if (is("search budget") || is("pair search budget")) return "search_budget";
+      if (is("skipped: identical earlier attempt failed (nogood)")) return "nogood_skip";
+      if (is("would rip a connection already ripped too often")) return "rip_cap";
+      if (is("would rip a --first-nets connection")) return "protected_net";
+      if (is("exact check")) return "exact_check_rejected";
+      if (is("track on a layer that takes no tracks") || is("no common layer at an end")) return "layer_stranded";
+      if (is("out of budget")) return "out_of_budget";
+      if (is("ripped up by ")) return "ripped_not_rerouted";
+      if (is("too short to couple")) return "pair_too_short";
+      if (is("no coupled path")) return "no_coupled_path";
+      if (is("would enclose pin ")) return "would_enclose_pin";
+      return "unknown";  // retain the complete detail for future router diagnostics
+    }
   };
   std::vector<Unrouted> unrouted;
 };

@@ -23,7 +23,6 @@ Environment:
 """
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import shlex
@@ -95,30 +94,6 @@ def find_binary():
     return shutil.which("tracemaker")
 
 
-def route_kwargs(args: list) -> dict:
-    """Maps the CLI's route options (TRACEMAKER_ARGS) to tracemaker.route() keyword arguments."""
-    p = argparse.ArgumentParser(add_help=False)
-    p.add_argument("--time", dest="time_s", type=float)
-    p.add_argument("--threads", type=int)
-    p.add_argument("--variants", type=int)
-    p.add_argument("--work", type=int)
-    p.add_argument("--seed", type=int)
-    p.add_argument("--pitch-um", dest="pitch_um", type=float)
-    p.add_argument("--via-cost-mm", dest="via_cost_mm", type=float)
-    p.add_argument("--view", action="store_true", default=None)
-    p.add_argument("--view-host")
-    p.add_argument("--view-port", type=int)
-    p.add_argument("--kb")
-    p.add_argument("--no-kb", dest="kb", action="store_false")
-    p.add_argument("--no-gpu", dest="gpu", action="store_false", default=None)
-    p.add_argument("--no-optimize", dest="optimize", action="store_false", default=None)
-    p.add_argument("--no-rip-up", dest="rip_up", action="store_false", default=None)
-    p.add_argument("--global", dest="global_route", action="store_true", default=None)
-    p.add_argument("--record")
-    known, unknown = p.parse_known_args(args)
-    if unknown:
-        print(f"TraceMaker: ignoring options the Python module does not take: {' '.join(unknown)}", file=sys.stderr)
-    return {k: v for k, v in vars(known).items() if v is not None}
 
 
 def find_placer():
@@ -166,11 +141,11 @@ def run_placer(src: str, out: str, report: str, mode: str) -> dict:
 def run_engine(src: str, out: str, items_path: str, extra: list | None = None) -> bool:
     """Routes `src`, writing the routed board to `out` and the new copper as JSON to `items_path`."""
     args = shlex.split(os.environ.get("TRACEMAKER_ARGS", "--time 120")) + (extra or [])
-    tm = None if extra else find_bindings()  # the module takes no --reroute
+    tm = find_bindings()
     if tm is not None:
         print(f"TraceMaker {tm.__version__} (Python module)", flush=True)
         try:
-            r = tm.route(src, out, items_out=items_path, verbose=True, **route_kwargs(args))
+            r = tm.route(src, out, items_out=items_path, verbose=True, args=args)
         except Exception as e:  # noqa: BLE001 - shown to the user in KiCad's plugin output
             print(f"TraceMaker: {e}", file=sys.stderr)
             return False
