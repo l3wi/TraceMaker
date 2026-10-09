@@ -760,6 +760,14 @@
      "done": true
     },
     {
+     "text": "Opt-in --protect-planes: >=60% clipped same-net outline union on inner layers; shared CLI/Python/plugin parser, logs/JSON, no tracks but vias still reach planes (D96, doc 05 \u00a741)",
+     "done": true
+    },
+    {
+     "text": "Fix plane-search zero heuristic: mandatory via lower bound except with tree goals; OtterCast 76->257 protected and 259->294 off at 3 M; gndplane judged completion 75.6->78.0% protected, 76.5->77.0% off, DRC failures retained (D96)",
+     "done": true
+    },
+    {
      "text": "Plane drops from a pad's island of existing copper with --tree-attach, not through routed copper or stale fills (D97, doc 05 \u00a742)",
      "done": true
     },

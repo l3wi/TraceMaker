@@ -174,6 +174,8 @@ void add_route_options(CLI::App& app, RouteJob& job, bool require_paths) {
                     "with --work. --time applies to each variant from its start");
   route->add_option("--no-tracks-on", r_job.no_tracks_on, "Copper layers that get no new tracks, e.g. In1.Cu,In2.Cu (vias still pass through and reach zone fills there)")
       ->delimiter(',');
+  route->add_flag("--protect-planes", r_job.protect_planes,
+                  "No new tracks on inner layers where one net's zone outlines cover at least 60% of the board (vias still reach planes)");
   route->add_option("--layer-cost", r_job.layer_costs, "Track cost per layer as LAYER=FACTOR, e.g. In1.Cu=4,In2.Cu=4 (1 = normal, at most 1000)")->delimiter(',');
   route->add_flag("--view", r_job.view, "Stream the routing live to the browser viewer");
   route->add_option("--record", r_job.record, "Write the routing events (JSON lines, time-stamped) to a file for replay; zstd-compressed if FILE ends in .zst");
@@ -253,9 +255,23 @@ RouteJobResult run_route_job(RouteJob job) {
     }
     log(fmt("reroute: %d unlocked copper items removed%s", removed, job.reroute ? "" : " from selected nets"));
   }
-  if (!job.no_tracks_on.empty() || !job.layer_costs.empty()) {
+  std::vector<route::ProtectedPlane> protected_planes;
+  if (job.protect_planes || !job.no_tracks_on.empty() || !job.layer_costs.empty()) {
     const auto& bd = lb.board;
-    const auto lim = route::layer_limits(bd, job.no_tracks_on, job.layer_costs);
+    auto lim = route::layer_limits(bd, job.no_tracks_on, job.layer_costs, job.protect_planes);
+    protected_planes = std::move(lim.protected_planes);
+    if (job.protect_planes) {
+      std::string planes;
+      for (const auto& plane : protected_planes)
+        planes += (planes.empty() ? "" : ", ") +
+                  fmt("%s (%s, %.1f%%)", bd.copper_name(plane.layer).c_str(),
+                      bd.nets[static_cast<std::size_t>(plane.net)].name.c_str(), plane.coverage * 100);
+      log("protected planes: " + (planes.empty() ? std::string("none") : planes));
+    }
+    for (const auto& warning : lim.warnings) {
+      log("warning: " + warning);
+      rule_warnings.push_back(warning);
+    }
     opt.no_track_layers = lim.no_track_layers;
     opt.layer_cost_pm = lim.layer_cost_pm;
     std::string names;
@@ -467,6 +483,12 @@ RouteJobResult run_route_job(RouteJob job) {
                  {"escape_corridors", res.escape_corridors}, {"stop", res.stop.empty() ? "complete" : res.stop}};
   out.summary["rules"] = {{"project", sources.project}, {"dru", sources.dru}, {"warnings", rule_warnings},
                           {"project_loaded", std::filesystem::exists(sources.project)}, {"dru_loaded", std::filesystem::exists(sources.dru)}};
+  if (job.protect_planes) {
+    out.summary["protected_planes"] = nlohmann::json::array();
+    for (const auto& plane : protected_planes)
+      out.summary["protected_planes"].push_back({{"layer", lb.board.copper_name(plane.layer)},
+          {"net", lb.board.nets[static_cast<std::size_t>(plane.net)].name}, {"coverage", plane.coverage}});
+  }
   out.summary["unrouted"] = nlohmann::json::array();
   auto layer_names = [&](model::LayerMask mask) {
     std::vector<std::string> names;

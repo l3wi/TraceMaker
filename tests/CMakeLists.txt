@@ -74,3 +74,5 @@ add_test(NAME rule_parity COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integratio
 set_tests_properties(rule_parity PROPERTIES LABELS "integration;rules" TIMEOUT 300)
 add_test(NAME net_tie COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/net_tie.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/net_tie)
 set_tests_properties(net_tie PROPERTIES SKIP_RETURN_CODE 77 LABELS "route;kicad;integration" TIMEOUT 600)
+add_test(NAME protect_planes COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/protect_planes.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/protect_planes)
+set_tests_properties(protect_planes PROPERTIES LABELS "route;integration" TIMEOUT 600)

@@ -1326,6 +1326,81 @@ all other connections, so that ground would take no channels from signals: `plan
 cannot make; left to the end they find their channels taken. Plane drops already go early without it (a pad
 inside a fill gets a connection of length 0, and connections are routed shortest first).
 
+## 41. Automatic inner-plane protection (2026-10-10, D96)
+
+`--protect-planes` is opt-in and uses the shared route-job parser: CLI, Python `args`, and the plugin's
+`TRACEMAKER_ARGS` all spell the same option. For each **inner** copper layer, group ordinary zones by net,
+take the union of each net's zone outlines, intersect it with the closed Edge.Cuts region, and divide by
+that region's area. A net covering **at least 60%** marks the layer as protected. Rule areas, keepouts,
+teardrops, and unassigned zones do not count. Layer type/name and cached fills do not decide coverage:
+antipads shrink fills, and fills can be stale or absent before refill. Overlapping zones count once;
+board cutouts and zone holes use even/odd membership. The implementation integrates the clipped union
+between boundary vertices/intersections, not a bounding box or raster approximation. Curves represented
+as arcs are flattened with 1 µm sagitta; endpoint joins accept KiCad's 0.01 mm outline tolerance.
+An open, branching, Bezier, or zero-area outline produces a log/JSON warning and no automatic protection;
+there is no bounding-box fallback.
+
+The threshold matches the `gndplane` tier's plane measure (doc 10). It includes OtterCast's split In2.Cu
+GND plane (59.9% and 8.7% in two disjoint zones, **68.5% union**), Aria's In1.Cu GND (89.3%) and In2.Cu
++3V3 (80.4%), and LoRaPP's two 100% inner GND planes, but rejects a 30% partial pour. Requiring more than
+half leaves room for antipad-independent partial-board planes without treating two half-board split
+power pours as a solid plane. Protection is not limited to ground: large inner power planes also qualify.
+Outer layers are never automatically protected, including two-layer boards and L1/L4 power pours plus
+signals.
+
+Detected layers union with `--no-tracks-on` into its existing mask (§29), without duplicate names.
+No new track may use the layer, but vias still pass through it and can end a connection in its same-net
+fill. Existing tracks are unchanged. Pads only on protected layers get the same stranded-pad warning and
+stay unrouted. A single `protected planes:` log line lists canonical layer names, net names, and coverage;
+if several nets qualify, the highest coverage wins (ties use ascending net ID). With the flag on, the
+route JSON has `protected_planes: [{\"layer\": \"In1.Cu\", \"net\": \"GND\", \"coverage\": 1.0}]`;
+coverage is a fraction, and the array is in stack order. With the flag off the detection and this JSON
+field are absent.
+
+Tests: `tests/integration/protect_planes.py` routes a synthetic four-layer board with a full In1.Cu GND
+outline and a 30% In2.Cu power outline, without fills: the unprotected run uses In1.Cu, the protected run
+uses In2.Cu and no In1.Cu tracks, and an explicit duplicate ban changes nothing. Unit tests exercise
+same-net union, clipping outside the board, holes/cutouts, crossing edges, missing/stale fills, exclusions,
+and closed/open outline chains.
+
+**Search-bound defect found while measuring.** The first OtterCast check at 3 M work routed 259/533
+without protection and only 76/533 with it; an explicit `--no-tracks-on In2.Cu` was identical, so detection
+was not the cause. Per-search diagnostics showed that the banned run spent 1.854 M expansions on 73
+successful In2.Cu plane drops, reaching no pad-to-pad searches before the budget expired. Across 75 matched
+successful attempts, expansions grew 652,509 → 1,881,307 while goal cost grew only 262.6 → 325.2 mm
+(+24%). The transitions correctly admitted a closed plane layer only at an immediate goal; neither wasted
+plane states nor window escalation explained the successful-search flood.
+
+The plane heuristic was zero even when changing layer required a via. This made it Dijkstra: before a
+landing at about 3 mm cost, it expanded all cheaper planar states, including states that still had to pay
+that via. The heuristic now uses the minimum mandatory via cost when the state is on another layer,
+and zero on the target layer. When `tree_end` has goals (including plane ties onto already-joined copper
+on other layers), the bound is zero: those goals may be reached without changing layer. Blind/micro
+transitions cost at least the through-via base cost, and all extras are nonnegative, so this remains an
+admissible lower bound. Geometry, lazy targets and legal landing semantics are unchanged. This applies
+to all plane-drop searches, not just protected planes. Temporary diagnostics were removed.
+
+A two-pad synthetic full-plane test with 10,000 work units now routes both pads with six expansions;
+the old bound routed only one and spent 22,800 expansions. It runs with and without plane protection.
+At 3 M work / one variant / `--soft-zones`, OtterCast now routes **294/533 off** and **257/533 protected**.
+The protected run detects In2.Cu GND at **68.534963%** and still emits no In2.Cu tracks.
+
+| `gndplane`, 14 boards, 3 M, one variant, soft zones, KiCad refill | Before bound | After bound |
+|---|---:|---:|
+| Protection off: mean KiCad completion | 76.5% | 77.0% |
+| Protection on: mean KiCad completion | 75.6% | 78.0% |
+| Protection off: clean boards | 1/14 | 1/14 |
+| Protection on: clean boards | 0/14 | 0/14 |
+
+All 13 other boards retain their routed counts and judged completion in both comparisons. Existing
+f4fc `items_not_allowed` failures remain; OtterCast gains more `track_width` violations as more routes
+are attempted (off 60 → 82, protected 12 → 63). This is not a clean-routing claim. Protection stays
+opt-in: the plane policy can make routes harder even with the corrected bound.
+
+The unchanged/default `quick` run (30 boards, 1 M work, `--variants 1`) was compared against an unmodified
+binary built from `924281c50079d1b84a13b175891038af62c02136`: all 30 output boards byte-identical,
+89.2% mean completion, 12 clean, no added KiCad DRC errors (native KiCad 10.0.3).
+
 ## 42. Plane drops from a pad's island (2026-10-11, D97)
 
 **Problem.** A pad tied to other pads of its net by existing copper (hand-routed GND tracks, a footprint's joined

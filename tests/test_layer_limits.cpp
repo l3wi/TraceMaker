@@ -3,6 +3,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <string>
 
 #include "io/kicad/board_reader.hpp"
@@ -155,5 +156,119 @@ TEST_CASE("layer limits: a dearer layer is avoided while a plain one will do, an
     CHECK(plain.tracks[i].a == ones.tracks[i].a);
     CHECK(plain.tracks[i].b == ones.tracks[i].b);
     CHECK(plain.tracks[i].layer == ones.tracks[i].layer);
+  }
+}
+
+TEST_CASE("protect planes: clipped same-net union, not fills or different-net sums", "[route][layers]") {
+  auto b = board({});
+  b.zones.clear();
+  auto zone = [](int layer, model::NetId net, int x0, int y0, int x1, int y1) {
+    model::Zone z;
+    z.net = net;
+    z.copper = model::layer_bit(layer);
+    z.outline = {{{x0 * 1'000'000LL, y0 * 1'000'000LL}, {x1 * 1'000'000LL, y0 * 1'000'000LL},
+                  {x1 * 1'000'000LL, y1 * 1'000'000LL}, {x0 * 1'000'000LL, y1 * 1'000'000LL}}};
+    return z;
+  };
+  // Each contributes 40% after clipping; overlap is 20%, hence the union is 60%, not 80%.
+  b.zones = {zone(kIn1, 3, -10, 0, 12, 20), zone(kIn1, 3, 6, 0, 18, 20),
+             zone(kIn2, 1, 0, 0, 9, 20), zone(kIn2, 3, 9, 0, 18, 20),
+             zone(kF, 3, 0, 0, 30, 20), zone(kB, 3, 0, 0, 30, 20)};
+  auto fake = zone(kIn2, 3, 0, 0, 30, 20);
+  fake.rule_area = true;
+  b.zones.push_back(fake);
+  fake.rule_area = false;
+  fake.teardrop = true;
+  b.zones.push_back(fake);
+  b.zones[2].fills.push_back({kIn2, zone(kIn2, 1, 0, 0, 30, 20).outline.front()});  // stale fill
+  CHECK(route::layer_limits(b, {}, {}).no_track_layers == 0);
+  const auto limits = route::layer_limits(b, {"In1.Cu", "B.Cu"}, {}, true);
+  REQUIRE(limits.protected_planes.size() == 1);
+  CHECK(limits.no_track_layers == (model::layer_bit(kIn1) | model::layer_bit(kB)));
+  CHECK(limits.protected_planes[0].layer == kIn1);
+  CHECK(limits.protected_planes[0].net == 3);
+  CHECK(std::abs(limits.protected_planes[0].coverage - 0.6) < 1e-12);
+
+  // A zone hole removes half its area. Board cutouts are removed from both numerator and denominator.
+  b.zones = {zone(kIn1, 3, 0, 0, 30, 20)};
+  b.zones.front().outline.push_back(zone(kIn1, 3, 0, 0, 15, 20).outline.front());
+  const auto half = route::layer_limits(b, {}, {}, true);
+  CHECK(half.protected_planes.empty());
+  model::Graphic hole;
+  hole.kind = model::Graphic::Kind::Rect;
+  hole.layer = "Edge.Cuts";
+  hole.a = {1'000'000, 1'000'000};
+  hole.b = {14'000'000, 19'000'000};
+  b.graphics.push_back(hole);
+  const auto cutout = route::layer_limits(b, {}, {}, true);
+  REQUIRE(cutout.protected_planes.size() == 1);
+  CHECK(std::abs(cutout.protected_planes[0].coverage - 300.0 / 366.0) < 1e-12);
+
+  // Sloping boundaries and crossing zone edges add sweep events, not just vertex x coordinates.
+  b.graphics.pop_back();
+  b.zones = {zone(kIn1, 3, 0, 0, 30, 20), zone(kIn1, 3, 0, 0, 30, 20)};
+  b.zones[0].outline = {{{0, 0}, {30'000'000, 0}, {0, 20'000'000}}};
+  b.zones[1].outline = {{{0, 0}, {30'000'000, 0}, {30'000'000, 20'000'000}}};
+  const auto crossing = route::layer_limits(b, {}, {}, true);
+  REQUIRE(crossing.protected_planes.size() == 1);
+  CHECK(std::abs(crossing.protected_planes[0].coverage - 0.75) < 1e-12);
+}
+
+TEST_CASE("protect planes: closed line chains; no bounding-box fallback for broken Edge.Cuts", "[route][layers]") {
+  auto b = board({});
+  b.zones.front().outline = {{{0, 0}, {30'000'000, 0}, {30'000'000, 20'000'000}, {0, 20'000'000}}};
+  const auto rect = b.graphics.back();
+  b.graphics.clear();
+  const std::vector<geom::Point> pts = {rect.a, {rect.b.x, rect.a.y}, rect.b, {rect.a.x, rect.b.y}};
+  for (std::size_t i = 0; i < pts.size(); ++i) {
+    model::Graphic line;
+    line.layer = "Edge.Cuts";
+    line.a = pts[(i + 1) % pts.size()];  // reversed endpoints and shuffled chains
+    line.b = pts[i];
+    b.graphics.insert(b.graphics.begin(), line);
+  }
+  REQUIRE(route::layer_limits(b, {}, {}, true).protected_planes.size() == 1);
+  b.graphics.front().a.x += 5'000;  // rounding-scale endpoint gap, within KiCad's 10 µm tolerance
+  REQUIRE(route::layer_limits(b, {}, {}, true).protected_planes.size() == 1);
+  b.graphics.front().a.x += 20'000;
+  CHECK(route::layer_limits(b, {}, {}, true).protected_planes.empty());
+  b.graphics.front().a.x -= 25'000;
+  b.graphics.pop_back();
+  const auto broken = route::layer_limits(b, {}, {}, true);
+  CHECK(broken.no_track_layers == 0);
+  CHECK(broken.protected_planes.empty());
+  REQUIRE(broken.warnings.size() == 1);
+  CHECK(broken.warnings[0].find("Edge.Cuts") != std::string::npos);
+}
+
+TEST_CASE("plane targets: mandatory via bound avoids planar floods at a small work budget", "[route][layers]") {
+  const auto b = io::read_board(sexpr::Document::parse(R"((kicad_pcb (version 20240108) (generator pcbnew)
+    (general (thickness 1.6))
+    (layers (0 "F.Cu" signal) (1 "In1.Cu" signal) (2 "In2.Cu" signal) (31 "B.Cu" signal) (44 "Edge.Cuts" user))
+    (setup (pad_to_mask_clearance 0)) (net 0 "") (net 1 "GND")
+    (footprint "T:A" (layer "F.Cu") (at 8 10) (property "Reference" "A")
+      (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "GND")))
+    (footprint "T:B" (layer "F.Cu") (at 22 10) (property "Reference" "B")
+      (pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu") (net 1 "GND")))
+    (zone (net 1) (net_name "GND") (layer "In1.Cu") (hatch edge 0.5)
+      (connect_pads (clearance 0.2)) (min_thickness 0.25)
+      (polygon (pts (xy 0 0) (xy 30 0) (xy 30 20) (xy 0 20)))
+      (filled_polygon (layer "In1.Cu") (pts (xy 0 0) (xy 30 0) (xy 30 20) (xy 0 20))))
+    (gr_rect (start 0 0) (end 30 20) (stroke (width 0.05) (type default)) (fill none) (layer "Edge.Cuts"))
+  ))"));
+  for (const bool protect : {false, true}) {
+    route::RouterOptions opt;
+    opt.soft_zones = true;
+    opt.gpu_device = -1;
+    opt.work_budget = 10'000;
+    opt.time_limit_s = 600;
+    opt.no_track_layers = route::layer_limits(b, {}, {}, protect).no_track_layers;
+    const auto result = route::Router(b, rules(), opt).run();
+    CAPTURE(protect);
+    CHECK(result.connections == 2);
+    CHECK(result.routed == 2);
+    CHECK(result.vias.size() == 2);
+    CHECK(result.expansions < opt.work_budget);
+    if (protect) CHECK(tracks_on(result, kIn1) == 0);
   }
 }

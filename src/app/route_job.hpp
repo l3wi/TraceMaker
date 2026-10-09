@@ -44,6 +44,7 @@ struct RouteJob {
   // the board into opt.no_track_layers / opt.layer_cost_pm; an unknown layer or a bad factor throws.
   std::vector<std::string> no_tracks_on;
   std::vector<std::string> layer_costs;
+  bool protect_planes = false;  // --protect-planes (doc 05 §41): detect inner planes, union with no_tracks_on
   // Progress lines (the CLI's stdout text, one line per call, no trailing newline). Empty = silent.
   std::function<void(const std::string&)> log;
 };
