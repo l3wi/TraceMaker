@@ -756,6 +756,10 @@
      "done": true
     },
     {
+     "text": "Ground-plane regression tier: 14 raw PCBench boards retaining inner planes, plane/signal judge and copper breakdown, hard/soft/tree baselines at 3 M (D95)",
+     "done": true
+    },
+    {
      "text": "Fine-pitch QFN fan-out among nearby decoupling (pins boxed in by the router's own earlier tracks)",
      "done": false
     },

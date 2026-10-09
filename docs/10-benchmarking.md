@@ -79,9 +79,35 @@ gates of §5.
 | `quick` | the 30 PCBench tier-A boards of `--limit 30 --seed 1` | `--set quick --work 1000000 --route-args "--variants 1"` (≈ 30 s with `--jobs 4`) | every routing change |
 | `mid` | 11 large, hard PCBench boards | `--set mid --work 20000000` | changes to search, plans or rip-up, which can move results at 20 M while `quick` stays identical |
 | `planes` | 7 KiCad demos with zone fills plus `tests/boards/plane_smd`, routing stripped | `bench/prepare_demos.py --set planes`, then `--fixtures build/demos --set planes --work 3000000 --refill`, once plain and once with `--route-args=--soft-zones` | changes to zones, planes and plane targets |
+| `gndplane` | 14 real PCBench boards with inner ground-plane zones; routing stripped, zones and fills retained | `bench/prepare_demos.py --pcbench /path/to/PCBench --out build/gndplane --set gndplane`, then `--fixtures build/gndplane --set gndplane --work 3000000 --jobs 4 --refill --route-args="--variants 1"` | ground-plane strategies on real 4-/6-layer boards, including power boards |
+
+`gndplane` is built from PCBench's **raw** boards: its existing `unrouted.kicad_pcb` fixtures have no zones.
+Preparation reuses `strip_routing`, removes only top-level segments, arcs and vias, and retains zone boundaries,
+fills, pads and placement; project/custom-rule files beside the raw board are copied as for demos.
+The tier requires an inner copper layer where the union of one ground net's zones, clipped to the closed
+Edge.Cuts outline, covers at least 60% of the board. Four candidates have open outlines reported by KiCad and
+are excluded with reasons in `bench/sets/gndplane.txt`; names with spaces remain single fixture names.
+Run all three comparisons with `--refill`, using `--route-args="--variants 1"`,
+`--route-args="--variants 1 --soft-zones"` and
+`--route-args="--variants 1 --soft-zones --tree-attach"`. The set header gives the preparation and run commands.
+
+The harness classifies a **plane net** by the same >=60% zone-union test on *any* copper layer, regardless of
+net spelling (power planes count too). Zone contours use even-odd holes and are clipped to the even-odd board
+outline; arcs are tessellated with at most 1 micrometre sagitta, and outline endpoints join within 0.01 mm.
+Rule areas and teardrops do not count, and stale fill polygons never determine plane ownership.
+After KiCad's judge, each unconnected record counts once: plane if its item's bracketed net name owns a plane,
+otherwise signal. `boards.jsonl` records `plane_nets` with qualifying per-layer coverage,
+`plane_unconnected_before/after`, `signal_unconnected_before/after`, `plane_vias_added`, `signal_vias_added`,
+and `plane_track_mm_added` / `signal_track_mm_added` (output minus input tracks/arcs/vias, measured in mm).
+`summary.json` aggregates these counts and reports `plane_metrics_boards`; `report.md` gives a per-board table.
+A malformed outline is recorded as `plane_metrics_error`, not silently classified as signals, and does not
+change routing or KiCad judging. Existing metrics and routing arguments are unchanged.
+The measurement/preparation regression tests run with
+`python3 -m unittest discover -s bench -p 'test_*.py'`.
 
 **Comparing.** `bench/compare_runs.py BEFORE AFTER [--expect-identical]` lists every board whose routed output
 differs or got worse, the clean-pass and completion totals and router seconds, and exits 1 if a gate fails.
+When plane metrics are present, it also shows plane/signal unconnected columns for every paired board.
 `--expect-identical` adds "every routed board byte-identical" for speed-ups and refactors. Build the "before"
 binary from the base commit (a clean `origin/main` worktree) and run both on the same machine.
 

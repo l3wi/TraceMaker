@@ -49,6 +49,7 @@ def main() -> int:
     boards = sorted(set(before) & set(after))
     missing = sorted(set(before) ^ set(after))
     identical, rows, failures = 0, [], []
+    plane_columns = any("plane_unconnected_after" in r for r in list(before.values()) + list(after.values()))
     for name in boards:
         b, f = before[name], after[name]
         db, df = digest(bdir / "boards" / f"{name}.kicad_pcb"), digest(adir / "boards" / f"{name}.kicad_pcb")
@@ -65,10 +66,12 @@ def main() -> int:
             failures.append(f"{name}: added DRC errors on a board clean before: {added}")
         if not same and a.expect_identical:
             failures.append(f"{name}: routed board differs")
-        if not same or worse or added:
+        if not same or worse or added or plane_columns:
+            split = (f"{b.get('plane_unconnected_after', '?')} → {f.get('plane_unconnected_after', '?')} | "
+                     f"{b.get('signal_unconnected_after', '?')} → {f.get('signal_unconnected_after', '?')} | ") if plane_columns else ""
             rows.append(f"| {name} | {b.get('routed', '?')} → {f.get('routed', '?')} / {f.get('connections', '?')} | "
                         f"{b['completion']:.1%} → {f['completion']:.1%} | {'yes' if b['clean'] else 'no'} → {'yes' if f['clean'] else 'no'} | "
-                        f"{f['added_errors'] or '–'} | {b.get('seconds', 0):.1f} → {f.get('seconds', 0):.1f} | {'identical' if same else 'differs'} |")
+                        f"{split}{f['added_errors'] or '–'} | {b.get('seconds', 0):.1f} → {f.get('seconds', 0):.1f} | {'identical' if same else 'differs'} |")
 
     def mean(rs, key):
         vals = [r[key] for r in rs if key in r]
@@ -88,7 +91,10 @@ def main() -> int:
     if not boards:
         failures.append("no board is in both runs")
     if rows:
-        out += ["", "| Board | Routed | Completion | Clean | Added errors (after) | Router s | Output |", "|---|---|---|---|---|---|---|"] + rows
+        extra_headers = " Plane unconnected | Signal unconnected |" if plane_columns else ""
+        extra_rules = "---|---|" if plane_columns else ""
+        out += ["", f"| Board | Routed | Completion | Clean |{extra_headers} Added errors (after) | Router s | Output |",
+                f"|---|---|---|---|{extra_rules}---|---|---|"] + rows
     out += ["", "Gates: " + ("pass" if not failures else "FAIL")] + [f"- {x}" for x in failures]
     text = "\n".join(out) + "\n"
     print(text, end="")
