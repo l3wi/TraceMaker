@@ -140,12 +140,19 @@ struct Router::Impl {
   }
 
   double elapsed() const { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
-  // Out of budget? The work budget (search expansions) is deterministic; wall time is only a safety net.
+  // Out of budget? The work budget (search expansions) is deterministic; wall time is only a safety net. Which limit
+  // was hit first is kept for the result (RouteResult::stop): a time stop makes the output machine-dependent.
   bool out_of_budget() const {
-    if (opt.deadline && res.routed < res.connections && elapsed() > opt.deadline->load(std::memory_order_relaxed)) return true;
-    if (opt.work_budget > 0 && res.expansions >= opt.work_budget) return true;
-    return elapsed() > opt.time_limit_s;
+    if (opt.deadline && res.routed < res.connections && elapsed() > opt.deadline->load(std::memory_order_relaxed)) return stop_hit("deadline");
+    if (opt.work_budget > 0 && res.expansions >= opt.work_budget) return stop_hit("work");
+    if (elapsed() > opt.time_limit_s) return stop_hit("time");
+    return false;
   }
+  bool stop_hit(const char* limit) const {
+    if (!stopped_by) stopped_by = limit;
+    return true;
+  }
+  mutable const char* stopped_by = nullptr;  // first limit out_of_budget reported
   void emit(const std::string& s) {
     if (opt.sink) opt.sink->publish(s);
   }
@@ -898,12 +905,48 @@ struct Router::Impl {
       if (o.routed && std::find(o.deps.begin(), o.deps.end(), ci) != o.deps.end()) return true;
     return false;
   }
+  // The pad's island of existing copper in window `w`: fixed tracks, arcs, vias and pads of its net joined to it
+  // through each other on a shared layer. Not through zone fills: a stale fill may be split by the refill, and a via
+  // dropped from the far side of it then joins nothing (`planes` StickHub). Sorted item ids.
+  std::vector<int> pad_island(const Window& w, NetId net, int pad) const {
+    const auto& items = obs->copper().items;
+    const Point lo = at(w.x0, w.y0), hi = at(w.x0 + w.w - 1, w.y0 + w.h - 1);
+    std::vector<int> cand;
+    obs->grid().query(geom::Box{lo.x, lo.y, hi.x, hi.y}, [&](int id) {
+      const auto& it = items[static_cast<std::size_t>(id)];
+      if (!it.removed && it.net == net && it.owner < 0 &&
+          (it.kind == drc::ItemKind::Track || it.kind == drc::ItemKind::Arc || it.kind == drc::ItemKind::Via || it.kind == drc::ItemKind::Pad))
+        cand.push_back(id);
+    });
+    std::sort(cand.begin(), cand.end());
+    cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
+    std::vector<int> island{pad_item[static_cast<std::size_t>(pad)]};
+    std::vector<std::uint8_t> in(cand.size(), 0);
+    for (std::size_t f = 0; f < island.size(); ++f) {
+      const auto& a = items[static_cast<std::size_t>(island[f])];
+      for (std::size_t k = 0; k < cand.size(); ++k) {
+        if (in[k] || cand[k] == island[0]) continue;
+        const auto& c = items[static_cast<std::size_t>(cand[k])];
+        if (!(a.layers & c.layers) || !a.box.intersects(c.box)) continue;
+        bool touch = false;
+        for (const auto& s : a.shapes)
+          for (const auto& t : c.shapes) touch = touch || geom::closer_than(s, t, 1);
+        if (touch) {
+          in[k] = 1;
+          island.push_back(cand[k]);
+        }
+      }
+    }
+    std::sort(island.begin(), island.end());
+    return island;
+  }
   // Appends to `e` the lattice cells of the window on copper of `net` in cluster `root` (under `u`): tracks, arcs,
-  // vias and pads other than `skip_pad`, fixed or routed. A track whose end lies on such copper is connected to it
-  // (KiCad links a track end inside other copper of its net), so the cell is a start or goal with no pad leg.
-  // Zone fills are not offered: plane connections have their own targets. Only cells a track end may occupy are
-  // offered. `node_at`: cell key -> connectivity node of the copper there. `mark`: goal flags to set.
-  void add_tree_cells(const Window& w, NetId net, const RootUnion& u, int root, int skip_pad, Endpoint& e,
+  // vias and pads other than `skip_pad`, fixed or routed (only the items of `only` when given). A track whose end
+  // lies on such copper is connected to it (KiCad links a track end inside other copper of its net), so the cell is
+  // a start or goal with no pad leg. Zone fills are not offered: plane connections have their own targets. Only
+  // cells a track end may occupy are offered. `node_at`: cell key -> connectivity node of the copper there. `mark`:
+  // goal flags to set.
+  void add_tree_cells(const Window& w, NetId net, const RootUnion& u, int root, int skip_pad, const std::vector<int>* only, Endpoint& e,
                       std::unordered_map<std::int64_t, int>& node_at, std::vector<std::uint8_t>* mark) {
     const std::size_t cells = static_cast<std::size_t>(w.w) * static_cast<std::size_t>(w.h);
     const Coord hw = track_width(net) / 2;
@@ -911,7 +954,7 @@ struct Router::Impl {
     for (const auto& [l, ci] : e.cells) seen.insert(cell_key(l, w.x0 + static_cast<int>(ci % w.w), w.y0 + static_cast<int>(ci / w.w)));
     const Point lo = at(w.x0, w.y0), hi = at(w.x0 + w.w - 1, w.y0 + w.h - 1);
     const geom::Box wbox{lo.x, lo.y, hi.x, hi.y};
-    const int skip_item = pad_item[static_cast<std::size_t>(skip_pad)];
+    const int skip_item = skip_pad >= 0 ? pad_item[static_cast<std::size_t>(skip_pad)] : -1;
     std::vector<int> ids;
     obs->grid().query(wbox, [&](int id) { ids.push_back(id); });
     std::sort(ids.begin(), ids.end());  // copper order, whatever the grid's
@@ -920,6 +963,7 @@ struct Router::Impl {
       const auto& it = items[static_cast<std::size_t>(id)];
       if (it.removed || it.net != net || id == skip_item || !it.box.intersects(wbox)) continue;
       if (it.kind != drc::ItemKind::Track && it.kind != drc::ItemKind::Arc && it.kind != drc::ItemKind::Via && it.kind != drc::ItemKind::Pad) continue;
+      if (only && !std::binary_search(only->begin(), only->end(), id)) continue;
       int node;
       if (it.owner >= 0) {
         const auto& o = cs[static_cast<std::size_t>(it.owner)];
@@ -929,7 +973,7 @@ struct Router::Impl {
         if (static_cast<std::size_t>(id) >= init_root.size()) continue;
         node = init_root[static_cast<std::size_t>(id)];
       }
-      if (u.find(node) != root) continue;
+      if (!only && u.find(node) != root) continue;
       for (const auto& s : it.shapes) {
         std::set<std::int64_t> tried;  // lattice points of this shape already tested
         auto try_point = [&](int gx, int gy) {
@@ -1084,15 +1128,31 @@ struct Router::Impl {
       return it == target_extra.end() ? 0 : it->second;
     };
     // Pad-to-tree routing (doc 05 §40): the copper already joined to either end is a start or a goal too, so the
-    // connection branches off its net's tree instead of running back to the planned pad.
+    // connection branches off its net's tree instead of running back to the planned pad. A connection into a plane
+    // starts anywhere on the pad's island (§42: hand-routed GND tracks tying pads together; the via drops where
+    // there is room, not at the planned pad). Not on copper joined to it by routing (such a start holds only while
+    // those routes stay: `planes` RoyalBlue54L-Feather lost 8 connections) or by a stale fill (pad_island).
+    // Plane ties (§43): copper already joined to the plane is a goal of a plane connection too.
     tree_start.clear();
     tree_end.clear();
-    if (opt.tree_attach && c.pad_b >= 0 && tree_ok()) {
-      const RootUnion u = net_roots(net, current);
-      const int ra = u.find(pad_root(c.pad_a)), rb = u.find(pad_root(c.pad_b));
-      if (ra != rb) {
-        add_tree_cells(w, net, u, ra, c.pad_a, src, tree_start, nullptr);
-        add_tree_cells(w, net, u, rb, c.pad_b, dst, tree_end, &is_target);
+    if (tree_ok()) {
+      if (c.pad_b < 0) {
+        if (opt.tree_attach) {
+          const std::vector<int> island = pad_island(w, net, c.pad_a);
+          if (island.size() > 1) add_tree_cells(w, net, RootUnion{}, 0, c.pad_a, &island, src, tree_start, nullptr);
+        }
+        if (opt.plane_tie) {
+          const RootUnion u = net_roots(net, current);
+          const int rz = u.find(end_root(c));
+          if (u.find(pad_root(c.pad_a)) != rz) add_tree_cells(w, net, u, rz, -1, nullptr, dst, tree_end, &is_target);
+        }
+      } else if (opt.tree_attach) {
+        const RootUnion u = net_roots(net, current);
+        const int ra = u.find(pad_root(c.pad_a)), rb = u.find(pad_root(c.pad_b));
+        if (ra != rb) {
+          add_tree_cells(w, net, u, ra, c.pad_a, nullptr, src, tree_start, nullptr);
+          add_tree_cells(w, net, u, rb, c.pad_b, nullptr, dst, tree_end, &is_target);
+        }
       }
     }
     // Zone target: any cell inside the fill on its layer, with room for the track (tested lazily when reached).
@@ -1205,7 +1265,7 @@ struct Router::Impl {
     // cell (any layer, obstacles ignored), by the two-pass chamfer transform, which is exact for 8-connected steps
     // of cost step/diag.
     goal_dist.clear();
-    if (!tree_end.empty() && !have_field) {
+    if (!tree_end.empty() && !have_field && !zone_target) {  // a plane target has no useful bound (below)
       constexpr std::int64_t kFar = std::int64_t{1} << 50;
       goal_dist.assign(cells, kFar);
       for (const auto& [l, ci] : dst.cells) goal_dist[static_cast<std::size_t>(ci)] = 0;
@@ -1422,7 +1482,7 @@ struct Router::Impl {
     std::vector<std::pair<int, int>> via_span;  // layers joined by each via
     // Pad-to-tree routing: a path that starts or ends on tree copper starts or ends right there (no pad leg).
     const auto ts = tree_start.find(cell_key(path.front().layer, path.front().gx, path.front().gy));
-    const auto te = c.pad_b >= 0 ? tree_end.find(cell_key(path.back().layer, path.back().gx, path.back().gy)) : tree_end.end();
+    const auto te = tree_end.find(cell_key(path.back().layer, path.back().gx, path.back().gy));
     const bool start_tree = ts != tree_start.end(), end_tree = te != tree_end.end();
     const int start_node = start_tree ? ts->second : pad_root(c.pad_a), end_node = end_tree ? te->second : end_root(c);
     const Point pa = start_tree ? at(path.front().gx, path.front().gy) : b.pads[static_cast<std::size_t>(c.pad_a)].pos;
@@ -3652,6 +3712,7 @@ struct Router::Impl {
       res.unrouted.push_back(std::move(u));
     }
     res.seconds = elapsed();
+    res.stop = res.routed == res.connections ? "complete" : stopped_by ? stopped_by : "exhausted";
     res.nogood_skips = nogood_skips;
     std::fprintf(stderr, "searches: %ld ok (%ld expansions), %ld failed (%ld expansions); fields %ld GPU + %ld CPU (%.2f s, %ld GPU fallbacks)\n",
                  n_ok, exp_ok, n_fail, exp_fail, field_runs, field_cpu_runs, field_seconds, field_gpu_fail);

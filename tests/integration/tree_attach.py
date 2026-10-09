@@ -6,7 +6,9 @@
 
 1. A pad 3 mm beside the middle of an existing 16 mm track of its net must branch off that track (about 3 mm of
    new copper), not run back to one of the track's end pads (about 9 mm).
-2. PCBench mini-whip with --tree-attach and the clean-up: connections branch off routed copper and the clean-up
+2. A GND island (two pads tied by an existing track that runs on out of a no-via area) must drop its via into the
+   B.Cu plane straight off the track where vias are allowed, not lay new track over the old one from a pad.
+3. PCBench mini-whip with --tree-attach and the clean-up: connections branch off routed copper and the clean-up
    re-routes connections, so the router's bookkeeping of what each route physically joins must hold. Every
    connection the router reports routed must be connected in TraceMaker's DRC and, when kicad-cli is available,
    in KiCad's. The run is repeated with two threads and must be byte-identical.
@@ -37,6 +39,28 @@ BRANCH = """(kicad_pcb (version 20240108) (generator pcbnew)
  (footprint "T:C" (layer "F.Cu") (at 10 8) (property "Reference" "C" (at 0 -1) (layer "F.SilkS"))
   (pad "1" smd circle (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask") (net 1 "BRANCH")))
  (segment (start 2 5) (end 18 5) (width 0.25) (layer "F.Cu") (net 1))
+ (gr_rect (start 0 0) (end 20 12) (stroke (width 0.05) (type default)) (fill none) (layer "Edge.Cuts"))
+)
+"""
+
+ISLAND = """(kicad_pcb (version 20240108) (generator pcbnew)
+ (general (thickness 1.6))
+ (layers (0 "F.Cu" signal) (31 "B.Cu" signal) (44 "Edge.Cuts" user))
+ (setup (pad_to_mask_clearance 0))
+ (net 0 "") (net 1 "GND")
+ (footprint "T:A" (layer "F.Cu") (at 2 5) (property "Reference" "A" (at 0 -1) (layer "F.SilkS"))
+  (pad "1" smd circle (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask") (net 1 "GND")))
+ (footprint "T:B" (layer "F.Cu") (at 6 5) (property "Reference" "B" (at 0 -1) (layer "F.SilkS"))
+  (pad "1" smd circle (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask") (net 1 "GND")))
+ (segment (start 2 5) (end 6 5) (width 0.25) (layer "F.Cu") (net 1))
+ (segment (start 6 5) (end 18 5) (width 0.25) (layer "F.Cu") (net 1))
+ (zone (net 0) (net_name "") (layers "F.Cu" "B.Cu") (name "novia") (hatch edge 0.5) (connect_pads (clearance 0))
+  (min_thickness 0.25) (keepout (tracks allowed) (vias not_allowed) (pads allowed) (copperpour allowed) (footprints allowed))
+  (fill (thermal_gap 0.5) (thermal_bridge_width 0.5)) (polygon (pts (xy 0 0) (xy 12 0) (xy 12 12) (xy 0 12))))
+ (zone (net 1) (net_name "GND") (layer "B.Cu") (name "plane") (hatch edge 0.5) (connect_pads (clearance 0.2))
+  (min_thickness 0.25) (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.5))
+  (polygon (pts (xy 0.5 0.5) (xy 19.5 0.5) (xy 19.5 11.5) (xy 0.5 11.5)))
+  (filled_polygon (layer "B.Cu") (pts (xy 0.5 0.5) (xy 19.5 0.5) (xy 19.5 11.5) (xy 0.5 11.5))))
  (gr_rect (start 0 0) (end 20 12) (stroke (width 0.05) (type default)) (fill none) (layer "Edge.Cuts"))
 )
 """
@@ -88,8 +112,21 @@ def main() -> int:
             print(f"FAIL branch: {name} DRC finds {n} unconnected items")
             ok = False
 
+    src = work / "island.kicad_pcb"
+    src.write_text(ISLAND)
+    out = work / "island_routed.kicad_pcb"
+    summary, items = route(tm, src, out, "--variants", "1", "--threads", "1", "--soft-zones")
+    length = sum(math.dist(t["start"], t["end"]) for t in items["tracks"]) / 1e6
+    if summary["routed"] != summary["connections"] or length > 1.0 or len(items["vias"]) != 1:
+        print(f"FAIL island: routed {summary['routed']}/{summary['connections']}, {length:.2f} mm new copper, {len(items['vias'])} vias "
+              "(expected one via dropped straight off the existing track)")
+        ok = False
+    if unconnected_tm(tm, out, work):
+        print("FAIL island: TraceMaker DRC finds unconnected items")
+        ok = False
+
     if not WHIP.exists():
-        print("PCBench fixture missing: second part skipped")
+        print("PCBench fixture missing: third part skipped")
         return 0 if ok else 1
     outs = []
     for threads in ("1", "2"):

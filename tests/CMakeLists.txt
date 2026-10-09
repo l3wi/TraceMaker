@@ -66,6 +66,9 @@ set_tests_properties(route_rule_warnings PROPERTIES LABELS "route;integration" T
 # reported route is connected (TraceMaker's DRC, and KiCad's when kicad-cli is on the PATH) and output is thread-independent.
 add_test(NAME tree_attach COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/tree_attach.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/tree_attach)
 set_tests_properties(tree_attach PROPERTIES LABELS "route;integration" TIMEOUT 600)
+# A plane connection with --plane-tie ends on a through pad already in the plane (no via); connected in both DRCs.
+add_test(NAME plane_tie COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/plane_tie.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/plane_tie)
+set_tests_properties(plane_tie PROPERTIES LABELS "route;integration" TIMEOUT 300)
 # Frozen KiCad 10 custom-rule item/pair multisets (expected.json names the judging version); normal runs do not require KiCad.
 add_test(NAME rule_parity COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/rule_parity/run.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/rule_parity)
 set_tests_properties(rule_parity PROPERTIES LABELS "integration;rules" TIMEOUT 300)

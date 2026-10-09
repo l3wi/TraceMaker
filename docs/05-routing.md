@@ -1325,3 +1325,56 @@ all other connections, so that ground would take no channels from signals: `plan
 −13 connections), the power board −5 alone and −4 with tree routing. Those connections are the ones the plane
 cannot make; left to the end they find their channels taken. Plane drops already go early without it (a pad
 inside a fill gets a connection of length 0, and connections are routed shortest first).
+
+## 42. Plane drops from a pad's island (2026-10-11, D97)
+
+**Problem.** A pad tied to other pads of its net by existing copper (hand-routed GND tracks, a footprint's joined
+pads) forms one cluster, and the plan gives the cluster one connection into its plane (§26). That connection started
+at one planned pad. When that pad was boxed in, or a no-via area surrounded it, the search laid new track over the
+existing trace until it found room for the via: on a two-pad island inside a no-via area, 10.4 mm of new copper
+duplicating the trace, then the via.
+
+**What was built** (with `--tree-attach`). A plane connection also starts on the planned pad's island: the fixed
+tracks, arcs, vias and pads of the net joined to it through each other on a shared layer (`pad_island`, within the
+search window). The same example drops its via straight off the trace with no new track
+(`tests/integration/tree_attach.py`, case 2).
+
+Two narrower rules came from measurement:
+
+- Not copper joined to the island by routing: a via dropped from a routed trunk holds only while the trunk stays and
+  sits in a routing channel (`planes` RoyalBlue54L-Feather −8 connections with routed copper allowed).
+- Not copper joined only through a zone fill: the saved fill is stale and a refill may split it; a via dropped from
+  the far side of a split pour joined nothing after the refill (`planes` StickHub: its F.Cu and B.Cu GND pours ended
+  up unconnected).
+
+**Results** (`--soft-zones --tree-attach`, single variant, KiCad after refill). `planes` 3 M: 7 of 8 boards
+byte-identical to tree routing without the change, the eighth equal in counts. `quick` and `mid` have no zones:
+byte-identical. On boards stripped of routing an island is rare (pads touching each other); the rule matters for
+boards that arrive partly routed.
+
+## 43. Plane ties (2026-10-11, D98)
+
+**Problem.** Every pad with a planned plane connection needed its own via. A ground pin boxed in by its own
+package (a BGA ball, a fine-pitch QFN pin between signal escapes) failed even when a ground neighbour a ball pitch
+away already had a via, or a through-hole ground pad sat in the plane next to it. Hand routing ties such a pin to
+the neighbour.
+
+**What was built (`--plane-tie`, opt-in).** For a plane connection, copper of the net already joined to the plane
+(through pads and vias in the fill, another pad's routed plane via and the copper leading to it, under the routed
+connectivity of §40) is a goal as well as the fill itself. The search takes whichever is cheaper: a via costs
+`via_cost_mm` (3 mm) of track, so ties are short. Only copper already joined to the plane qualifies, so two pads
+can never tie only to each other. A tie records the route it ends on, so ripping that route rips the tie (§40).
+With a plane target there is no useful distance bound to tree goals, so none is computed.
+
+**Results** (single variant, `--soft-zones`, KiCad after refill; plane/signal = unconnected items of plane nets and
+of other nets, D95):
+
+| Set | Without | With `--plane-tie` | Notes |
+|---|---|---|---|
+| `gndplane`, 3 M | 76.5 % | 77.4 % | 13 of 14 byte-identical; OtterCastAudioV2 259 → 341 of 533 routed (BGA ground balls), plane 18 → 9, signal 234 → 184. No board worse |
+| `planes`, 3 M | 78.2 % | 82.2 % | plane_smd 29 → 42 of 49, RoyalBlue54L-Feather 76 → 84; StickHub −1 connection after refill |
+| 4-layer power board (user report), 100 M, `--no-tracks-on In1.Cu` | 555 of 698 | 552 of 698 | 235 → 215 vias |
+| `quick`, `mid` | | | no zones: no plane connections, unchanged |
+
+It stays opt-in: the power board loses three connections. Ties cost a little track on the signal layers; they win
+where vias cannot be placed (ball arrays, dense QFN fan-outs).

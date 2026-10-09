@@ -160,6 +160,9 @@ kicad-cli pcb drc --format json --severity-all --all-track-errors --exit-code-vi
   `route` returns 0 when every planned connection routes, 3 when output is written with unrouted
   connections, 1 on runtime error; CLI usage errors return CLI11's nonzero usage status.
   Completion (0) is **not** KiCad DRC sign-off.
+  The summary has `stop` (`complete`, `work`, `time`, `deadline`, `exhausted`; D101) and the log line ends with
+  `stopped: …`; a `time` stop also logs a warning, because the output then depends on machine speed and load.
+  For repeatable runs in scripts pass `--time` well above the time `--work` needs.
 - **PCM package**: `scripts/make_pcm_package.py` writes `build/pcm/tracemaker-<version>.zip` (metadata schema v2
   as shipped with KiCad 10, `type: plugin`, `runtime: ipc`, `kicad_version: 10.0`, the plugin under `plugins/`, a
   generated 64×64 `resources/icon.png`; reproducible archive). `scripts/validate_pcm.py` checks the layout and

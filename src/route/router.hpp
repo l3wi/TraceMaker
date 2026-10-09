@@ -88,6 +88,9 @@ struct RouterOptions {
   // Pad-to-tree routing (doc 05 §40): a connection may start or end on any copper of its net already joined to
   // that end -- tracks, vias and pads of the cluster, fixed or routed -- instead of only on the planned pads.
   bool tree_attach = false;
+  // Plane ties (doc 05 §43): a connection into a plane may instead end on copper of its net that already reaches
+  // the plane (a through pad or via in it, a neighbour's routed via), whichever the search finds cheaper.
+  bool plane_tie = false;
   bool optimize = true;         // post-routing clean-up: re-route connections to save vias and length
   bool escape_plan = false;     // reserve escape corridors for the pins of dense packages (route/escape.hpp, M9)
   bool escape_second_ring = false;  // second-ring balls escape between two outer balls instead of by dog-bone
@@ -153,6 +156,10 @@ struct RouteResult {
   std::vector<CutLine> over_cuts;
   CutLine tightest_cut;
   double seconds = 0;
+  // Why the run ended: "complete" (every connection routed), "work" (work budget spent), "time" (wall-time limit:
+  // the output depends on machine speed and load), "deadline" (portfolio: another variant completed first) or
+  // "exhausted" (every pass and rung tried within budget).
+  std::string stop;
   Coord pitch = 0;
   std::vector<std::string> failures;  // one line per unrouted connection
   struct Unrouted {

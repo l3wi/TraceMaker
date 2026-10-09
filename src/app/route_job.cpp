@@ -139,6 +139,8 @@ void add_route_options(CLI::App& app, RouteJob& job, bool require_paths) {
   route->add_flag("--plan-gap,!--no-plan-gap", ropt.plan_gap, "Plan connections by copper-to-copper distance between pads rather than centre to centre (default on)");
   route->add_flag("--tree-attach,!--no-tree-attach", ropt.tree_attach,
                   "Connections may start or end on any copper already joined to their pads (branch off the net's tree)");
+  route->add_flag("--plane-tie,!--no-plane-tie", ropt.plane_tie,
+                  "A pad's plane connection may end on nearby copper of its net that already reaches the plane instead of its own via");
   route->add_flag("--global-congestion", ropt.global_congestion, "Global plan as a congestion map: through traffic pays in tiles the plan fills (experimental)")->group("");
   route->add_option("--global-congestion-from", ropt.global_congestion_from, "Congestion threshold, eighths of tile capacity")->group("");
   route->add_option("--global-congestion-pen", ropt.global_congestion_pen, "Congestion cost, pitches per step per eighth above the threshold")->group("");
@@ -442,8 +444,11 @@ RouteJobResult run_route_job(RouteJob job) {
     for (const auto& v : res.vias) ed.add_via(v);
     ed.save(job.out);
   }
-  log(fmt("routed %d/%d connections, %zu tracks, %zu vias, pitch %.3f mm, %ld expansions, %.2f s", res.routed, res.connections, res.tracks.size(),
-          res.vias.size(), nm_to_mm(res.pitch), res.expansions, res.seconds));
+  log(fmt("routed %d/%d connections, %zu tracks, %zu vias, pitch %.3f mm, %ld expansions, %.2f s, stopped: %s", res.routed, res.connections,
+          res.tracks.size(), res.vias.size(), nm_to_mm(res.pitch), res.expansions, res.seconds, res.stop.empty() ? "complete" : res.stop.c_str()));
+  if (res.stop == "time")
+    log(fmt("warning: the run hit its time limit (--time %.0f s) before its work budget, so the result depends on machine speed and load; "
+            "raise --time or lower --work for repeatable output", job.opt.time_limit_s));
   for (const auto& f : res.failures) log("  unrouted: " + f);
   for (std::size_t r = 0; r < res.escape_rings.size(); ++r)
     log(fmt("  deep-array ring %zu: %d of %d pins connected", r + 1, res.escape_rings[r].second, res.escape_rings[r].first));
@@ -459,7 +464,7 @@ RouteJobResult run_route_job(RouteJob job) {
   out.summary = {{"routed", res.routed},     {"connections", res.connections}, {"tracks", res.tracks.size()},
                  {"vias", res.vias.size()},  {"seconds", res.seconds},         {"expansions", res.expansions},
                  {"pitch_mm", nm_to_mm(res.pitch)}, {"failures", res.failures}, {"variant", best_index}, {"variant_name", best_name},
-                 {"escape_corridors", res.escape_corridors}};
+                 {"escape_corridors", res.escape_corridors}, {"stop", res.stop.empty() ? "complete" : res.stop}};
   out.summary["rules"] = {{"project", sources.project}, {"dru", sources.dru}, {"warnings", rule_warnings},
                           {"project_loaded", std::filesystem::exists(sources.project)}, {"dru_loaded", std::filesystem::exists(sources.dru)}};
   out.summary["unrouted"] = nlohmann::json::array();

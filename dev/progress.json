@@ -760,11 +760,27 @@
      "done": true
     },
     {
+     "text": "Plane drops from a pad's island of existing copper with --tree-attach, not through routed copper or stale fills (D97, doc 05 \u00a742)",
+     "done": true
+    },
+    {
+     "text": "Plane ties, opt-in --plane-tie: boxed-in plane pins end on copper already in the plane (gndplane 76.5 -> 77.4 %, no board worse; planes 78.2 -> 82.2 %; D98, doc 05 \u00a743)",
+     "done": true
+    },
+    {
+     "text": "Route reports why it stopped (complete/work/time/deadline/exhausted) and warns on a time-limit stop (D101)",
+     "done": true
+    },
+    {
      "text": "Fine-pitch QFN fan-out among nearby decoupling (pins boxed in by the router's own earlier tracks)",
      "done": false
     },
     {
      "text": "Decide --tree-attach as a default or portfolio arm (8-variant tier B/C runs)",
+     "done": false
+    },
+    {
+     "text": "Tree-attach failed searches flood the window (no distance bound to tree goals): LimeSDR on gndplane 746 -> 598 at 3 M",
      "done": false
     }
    ]
