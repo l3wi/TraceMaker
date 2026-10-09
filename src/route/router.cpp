@@ -97,7 +97,6 @@ struct Router::Impl {
   };
   std::vector<ConnState> cs;
   std::set<NetId> first_net_ids;  // --first-nets
-  std::set<NetId> plane_nets;     // --plane-nets-last: nets with a planned connection into a zone fill
   std::unordered_map<std::int64_t, std::uint16_t> history;  // contested lattice cells (PathFinder history cost)
   std::vector<int> init_root;        // copper item -> initial cluster root (fixed copper)
   // With soft zones: routed copper item -> initial clusters of the same-net plane fills it touches, so a via that
@@ -475,13 +474,6 @@ struct Router::Impl {
       out = std::move(sorted);
     } else {
       std::stable_sort(out.begin(), out.end(), [](const Connection& a, const Connection& c) { return a.length < c.length; });
-    }
-    // Plane nets last: their pad-to-pad connections wait until every other connection had its chance, so they do
-    // not take channels from signals; their plane drops (short, and the pins need their via sites) keep their place.
-    if (opt.plane_nets_last) {
-      for (const auto& c : out)
-        if (c.zone_b >= 0) plane_nets.insert(c.net);
-      std::stable_partition(out.begin(), out.end(), [&](const Connection& c) { return !(c.pad_b >= 0 && plane_nets.count(c.net)); });
     }
     if (!opt.priority.empty()) {
       std::set<std::pair<std::string, std::string>> pri;
@@ -3477,11 +3469,6 @@ struct Router::Impl {
       } else {
         std::stable_sort(order.begin(), order.end(), [&](int x, int y) { return cs[static_cast<std::size_t>(x)].fails > cs[static_cast<std::size_t>(y)].fails; });
       }
-      if (opt.plane_nets_last)
-        std::stable_partition(order.begin(), order.end(), [&](int k) {
-          const auto& c = cs[static_cast<std::size_t>(k)].c;
-          return !(c.pad_b >= 0 && plane_nets.count(c.net));
-        });
       // --first-nets go first again: a restart rips everything, including them.
       if (!first_net_ids.empty())
         std::stable_partition(order.begin(), order.end(), [&](int c) { return first_net_ids.count(cs[static_cast<std::size_t>(c)].c.net) > 0; });

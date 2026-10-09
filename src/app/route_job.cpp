@@ -139,8 +139,6 @@ void add_route_options(CLI::App& app, RouteJob& job, bool require_paths) {
   route->add_flag("--plan-gap,!--no-plan-gap", ropt.plan_gap, "Plan connections by copper-to-copper distance between pads rather than centre to centre (default on)");
   route->add_flag("--tree-attach,!--no-tree-attach", ropt.tree_attach,
                   "Connections may start or end on any copper already joined to their pads (branch off the net's tree)");
-  route->add_flag("--plane-nets-last,!--no-plane-nets-last", ropt.plane_nets_last,
-                  "Nets with a plane connection route their pad-to-pad connections after all other connections");
   route->add_flag("--global-congestion", ropt.global_congestion, "Global plan as a congestion map: through traffic pays in tiles the plan fills (experimental)")->group("");
   route->add_option("--global-congestion-from", ropt.global_congestion_from, "Congestion threshold, eighths of tile capacity")->group("");
   route->add_option("--global-congestion-pen", ropt.global_congestion_pen, "Congestion cost, pitches per step per eighth above the threshold")->group("");

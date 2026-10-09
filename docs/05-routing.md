@@ -1236,3 +1236,48 @@ rules". The router reports the same pin boxed in.
   `--no-tracks-on` limits and the router's off-lattice escape rungs are not modelled.
 - Satisfied means the net is complete. A pin whose cluster still has to reach another cluster is searched from
   its pad, through its own net's copper.
+
+## 40. Pad-to-tree routing (2026-10-10, D92)
+
+**Problem.** A connection's search ran from one planned pad to the other (or into a zone fill). Copper already
+joined to either end -- a trunk routed for the same net a moment earlier, a hand-routed track, a via -- was only
+something the search could pass over, never a place to stop. Boards came out with repeated point-to-point runs:
+a pad beside the middle of its net's trunk ran back to the trunk's end pad, and nearby pads each dropped their
+own via instead of sharing one (user report on a 4-layer power board).
+
+**What was built (`--tree-attach`, opt-in).**
+
+- Starts and goals: before each search, the copper of the window in the cluster of each end -- tracks, arcs,
+  vias and pads, fixed or routed, other than the end pad itself -- is offered as start or goal cells at no pad-leg
+  cost. A cell qualifies when its lattice point lies on that copper (a track end there is connected: KiCad links a
+  track end that lies on other copper of its net) and a track end of the net may occupy it. Zone fills keep their
+  own targets. Coupled pairs neither branch nor get branched from.
+- Connectivity: a route joins what its ends physically touch, not its planned pads. Each routed connection
+  records those connectivity nodes (an initial copper cluster, or another route) and the routes it branched
+  from. `joined` and the clusters above union these nodes. Ripping a route rips the routes that branched from
+  it (not counted against their rip limit), and the clean-up (via re-routes, region rip-up, smoothing, meanders)
+  leaves routes that others branch from alone. A first version united planned pads instead: the clean-up then
+  re-routed a connection onto copper that was joined only on paper, leaving KiCad-unconnected pads (mini-whip,
+  5 of 23); `tests/integration/tree_attach.py` catches that.
+- Heuristic: with tree goals and no cost-to-go field, the exact octile distance to the nearest goal cell (two-pass
+  chamfer transform over the window); with a field, the field (built from all goal cells) and 0 where it has no
+  value.
+
+**Results** (single variant, deterministic work budgets; boards KiCad-judged; completion is KiCad's).
+
+| Set | Without | With `--tree-attach` | Notes |
+|---|---|---|---|
+| `quick`, 1 M | 89.2 %, 12 clean | 89.3 %, 12 clean | 4 boards lose 1-2 connections, 6 gain; on the 11 boards complete both ways 2.2 % less copper and 33 % fewer vias (27 → 18) |
+| `mid`, 20 M | 53.3 % | 55.6 % | +154 connections in total (logicbone +47, MonApollo +34), LimeSDR −18, Teensy −1; 23 % fewer vias (1,580 → 1,219) while routing more |
+| `planes`, 3 M, `--soft-zones`, refilled | 77.3 % | 77.6 % | no board worse |
+| 4-layer power board (user report), 200 M, `--soft-zones --no-tracks-on In1.Cu` | 597 of 698 | 621 of 698 | |
+
+It stays opt-in: on the `quick` tier some boards lose connections, which the default must not do. Router wall time
+rises about 10 % at 20 M (offering cells costs legality checks that are not counted as search work).
+
+**Tried and dropped.** A junction penalty (0.5-4 mm on tree starts and goals) did not recover the boards that lose
+connections at 1 M. Routing the pad-to-pad connections of plane nets (nets with a planned plane connection) after
+all other connections, so that ground would take no channels from signals: `planes` 77.3 % → 75.9 % (StickHub
+−13 connections), the power board −5 alone and −4 with tree routing. Those connections are the ones the plane
+cannot make; left to the end they find their channels taken. Plane drops already go early without it (a pad
+inside a fill gets a connection of length 0, and connections are routed shortest first).
