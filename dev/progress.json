@@ -731,6 +731,39 @@
      "done": true
     }
    ]
+  },
+  {
+   "id": "M14",
+   "title": "Usability from a field report (4-layer power board)",
+   "status": "in_progress",
+   "gate": "Each change measured on quick (no default regression), mid and planes, plus the reporting board; opt-in where a tier gets worse",
+   "deliverables": "Pad-to-tree routing, net-tie and solder-jumper legality, a scriptable route contract (rule source, structured failures, exit codes, Python parity, per-net reroute)",
+   "tasks": [
+    {
+     "text": "Pad-to-tree routing, opt-in --tree-attach (mid 53.3 -> 55.6 %, 23 % fewer vias; quick mean equal, 4 boards -1/-2; D92, doc 05 \u00a740)",
+     "done": true
+    },
+    {
+     "text": "Plane nets' pad-to-pad connections last: closed, dropped (planes 77.3 -> 75.9 %, reporting board -5; D92)",
+     "done": true
+    },
+    {
+     "text": "Net-tie bridges and allow_soldermask_bridges jumpers as KiCad 10.0.6 judges them; custom-pad circle primitives (D93)",
+     "done": true
+    },
+    {
+     "text": "Route contract: --project, rule sources and warnings in log/JSON, structured unrouted reasons, documented exit codes, Python args parity, --reroute-nets (D94)",
+     "done": true
+    },
+    {
+     "text": "Fine-pitch QFN fan-out among nearby decoupling (pins boxed in by the router's own earlier tracks)",
+     "done": false
+    },
+    {
+     "text": "Decide --tree-attach as a default or portfolio arm (8-variant tier B/C runs)",
+     "done": false
+    }
+   ]
   }
  ]
 }
