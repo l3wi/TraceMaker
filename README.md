@@ -186,6 +186,9 @@ down beside the board and reported.
 - `--cut-report`: report lines across the board that more nets must cross than tracks fit.
 - `--no-tracks-on In1.Cu,In2.Cu`: no new tracks on these layers (vias still pass through and reach the planes).
   `--layer-cost In1.Cu=4,In2.Cu=4`: tracks there cost that many times their length, so they are a last resort.
+- `--protect-planes`: automatically keep new tracks off inner copper layers where one net's zone outlines,
+  clipped to the board outline, cover at least 60% of the board. Unions with `--no-tracks-on`; outer layers
+  remain routable. Vias still reach the planes. Detected layer/net/coverage appear in the log and route JSON.
 - `--tree-attach`: a connection may branch off any copper already joined to its pads (a trunk, a via, another pad of
   the cluster) instead of running back to the planned pad. Less copper and fewer vias; on large boards it also
   routes more (doc 05 §40). Off by default: a few small boards lose a connection at small budgets.

@@ -756,6 +756,10 @@
      "done": true
     },
     {
+     "text": "Opt-in --protect-planes: >=60% clipped same-net outline union on inner layers; shared CLI/Python/plugin parser, logs/JSON, no tracks but vias still reach planes (D96, doc 05 \u00a741)",
+     "done": true
+    },
+    {
      "text": "Fine-pitch QFN fan-out among nearby decoupling (pins boxed in by the router's own earlier tracks)",
      "done": false
     },

@@ -1325,3 +1325,50 @@ all other connections, so that ground would take no channels from signals: `plan
 −13 connections), the power board −5 alone and −4 with tree routing. Those connections are the ones the plane
 cannot make; left to the end they find their channels taken. Plane drops already go early without it (a pad
 inside a fill gets a connection of length 0, and connections are routed shortest first).
+
+## 41. Automatic inner-plane protection (2026-10-10, D96)
+
+`--protect-planes` is opt-in and uses the shared route-job parser: CLI, Python `args`, and the plugin's
+`TRACEMAKER_ARGS` all spell the same option. For each **inner** copper layer, group ordinary zones by net,
+take the union of each net's zone outlines, intersect it with the closed Edge.Cuts region, and divide by
+that region's area. A net covering **at least 60%** marks the layer as protected. Rule areas, keepouts,
+teardrops, and unassigned zones do not count. Layer type/name and cached fills do not decide coverage:
+antipads shrink fills, and fills can be stale or absent before refill. Overlapping zones count once;
+board cutouts and zone holes use even/odd membership. The implementation integrates the clipped union
+between boundary vertices/intersections, not a bounding box or raster approximation. Curves represented
+as arcs are flattened with 1 µm sagitta; endpoint joins accept KiCad's 0.01 mm outline tolerance.
+An open, branching, Bezier, or zero-area outline produces a log/JSON warning and no automatic protection;
+there is no bounding-box fallback.
+
+The threshold matches the `gndplane` tier's plane measure (doc 10). It includes OtterCast's split In2.Cu
+GND plane (59.9% and 8.7% in two disjoint zones, **68.5% union**), Aria's In1.Cu GND (89.3%) and In2.Cu
++3V3 (80.4%), and LoRaPP's two 100% inner GND planes, but rejects a 30% partial pour. Requiring more than
+half leaves room for antipad-independent partial-board planes without treating two half-board split
+power pours as a solid plane. Protection is not limited to ground: large inner power planes also qualify.
+Outer layers are never automatically protected, including two-layer boards and L1/L4 power pours plus
+signals.
+
+Detected layers union with `--no-tracks-on` into its existing mask (§29), without duplicate names.
+No new track may use the layer, but vias still pass through it and can end a connection in its same-net
+fill. Existing tracks are unchanged. Pads only on protected layers get the same stranded-pad warning and
+stay unrouted. A single `protected planes:` log line lists canonical layer names, net names, and coverage;
+if several nets qualify, the highest coverage wins (ties use ascending net ID). With the flag on, the
+route JSON has `protected_planes: [{\"layer\": \"In1.Cu\", \"net\": \"GND\", \"coverage\": 1.0}]`;
+coverage is a fraction, and the array is in stack order. With the flag off the detection and this JSON
+field are absent.
+
+Tests: `tests/integration/protect_planes.py` routes a synthetic four-layer board with a full In1.Cu GND
+outline and a 30% In2.Cu power outline, without fills: the unprotected run uses In1.Cu, the protected run
+uses In2.Cu and no In1.Cu tracks, and an explicit duplicate ban changes nothing. Unit tests exercise
+same-net union, clipping outside the board, holes/cutouts, crossing edges, missing/stale fills, exclusions,
+and closed/open outline chains.
+
+**Measured checks.** On a temporary routing-stripped copy of PCBench `kitspace_OtterCastAudioV2/raw.kicad_pcb`
+(original zones/fills preserved; no fixture modified), one variant and 3 M work with `--soft-zones`:
+without protection **259/533** engine connections, **25** new In2.Cu tracks; with protection **76/533**,
+In2.Cu GND detected at **68.534963%**, **zero** new In2.Cu tracks. These are engine counts before refill,
+not a KiCad completion claim. The substantial loss at this small budget is why this policy is explicitly
+opt-in: keeping a plane intact can make signal routes harder, and the option does not claim to improve
+completion. The unchanged/default `quick` run (30 boards, 1 M work, `--variants 1`) was compared against
+an unmodified binary built from `924281c50079d1b84a13b175891038af62c02136`: all 30 output boards
+byte-identical, 89.2% mean completion, 12 clean, no added KiCad DRC errors (native KiCad 10.0.3).
