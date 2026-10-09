@@ -1443,14 +1443,17 @@ can never tie only to each other. A tie records the route it ends on, so ripping
 With a plane target there is no useful distance bound to tree goals, so none is computed.
 
 **Results** (single variant, `--soft-zones`, KiCad after refill; plane/signal = unconnected items of plane nets and
-of other nets, D95):
+of other nets, D95). Measured on the merged tree, with the plane-drop bound of §41 and KiCad's default rules (D100):
 
 | Set | Without | With `--plane-tie` | Notes |
 |---|---|---|---|
-| `gndplane`, 3 M | 76.5 % | 77.4 % | 13 of 14 byte-identical; OtterCastAudioV2 259 → 341 of 533 routed (BGA ground balls), plane 18 → 9, signal 234 → 184. No board worse |
-| `planes`, 3 M | 78.2 % | 82.2 % | plane_smd 29 → 42 of 49, RoyalBlue54L-Feather 76 → 84; StickHub −1 connection after refill |
-| 4-layer power board (user report), 100 M, `--no-tracks-on In1.Cu` | 555 of 698 | 552 of 698 | 235 → 215 vias |
+| `gndplane`, 3 M | 77.0 % | 77.3 % | 13 of 14 byte-identical; OtterCastAudioV2 (BGA ground balls) 296 → 345 of 533 routed |
+| `gndplane`, 3 M, `--protect-planes` | 78.2 % | 78.9 % | the same single board: 278 → 345, plane unconnected 17 → 8 |
+| `planes`, 3 M | 84.3 % | 82.6 % | plane_smd 48 → 43 of 49, StickHub 125 → 119; 176 → 132 vias |
+| 4-layer power board (user report), 100 M, `--protect-planes` | 560 of 698 | 552 of 698 | 244 → 215 vias |
 | `quick`, `mid` | | | no zones: no plane connections, unchanged |
 
-It stays opt-in: the power board loses three connections. Ties cost a little track on the signal layers; they win
-where vias cannot be placed (ball arrays, dense QFN fan-outs).
+Before the bound of §41, plane drops searched with no lower bound and boxed-in plane pins often ran out of budget;
+ties then helped widely (`planes` 78.2 % → 82.2 %, plane_smd 29 → 42). With the bound, plane drops succeed where a
+via fits and a tie mostly trades a via for track on a signal layer, which costs other nets there. It stays opt-in,
+for boards whose plane pins sit in ball arrays.

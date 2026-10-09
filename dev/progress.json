@@ -772,7 +772,7 @@
      "done": true
     },
     {
-     "text": "Plane ties, opt-in --plane-tie: boxed-in plane pins end on copper already in the plane (gndplane 76.5 -> 77.4 %, no board worse; planes 78.2 -> 82.2 %; D98, doc 05 \u00a743)",
+     "text": "Plane ties, opt-in --plane-tie: boxed-in plane pins end on copper already in the plane; with the plane-drop bound it helps ball arrays only (gndplane 77.0 -> 77.3 %, OtterCast +49; planes 84.3 -> 82.6 %; D98, doc 05 \u00a743)",
      "done": true
     },
     {
@@ -785,6 +785,10 @@
     },
     {
      "text": "Repeated-route KB safety: reporting-only history, no failed-first order or variant reselection; deterministic fixture-free integration regression; default quick 30/30 byte-identical (D99, doc 06 §4.1)",
+     "done": true
+    },
+    {
+     "text": "Ground-strategy matrix on gndplane/planes/power board: --soft-zones --protect-planes best general setting (gndplane 77.0 -> 78.2 %, planes 84.3 -> 86.9 %); tree-attach and plane-nets-last not for plane boards",
      "done": true
     },
     {
