@@ -97,6 +97,60 @@ TEST_CASE("explicit project selects its custom rules for a renamed board", "[rul
   CHECK_THROWS_AS(io::read_design_rules(f.pcb.string(), (f.dir / "missing.kicad_pro").string()), std::runtime_error);
 }
 
+TEST_CASE("project rules retain KiCad 10 defaults key by key", "[rules][io]") {
+  const Files f("defaults", board_text(""), "");
+  auto check_defaults = [](const model::DesignRules& r) {
+    const auto& m = r.minimums;
+    CHECK(m.clearance == 0);
+    CHECK(m.track_width == 200'000);
+    CHECK(m.connection_width == 0);
+    CHECK(m.via_diameter == 500'000);
+    CHECK(m.via_annular_width == 100'000);
+    CHECK(m.through_hole_diameter == 300'000);
+    CHECK(m.microvia_diameter == 200'000);
+    CHECK(m.microvia_drill == 100'000);
+    CHECK(m.hole_clearance == 250'000);
+    CHECK(m.hole_to_hole == 250'000);
+    CHECK(m.copper_edge_clearance == 500'000);
+    CHECK(m.silk_clearance == 0);
+    CHECK(m.solder_mask_to_copper_clearance == 0);
+    CHECK(m.solder_mask_min_width == 0);
+    const auto& nc = r.classes.front();
+    CHECK(nc.clearance == 200'000);
+    CHECK(nc.track_width == 200'000);
+    CHECK(nc.via_diameter == 600'000);
+    CHECK(nc.via_drill == 300'000);
+    CHECK(nc.uvia_diameter == 300'000);
+    CHECK(nc.uvia_drill == 100'000);
+    CHECK(nc.diff_pair_width == 200'000);
+    CHECK(nc.diff_pair_gap == 250'000);
+    CHECK(nc.diff_pair_via_gap == 250'000);
+  };
+  check_defaults(io::read_design_rules(f.pcb.string()));
+  const auto pro = f.dir / "b.kicad_pro";
+  std::ofstream(pro) << "{}";
+  check_defaults(io::read_design_rules(f.pcb.string()));
+  std::ofstream(pro) << R"({"board":{"design_settings":{"rules":{"min_clearance":0}}},"net_settings":{"classes":[{"name":"Default"}]}})";
+  check_defaults(io::read_design_rules(f.pcb.string()));
+  std::ofstream(pro) << R"({"board":{"design_settings":{"rules":{"min_track_width":0.12,"min_via_diameter":0,"min_hole_clearance":0.15}}},"net_settings":{"classes":[{"name":"Default","track_width":0.17}]}})";
+  const auto custom = io::read_design_rules(f.pcb.string());
+  CHECK(custom.minimums.track_width == 120'000);
+  CHECK(custom.minimums.via_diameter == 0);  // Explicit zero is a rule, not an absent key.
+  CHECK(custom.minimums.hole_clearance == 150'000);
+  CHECK(custom.minimums.through_hole_diameter == 300'000);
+  CHECK(custom.classes.front().track_width == 170'000);
+}
+
+TEST_CASE("legacy board minimums survive omitted project keys", "[rules][io]") {
+  const Files f("legacy_defaults", board_text("(setup (trace_min 0.11) (via_min_size 0.45))"), "");
+  std::ofstream(f.dir / "b.kicad_pro") << R"({"board":{"design_settings":{"rules":{"min_clearance":0.1}}}})";
+  const auto r = io::read_design_rules(f.pcb.string());
+  CHECK(r.minimums.track_width == 110'000);
+  CHECK(r.minimums.via_diameter == 450'000);
+  CHECK(r.minimums.clearance == 100'000);
+  CHECK(r.minimums.through_hole_diameter == 300'000);
+}
+
 TEST_CASE("unrouted categories follow final diagnostics without parsing pad references", "[route][failures]") {
   const std::vector<std::pair<std::string, std::string>> cases{
       {"", "not_attempted"}, {"boxed in", "boxed_in_source"}, {"boxed in (target)", "boxed_in_target"},

@@ -37,6 +37,10 @@
   board's rules. An explicit project that is missing/unreadable is an error. Routing logs the absolute
   project/DRU paths (loaded or absent) and every reader/compiler warning before routing, and includes
   `rules: {project, dru, warnings, project_loaded, dru_loaded}` in its JSON summary.
+  The reader starts with KiCad 10's built-in minimums, applies legacy board setup/net classes, then
+  overrides individual values supplied by the project. Missing project keys keep the board value or
+  built-in default; an explicitly supplied zero stays zero. Missing projects are warned, not treated
+  as zero-minimum designs (D100).
 - **Schematic**: netlist from the hierarchical `.kicad_sch` set (symbols, pins, labels, power symbols, net
   class directives, DNP / exclude-from-board flags). Cross-checked in tests against
   `kicad-cli sch export netlist --format kicadsexpr`.
@@ -45,6 +49,94 @@
 - **Specctra DSN reader / SES writer** for the Freerouting fixture set, plus a **DSN writer** so Freerouting
   can be run as a baseline on our own `.kicad_pcb` fixtures (KiCad 10 has no `kicad-cli` DSN export, and the
   SWIG exporter disappears in KiCad 11).
+
+### 3.1 Project-less and missing-key rule defaults (D100)
+
+KiCad 10.0.3's [`include/board_design_settings.h`](https://github.com/KiCad/kicad-source-mirror/blob/10.0.3/include/board_design_settings.h)
+defines `DEFAULT_TRACKMINWIDTH`, `DEFAULT_VIASMINSIZE`, `DEFAULT_MINTHROUGHDRILL` and the other
+`DEFAULT_*` constants below. Its
+[`BOARD_DESIGN_SETTINGS` constructor](https://github.com/KiCad/kicad-source-mirror/blob/10.0.3/pcbnew/board_design_settings.cpp)
+sets the annular width to `(DEFAULT_VIASMINSIZE - DEFAULT_MINTHROUGHDRILL) / 2` and
+`m_resetParamsIfMissing = false`: an absent project key preserves the constructor value or a value
+read from the legacy board. This matters because the JSON parameter's annular-width reset default
+is not the constructor value; use the value actually judged, not that parameter declaration.
+
+| Board constraint | Default (mm) |
+|---|---:|
+| Overall clearance / minimum connection width | 0 / 0 |
+| Minimum track width | 0.2 |
+| Minimum via diameter / annular width | 0.5 / 0.1 |
+| Minimum through-hole drill | 0.3 |
+| Minimum microvia diameter / drill | 0.2 / 0.1 |
+| Hole-to-copper / hole-to-hole clearance | 0.25 / 0.25 |
+| Copper-to-edge clearance | 0.5 |
+| Silk clearance / mask-to-copper clearance / mask web width | 0 / 0 / 0 |
+
+Default net-class values come from
+[`common/netclass.cpp`](https://github.com/KiCad/kicad-source-mirror/blob/10.0.3/common/netclass.cpp):
+clearance and track width 0.2 mm, via diameter/drill 0.6/0.3 mm, microvia diameter/drill 0.3/0.1 mm,
+differential-pair width/gap/via-gap 0.2/0.25/0.25 mm. The class track/via dimensions are routing
+defaults, not minimum constraints: a legal neck-down is bounded by the board/custom rules.
+
+`tests/integration/no_project_defaults.py` probes thin tracks, undersized vias/drills/annular rings,
+close holes, hole-to-copper and edge clearances, with no project and with omitted project keys. On local `kicad-cli 10.0.3` its
+messages report respectively 0.2000, 0.5000, 0.3000, 0.1000, 0.2495, 0.2500 and 0.5000 mm; the
+hole-to-hole message includes KiCad's 0.0005 mm checking tolerance (the configured rule is 0.25).
+Foreign-net clearance is 0.2000 mm. The same test checks that TraceMaker reports the formerly missed
+thin-track violation and routes a legacy 0.15 mm class at a legal width, both without a project and
+with a partial project omitting the minimum-width key. Unit tests cover every reader default,
+explicit zero, individual project overrides and preserved legacy minimums.
+
+OtterCast's 0.15 mm GND stubs came from the router's **neck-down escalation**, not a board net class:
+its board has neither legacy `net_class` nor `trace_min`. Previously the reader supplied track
+minimum 0, so `Router::neck_width` could lower the 0.25 mm fallback class width to 0.15 mm, and the
+exact rule check agreed with that incorrect minimum. KiCad instead judged against its 0.2 mm
+minimum. Reading the real defaults fixes both search/escape widths and the exact DRC without
+special-casing short tracks or GND.
+
+**Measured correction, macOS arm64 / KiCad 10.0.3:** paired runs
+`defaults-quick-before`/`defaults-quick-after` (1 M work, one variant) and
+`defaults-gnd-before`/`defaults-gnd-after` (3 M work, one variant, `--soft-zones`, refill).
+Both used four board jobs and no knowledge base; timing differed with machine load and is not a speed claim.
+
+| Tier | Routed / planned before → after | Mean KiCad completion | Clean boards | Added routing errors | Byte-identical outputs |
+|---|---:|---:|---:|---:|---:|
+| quick (30) | 1,720 / 2,018 → 1,720 / 2,018 | 89.20% → 89.20% | 12 → 12 | 0 → 0 | 30/30 |
+| gndplane (14) | 2,832 / 3,849 → 2,780 / 3,849 | 76.49% → 75.71% | 1 → 1 | 105 → 45 | 13/14 |
+
+| Ground-plane board | Routed before → after / planned | Added KiCad routing errors before → after |
+|---|---:|---|
+| Retro1DecodingModules_AddressDecoderModule | 35 → 35 / 35 | 0 → 0 |
+| Radar-System_fmcw_radar | 64 → 64 / 74 | 0 → 0 |
+| rxadc_14_rxadc_14 | 115 → 115 / 124 | 0 → 0 |
+| TinyTracker_ub-minimal | 126 → 126 / 159 | 0 → 0 |
+| LoRaPP_loramod | 150 → 150 / 164 | 0 → 0 |
+| PDB_OSD_HARDWARE_Quadcopter Power Board | 136 → 136 / 138 | 0 → 0 |
+| Aria_Aria | 156 → 156 / 239 | 0 → 0 |
+| f4fc_f4fc | 123 → 123 / 208 | 45 `items_not_allowed` → 45 (unchanged output) |
+| FMCW_RADAR_Radar MCU | 238 → 238 / 258 | 0 → 0 |
+| Ttl_wlan_radar | 145 → 145 / 282 | 0 → 0 |
+| mppt-2420-hpx_mppt-2420-hpx | 250 → 250 / 403 | 0 → 0 |
+| draco_draco | 289 → 289 / 418 | 0 → 0 |
+| kitspace_OtterCastAudioV2 | 259 → 207 / 533 | 60 `track_width` → 0 |
+| front-end-modules_LimeSDR_Sony | 746 → 746 / 814 | 0 → 0 |
+
+No board gains KiCad routing errors. Quick is entirely byte-identical because its stored legacy
+rules still win. Only OtterCast changes in the ground-plane tier: its unconnected records rise
+252 → 303 (GND 18 → 20, signals 234 → 283), completion 46.61% → 35.81%, vias 157 → 136.
+It has **zero new-copper track-width violations and zero added routing errors**, but is not complete.
+The ground-plane completion comparison gate fails on this board; the old higher completion used
+illegal copper and is not a valid target to preserve by weakening the minimum. The remaining
+45 `items_not_allowed` errors on f4fc are a pre-existing, byte-identical result, not hidden as a pass.
+Raw KiCad error totals (including pre-existing errors and categories excluded from routing-added
+metrics) are quick 237 → 237, gndplane 1,326 → 1,268; no board's total increases.
+OtterCast alone is 85 → 27: its 60 thin-track errors disappear, 12 fixed-input errors stay, and
+`starved_thermal` is 13 → 15 (the unrouted input had 20). The legal route therefore heals two fewer
+existing thermal problems than the old illegal route; those are not silently omitted from this report.
+The new integration test passes; `tm_tests` passes 111 cases / 635,046 assertions, with one CUDA-only
+Philox test skipped on this Metal build.
+
+
 
 ## 4. Rule coverage policy
 
