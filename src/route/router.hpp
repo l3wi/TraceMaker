@@ -85,6 +85,12 @@ struct RouterOptions {
   double global_congestion_pen = 0.5;  // pitches per lattice step, per eighth of capacity above the threshold
   // Connection planning measures pad copper to pad copper instead of centre to centre (doc 05 §17).
   bool plan_gap = true;
+  // Pad-to-tree routing (doc 05 §40): a connection may start or end on any copper of its net already joined to
+  // that end -- tracks, vias and pads of the cluster, fixed or routed -- instead of only on the planned pads.
+  bool tree_attach = false;
+  // Plane nets (nets with a planned connection into a zone fill): their pad-to-pad connections are routed after
+  // every other connection, also after restarts; their plane connections keep their place (doc 05 §40).
+  bool plane_nets_last = false;
   bool optimize = true;         // post-routing clean-up: re-route connections to save vias and length
   bool escape_plan = false;     // reserve escape corridors for the pins of dense packages (route/escape.hpp, M9)
   bool escape_second_ring = false;  // second-ring balls escape between two outer balls instead of by dog-bone

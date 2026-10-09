@@ -62,6 +62,10 @@ set_tests_properties(plane_smd PROPERTIES SKIP_RETURN_CODE 77 LABELS "route;inte
 # Custom rules the router cannot apply are named in the route log (doc 05 §27).
 add_test(NAME route_rule_warnings COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/route_rule_warnings.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/route_rule_warnings)
 set_tests_properties(route_rule_warnings PROPERTIES LABELS "route;integration" TIMEOUT 120)
+# Pad-to-tree routing (doc 05 §40, D92): a pad beside a track branches off it; with the clean-up on a PCBench board every
+# reported route is connected (TraceMaker's DRC, and KiCad's when kicad-cli is on the PATH) and output is thread-independent.
+add_test(NAME tree_attach COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/tree_attach.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/tree_attach)
+set_tests_properties(tree_attach PROPERTIES LABELS "route;integration" TIMEOUT 600)
 # Frozen KiCad 10 custom-rule item/pair multisets (expected.json names the judging version); normal runs do not require KiCad.
 add_test(NAME rule_parity COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/rule_parity/run.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/rule_parity)
 set_tests_properties(rule_parity PROPERTIES LABELS "integration;rules" TIMEOUT 300)
