@@ -76,3 +76,5 @@ add_test(NAME net_tie COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/ne
 set_tests_properties(net_tie PROPERTIES SKIP_RETURN_CODE 77 LABELS "route;kicad;integration" TIMEOUT 600)
 add_test(NAME protect_planes COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/protect_planes.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/protect_planes)
 set_tests_properties(protect_planes PROPERTIES LABELS "route;integration" TIMEOUT 600)
+add_test(NAME no_project_defaults COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/no_project_defaults.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/no_project_defaults)
+set_tests_properties(no_project_defaults PROPERTIES SKIP_RETURN_CODE 77 LABELS "route;kicad;integration" TIMEOUT 600)

@@ -780,6 +780,10 @@
      "done": true
     },
     {
+     "text": "KiCad 10 project-less/missing-key defaults (D100): synthetic judge regression; quick 30/30 identical; OtterCast track_width errors 60 -> 0, routed 259 -> 207 (correct minimum binds), gndplane 13/14 identical; f4fc's 45 existing items_not_allowed remain",
+     "done": true
+    },
+    {
      "text": "Fine-pitch QFN fan-out among nearby decoupling (pins boxed in by the router's own earlier tracks)",
      "done": false
     },
