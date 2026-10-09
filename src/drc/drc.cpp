@@ -299,29 +299,15 @@ class Checker {
     return side > 0 ? static_cast<Coord>(side) : 0;
   }
 
-  // DRC_ENGINE::IsNetTieExclusion: copper of a net may run into the items of a net-tie footprint where it lies
-  // on one of that footprint's net-tie pads of the same net (tinytapeout-demo NT1). KiCad tests the collision
-  // point; here the item must overlap such a pad.
-  bool net_tie_exclusion(const CopperItem& x, const CopperItem& y) {
+  // Share the router's collision-local exclusion; mere probe overlap with a tied pad is insufficient.
+  bool net_tie_exclusion(const CopperItem& x, const CopperItem& y) const {
     if (x.net == 0 || y.footprint < 0 || y.footprint == x.footprint) return false;
-    const auto& fp = b_.footprints[static_cast<std::size_t>(y.footprint)];
-    if (fp.net_tie_groups.empty()) return false;
-    if (fp_pads_.empty()) {
-      fp_pads_.assign(b_.footprints.size(), {});
-      for (std::size_t k = 0; k < cm_.items.size(); ++k)
-        if (cm_.items[k].kind == ItemKind::Pad && cm_.items[k].footprint >= 0)
-          fp_pads_[static_cast<std::size_t>(cm_.items[k].footprint)].push_back(static_cast<int>(k));
-    }
-    for (const int k : fp_pads_[static_cast<std::size_t>(y.footprint)]) {
-      const CopperItem& p = cm_.items[static_cast<std::size_t>(k)];
-      if (p.net != x.net || !(p.layers & x.layers)) continue;
-      const auto& num = b_.pads[static_cast<std::size_t>(p.index)].number;
-      bool tied = false;
-      for (const auto& g : fp.net_tie_groups)
-        if (std::find(g.begin(), g.end(), num) != g.end()) tied = true;
-      if (tied && shapes_closer(x, p, o_.epsilon)) return true;
-    }
-    return false;
+    const model::LayerMask common = x.layers & y.layers;
+    if (!common) return false;
+    for (model::LayerMask layers = common; layers; layers &= layers - 1)
+      for (const auto& shape : x.shapes)
+        if (net_tie_allowed_net(cm_, shape, y, std::countr_zero(layers), o_.epsilon, x.net) != x.net) return false;
+    return true;
   }
 
   void check_items() {
@@ -431,6 +417,7 @@ class Checker {
         if (a.pad >= 0 && c.footprint >= 0 && c.footprint == b_.pads[static_cast<std::size_t>(a.pad)].footprint) return;  // own footprint
         if (a.pad >= 0 && c.kind == ItemKind::Pad && b_.pads[static_cast<std::size_t>(c.index)].footprint == b_.pads[static_cast<std::size_t>(a.pad)].footprint && !a.plated) return;
         const int layer = std::countr_zero(c.layers);
+        if (c.kind == ItemKind::Graphic && a.net != 0 && net_tie_net_at(cm_, c.footprint, a.pos, layer, o_.epsilon, a.net) == a.net) return;
         const Coord req = re_.hole_clearance(ao, c, layer);
         // KiCad tests a track or via against holes (and a via's hole against copper) even at zero clearance:
         // copper may not reach into a hole (testSingleLayerItemAgainstItem). Pad-to-pad hole tests need a clearance.
@@ -705,7 +692,6 @@ class Checker {
   std::unique_ptr<index::UniformGrid> grid_;
   ItemGraph graph_;
   std::vector<Coord> via_drill_;  // net-class drill of vias written without one (0 otherwise)
-  std::vector<std::vector<int>> fp_pads_;  // copper pad items per footprint (built on first use)
   std::set<std::tuple<std::string, std::size_t, int, int>> zone_reported_;  // (check, item, zone, layer)
   std::unique_ptr<ZoneFills> zones_;
   Coord reach_ = 0;

@@ -959,3 +959,75 @@ TEST_CASE("Rules with a KiCad function TraceMaker does not evaluate are kept, un
   CHECK(engine.clearance(*sig, *gnd, 0) == 1'000'000);
   CHECK(engine.clearance(*sig, *sig, 0) < 1'000'000);
 }
+
+TEST_CASE("net-tie bridges admit pad entry locally without merging nets", "[rules][route][net-tie]") {
+  const std::string jumper =
+      "(net 3 \"UNTIED\")\n"
+      "(footprint \"Jumper\" (layer \"F.Cu\") (at 10 5)\n"
+      " (attr allow_soldermask_bridges) (net_tie_pad_groups \"1,2\")\n"
+      " (fp_poly (pts (xy -0.9 -0.3) (xy -0.4 -0.3) (xy -0.4 0.3) (xy -0.9 0.3))\n"
+      "  (stroke (width 0) (type solid)) (fill yes) (layer \"F.Cu\"))\n"
+      " (fp_rect (start -0.8 -0.75) (end 0.8 0.75) (stroke (width 0) (type solid)) (fill yes) (layer \"F.Mask\"))\n"
+      " (pad \"1\" smd custom (at -1.3 0) (size 1 0.5) (layers \"F.Cu\" \"F.Mask\") (net 2 \"GND\")\n"
+      "  (options (clearance outline) (anchor rect)) (primitives\n"
+      "   (gr_circle (center 0 0.25) (end 0.5 0.25) (width 0) (fill yes))\n"
+      "   (gr_circle (center 0 -0.25) (end 0.5 -0.25) (width 0) (fill yes))\n"
+      "   (gr_poly (pts (xy 0.55 0.75) (xy 0 0.75) (xy 0 -0.75) (xy 0.55 -0.75)) (width 0) (fill yes))))\n"
+      " (pad \"2\" smd rect (at 0 0) (size 1 1.5) (layers \"F.Cu\" \"F.Mask\") (net 1 \"SIG\"))\n"
+      " (pad \"3\" smd rect (at 1.3 0) (size 1.1 1.5) (layers \"F.Cu\" \"F.Mask\") (net 3 \"UNTIED\")))\n";
+  const Files f("net_tie", board_text(jumper), "");
+  auto lb = io::read_board_file(f.pcb.string());
+  const auto rules = io::read_design_rules(f.pcb.string());
+  route::Obstacles obs(lb.board, rules);
+  const geom::Point first{9'200'000, 5'000'000}, second{9'550'000, 5'000'000}, bridge{9'350'000, 5'000'000};
+  CHECK(obs.disk_ok(first, 0, 75'000, 2, 0));
+  CHECK(obs.disk_ok(second, 0, 75'000, 1, 0));
+  CHECK_FALSE(obs.disk_ok(bridge, 0, 75'000, 1, 0));
+  CHECK_FALSE(obs.disk_ok(bridge, 0, 75'000, 2, 0));
+  CHECK_FALSE(obs.disk_ok(first, 0, 75'000, 3, 0));
+  CHECK_FALSE(obs.disk_ok(second, 0, 75'000, 3, 0));
+  CHECK(obs.segment_ok(first, {9'200'000, 3'500'000}, 0, 150'000, 2));
+  CHECK(obs.segment_ok(second, {9'550'000, 3'500'000}, 0, 150'000, 1));
+  // Circular custom-pad primitives must participate in exact clearance, not only the rectangular anchor.
+  CHECK_FALSE(obs.disk_ok({8'400'000, 5'600'000}, 0, 75'000, 3, 0));
+  // KiCad waives bridge hole clearance when the drill centre is on the same-net tied pad.
+  CHECK(obs.via_ok({9'750'000, 5'000'000}, 500'000, 300'000, 1, 0));
+  CHECK(obs.via_ok({10'000'000, 4'400'000}, 700'000, 50'000, 1, 0));
+  CHECK_FALSE(obs.via_ok({10'000'000, 4'400'000}, 700'000, 50'000, 3, 0));
+  // Touching one's pad somewhere does not permit crossing the bridge between the pads.
+  CHECK_FALSE(obs.segment_ok({10'000'000, 5'000'000}, {8'700'000, 5'000'000}, 0, 150'000, 1));
+  CHECK_FALSE(obs.segment_ok({9'350'000, 4'000'000}, {9'350'000, 6'000'000}, 0, 150'000, 3));
+  for (model::NetId net : {1, 2, 3})
+    for (Coord x = 8'000'000; x <= 12'000'000; x += 50'000) {
+      const geom::Point p{x, 5'000'000};
+      const auto code = obs.fixed_code(p, 0, 75'000, 0, net);
+      CHECK((code == route::Obstacles::kFree || code == net) == obs.disk_ok(p, 0, 75'000, net, 0));
+      CHECK(obs.fixed_via_code(p, 300'000, 150'000, 0, net) == obs.fixed_via_code_reference(p, 300'000, 150'000, 0, net));
+    }
+  // At an overlapping pair of tied pads KiCad accepts either pad's net. A class cache can encode
+  // only one allowed net, so that uncommon board must use the exact per-net lattice checks.
+  auto overlapping = lb.board;
+  for (auto& pad : overlapping.pads)
+    if (pad.shape == model::PadShape::Custom) pad.pos.x += 1'300'000;
+  route::Obstacles overlap_obs(overlapping, rules);
+  CHECK(overlap_obs.needs_exact_routing());
+  CHECK(overlap_obs.disk_ok(second, 0, 75'000, 1, 0));
+  CHECK(overlap_obs.disk_ok(second, 0, 75'000, 2, 0));
+  CHECK_FALSE(overlap_obs.disk_ok(second, 0, 75'000, 3, 0));
+  const auto result = route_board(f);
+  REQUIRE(result.routed == result.connections);
+  REQUIRE(has_track(result, 1, false));
+  REQUIRE(has_track(result, 2, false));
+  lb.board.tracks.insert(lb.board.tracks.end(), result.tracks.begin(), result.tracks.end());
+  lb.board.vias.insert(lb.board.vias.end(), result.vias.begin(), result.vias.end());
+  const auto copper = drc::build_copper(lb.board);
+  index::UniformGrid grid(obs.bounds(), 1'000'000, copper.items.size());
+  for (std::size_t i = 0; i < copper.items.size(); ++i) grid.insert(static_cast<int>(i), copper.items[i].box);
+  const auto propagated = drc::propagate_nets(copper, drc::item_graph(lb.board, copper, grid), drc::ZoneFills(copper), grid);
+  for (std::size_t i = 0; i < copper.items.size(); ++i)
+    if (copper.items[i].kind == drc::ItemKind::Track || copper.items[i].kind == drc::ItemKind::Pad)
+      CHECK(propagated[i] == copper.items[i].net);
+  const auto checked = drc::run_drc(lb.board, rules);
+  for (const auto& violation : checked.violations)
+    CHECK((violation.type != "clearance" && violation.type != "shorting_items"));
+}

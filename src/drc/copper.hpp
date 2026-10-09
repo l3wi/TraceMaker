@@ -41,6 +41,8 @@ struct Hole {
 struct CopperModel {
   std::vector<CopperItem> items;
   std::vector<Hole> holes;
+  std::vector<std::vector<int>> net_tie_pads;  // tied copper pad items, indexed by footprint
+  bool overlapping_net_tie_pads = false;  // a single-net fixed code cannot express their exclusions
   std::vector<geom::Shape> edges;  // Edge.Cuts outline pieces (open polylines, r = 0)
   // Margin-layer graphics: KiCad's copper_edge_clearance treats them like the board edge
   // (drc_test_provider_edge_clearance collects Edge.Cuts and Margin), but they are no part of the outline.
@@ -51,5 +53,14 @@ struct CopperModel {
 std::vector<geom::Shape> pad_shapes(const model::Pad& pad);
 
 CopperModel build_copper(const model::Board& b);
+
+// KiCad 10.0.6 DRC_ENGINE::IsNetTieExclusion: the collision location, not an arbitrary contact with
+// the probe, must lie on a tied pad. With requested_net, tests that net alone; otherwise returns
+// the single net allowed at that location, or 0 (including an ambiguous multiple-net entry).
+model::NetId net_tie_allowed_net(const CopperModel& copper, const geom::Shape& probe,
+                               const CopperItem& obstacle, int layer, Coord epsilon = 500, model::NetId requested_net = 0);
+// Hole clearance uses the hole centre rather than the copper collision witness.
+model::NetId net_tie_net_at(const CopperModel& copper, int footprint, geom::Point point, int layer,
+                          Coord epsilon = 500, model::NetId requested_net = 0);
 
 }  // namespace tmk::drc
