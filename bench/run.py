@@ -33,6 +33,8 @@ import sys
 import time
 from collections import Counter
 
+from plane_metrics import copper_totals, plane_nets, unconnected_split
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 FIX = ROOT / "bench/data/freerouting/scripts/benchmark/fixtures/PCBench"
 SRC_FIX = FIX  # --fixtures DIR: boards to place and route (e.g. set S); FIX stays the human reference for placement errors
@@ -72,7 +74,7 @@ def fr_baseline() -> dict[str, dict]:
     return out
 
 
-def drc(path: pathlib.Path, timeout: int = 600) -> dict | None:
+def drc(path: pathlib.Path, timeout: int = 600, planes: dict | None = None) -> dict | None:
     DRC_CACHE.mkdir(parents=True, exist_ok=True)
     st = path.stat()
     key = hashlib.sha1(f"{path.resolve()}:{st.st_mtime_ns}:{st.st_size}:{REFILL}".encode()).hexdigest()[:16]
@@ -101,7 +103,10 @@ def drc(path: pathlib.Path, timeout: int = 600) -> dict | None:
         refs = [re.search(r" of ([^ ]+)(?: on [^ ]+)?$", i.get("description", "")) for i in v.get("items", [])]
         return bool(refs) and all(refs) and len({m.group(1) for m in refs}) == 1
     x = Counter(v["type"] for v in d.get("violations", []) if v.get("severity") == "error" and not own_footprint(v))
-    return {"errors": dict(c), "routed_errors": dict(r), "cross_errors": dict(x), "unconnected": len(d.get("unconnected_items", []))}
+    result = {"errors": dict(c), "routed_errors": dict(r), "cross_errors": dict(x), "unconnected": len(d.get("unconnected_items", []))}
+    if planes is not None:
+        result.update(unconnected_split(d.get("unconnected_items", []), planes))
+    return result
 
 
 PLACE = ROOT / "build/release/src/place/tracemaker-place"
@@ -174,6 +179,13 @@ def run_board(name: str, outdir: pathlib.Path, time_limit: float) -> dict:
             shutil.copyfile(src0.with_suffix(ext), out.with_suffix(ext))
     res = {"board": name}
     src = place_board(name, src0, outdir, res) if PLACE_MODE else src0
+    try:
+        planes = plane_nets(src0)
+        res["plane_nets"] = planes
+    except ValueError as error:
+        # A malformed outline must not change routing or suppress the KiCad judge.
+        planes = None
+        res["plane_metrics_error"] = str(error)
     res["dead_pins"] = dead_pins(src, outdir / "boards" / f"{name}.escape.json")
     t0 = time.time()
     try:
@@ -192,8 +204,8 @@ def run_board(name: str, outdir: pathlib.Path, time_limit: float) -> dict:
     if rj.exists():
         r = json.loads(rj.read_text())
         res.update({k: r[k] for k in ("routed", "connections", "tracks", "vias", "seconds")})
-    before = drc(src)
-    after = drc(out) if out.exists() else None
+    before = drc(src, planes=planes)
+    after = drc(out, planes=planes) if out.exists() else None
     if before is None or after is None:
         res["judge"] = "failed"
         return res
@@ -203,6 +215,14 @@ def run_board(name: str, outdir: pathlib.Path, time_limit: float) -> dict:
     res["added_any"] = {t: n - before["errors"].get(t, 0) for t, n in after["errors"].items()
                         if t not in NOT_ROUTING and n - before["errors"].get(t, 0) > 0}
     res.update({"unconnected_before": before["unconnected"], "unconnected_after": after["unconnected"], "added_errors": added})
+    if planes is not None:
+        res.update({f"{group}_unconnected_{stage}": judge[f"{group}_unconnected"]
+                    for group in ("plane", "signal") for stage, judge in (("before", before), ("after", after))})
+        initial, final = copper_totals(src, planes), copper_totals(out, planes)
+        res.update({f"{group}_vias_added": final[f"{group}_vias"] - initial[f"{group}_vias"]
+                    for group in ("plane", "signal")})
+        res.update({f"{group}_track_mm_added": round(final[f"{group}_track_mm"] - initial[f"{group}_track_mm"], 4)
+                    for group in ("plane", "signal")})
     res["completion"] = 1.0 if before["unconnected"] == 0 else round(1 - after["unconnected"] / before["unconnected"], 4)
     res["clean"] = after["unconnected"] == 0 and not added and not res.get("place_added")
     return res
@@ -216,7 +236,7 @@ def main() -> int:
     ap.add_argument("--work", type=int, default=0, help="deterministic work budget per board (no knowledge base)")
     ap.add_argument("--refill", action="store_true", help="KiCad refills zones before judging input and output")
     ap.add_argument("--route-args", help="extra route options, space-separated; adds to TM_ROUTE_ARGS (write --route-args=--opt for one option)")
-    ap.add_argument("--set", help="board set in bench/sets/<SET>.txt (quick, mid, planes); also names the set in the summary")
+    ap.add_argument("--set", help="board set in bench/sets/<SET>.txt (quick, mid, planes, gndplane); also names the set in the summary")
     ap.add_argument("--jobs", type=int, default=12)
     ap.add_argument("--seed", type=int, default=1, help="board sampling seed")
     ap.add_argument("--name")
@@ -313,6 +333,10 @@ def main() -> int:
     feasible = [r for r in judged if r.get("dead_pins") == 0]
     summary["feasible_boards"] = len(feasible)
     summary["clean_pass_feasible"] = round(sum(r["clean"] for r in feasible) / len(feasible), 4) if feasible else None
+    for key in ("plane_unconnected_before", "plane_unconnected_after", "signal_unconnected_before", "signal_unconnected_after",
+                "plane_vias_added", "signal_vias_added", "plane_track_mm_added", "signal_track_mm_added"):
+        summary[key] = round(sum(r[key] for r in judged if key in r), 4)
+    summary["plane_metrics_boards"] = sum("plane_unconnected_after" in r for r in judged)
     (outdir / "summary.json").write_text(json.dumps(summary, indent=1))
     notes = [f"{budget} per board"] + (["zones refilled before judging"] if a.refill else []) + ([f"route options `{' '.join(EXTRA)}`"] if EXTRA else [])
     lines = [f"# Benchmark {run_id}", "", f"{a.set_name or 'PCBench tier ' + a.tier}, {n} boards, {', '.join(notes)}.", "",
@@ -321,6 +345,14 @@ def main() -> int:
              f"| Mean completion | {summary['completion']:.1%} | | |", "",
              f"Both clean: {both}; only TraceMaker: {only_tm}; only Freerouting: {only_fr}.",
              f"Boards with added DRC errors: {summary['boards_with_added_errors']} ({dict(added_types)})."]
+    lines += ["", "| Board | Routed / connections | KiCad completion | Plane unconnected | Signal unconnected | Vias | Plane / signal vias added | Plane / signal track mm added |",
+              "|---|---:|---:|---:|---:|---:|---:|---:|"]
+    for row in rows:
+        completion = f"{row['completion']:.1%}" if "completion" in row else "judge failed"
+        lines.append(f"| {row['board']} | {row.get('routed', '?')} / {row.get('connections', '?')} | {completion} | "
+                     f"{row.get('plane_unconnected_after', '?')} | {row.get('signal_unconnected_after', '?')} | {row.get('vias', '?')} | "
+                     f"{row.get('plane_vias_added', '?')} / {row.get('signal_vias_added', '?')} | "
+                     f"{row.get('plane_track_mm_added', '?')} / {row.get('signal_track_mm_added', '?')} |")
     (outdir / "report.md").write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
     return 0
