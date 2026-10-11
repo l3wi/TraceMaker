@@ -25,11 +25,12 @@ import quality_rules as qr
 import interfaces as interface_io
 import quality_returns as returns
 import quality_paths as qpaths
+import quality_spacing as spacing
 from shapely.geometry import Point
 
 # Module names, imported only for an explicitly selected profile; each exposes
 # measure_rules(d, interfaces, profile, ctx) -> list of quality_rules.result dicts.
-RULE_MODULES = ['quality_paths', 'quality_returns']
+RULE_MODULES = ['quality_paths', 'quality_returns', 'quality_spacing']
 
 
 def measure_rules(d, interfaces, profile, ctx):
@@ -214,8 +215,10 @@ def measure(d, manifest, board, meta, bad, *, censored=False, interfaces=None, p
     for key,v in manufacturing['per_pad_entry'].items():
         categories['pad_entry'][key]=dict(off_axis=int(v['off']),corner=int(v['corner']),wider_than_face=int(v['wide']),
                                          connected=complete.get(pad_net[key],False),local_contact=True)
+    spacing_fields = spacing.measure(d, complete)
     for n in sorted(complete):
         categories['routing_craft'][n]=dict(acute_junctions=manufacturing.get('acute_by_net',{}).get(n,0),connected=complete[n])
+        categories['routing_craft'][n].update(spacing_fields.get(n, {}))
         pads={(p['ref'],p['num']) for p in d['pads'] if p['net']==n}
         obligations=max(0,len(pads)-1)
         if obligations:

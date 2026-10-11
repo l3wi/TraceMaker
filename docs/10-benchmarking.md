@@ -669,3 +669,48 @@ lower bound then measures the ground-side lead; free travel requires contacts re
 **same grounded refilled island**. Missing/ambiguous pads or unrepresented ground paths are N/A.
 The old `effective_mm` supply metric is unchanged. Neither side is a loop-inductance estimate.
 
+### Guide spacing and bend screens (D-SC-SPACING)
+
+`quality_spacing.py` adds independent routing-craft parity fields on each known-connected signal net:
+`self_spacing_violations` counts close-approach sites below 4W (Toradex 2015 §6.2 p17, R36), and
+`short_bend_segments` counts straight bend segments below 1.5W (R37). Both are lower-is-better integer counts
+with zero parity tolerance. Supply/ground exclusions reuse `quality_craft.is_power`/`is_ground`; no interface
+manifest is needed for these two fields. Historical acute-junction values and thresholds are unchanged.
+
+A **run** is a maximal equal-width straight centreline formed by coalescing degree-two collinear pieces,
+or one circular arc with analytic endpoint tangents and exact circular path length.
+A **non-local site** is an unordered same-layer run pair with no direct copper contact, common endpoint, or endpoint contacts to
+the same pad/via, and no endpoint-to-endpoint centreline path at most `2*max(Wa,Wb)`. Its gap is minimum
+centreline distance minus the two half-widths, clamped at zero; its ratio uses `max(Wa,Wb)`. This operational
+neighbourhood removes ordinary connected corners, rather than applying 4W at a joint where separation
+necessarily vanishes. One violating run pair counts once, independently of collinear file fragmentation.
+The minimum ratio is N/A when no eligible site exists, not an artificial pass. Bend segments must have real
+direction changes at both ends, degree-two joints, and endpoints outside pad/via copper; straight width
+transitions and endpoints are not bends. Arc tessellation vertices are never bend segments; tangent continuity
+uses a 1 µrad uncertainty tolerance for integer-rounded arc control points. Junction contact exclusions use
+the existing rotated pad-envelope model, not custom-pad electrical certification. Invalid arcs/widths are N/A.
+
+For frozen, reviewed interface lanes, `measure_rules(d, interfaces, profile, ctx)` supplies
+`self_spacing_ratio`, `bend_segment_ratio`, `pair_gap_mm`, `pair_gap_ratio`, and `other_gap_mm`.
+Wildcard profile interface rules apply to all declared lanes. Pair distance is the minimum same-layer
+copper-edge distance to **other declared lanes**, across interface groups. Tracks, circular arcs, vias, supported
+pads and supplied refilled signal fills participate. `other_gap_mm` reports distance to every other non-ground,
+non-supply signal net; role-specific high/low-speed distances cannot be inferred from this scalar.
+
+An optional interface `breakout_radius_nm` freezes endpoint-centred breakout disks (default zero: no exception).
+Only pad-to-pad comparisons on a shared endpoint footprint, whose pad centres fall within their respective
+lanes' declared disks, are excluded. Tracks/vias are never exempt. `excluded_pad_comparisons` publishes the
+number of excluded same-layer comparisons, independently of spatial-index traversal. Do not choose these
+disks from the evaluated router output. The LVDS ratio divides the minimum foreign-lane gap by the own-leg
+gap **at that closest site**: project the closest own-copper point onto its track centreline, then measure to
+the closest same-layer mate track, subtracting half-widths. A closest pad/via/fill/arc site, missing mate, or zero
+own gap makes the ratio N/A. This local geometric screen is not an impedance measurement.
+
+Integer-nanometre identities, canonical run/copper ordering and exact segment/polygon distances give
+item-order-independent results. Round copper is polygonized with at least 128 chords per quadrant and at
+most 0.1 µm sagitta, below the 1 µm geometric rule band. Ratio bands convert 1 µm by the minimum represented
+lane width (self/bend) or local own-leg gap (pair); an explicit profile band overrides this. Unknown connectivity,
+unreviewed/candidate intent, missing neighbour geometry, unsupported pads or invalid arcs yield N/A, never pass.
+STRtrees prune distance candidates; `indexed=False` exposes linear reference paths tested for equivalence.
+No field solver, crosstalk sign-off, optional close-parallel-length metric or new hard gate is introduced.
+
