@@ -23,6 +23,9 @@ BAND_MM = 0.001
 COMPARATORS = ('<', '<=', '>', '>=')
 TREATMENTS = ('rule', 'report')
 SCHEMA = 1
+# Millimetre values arrive as binary floats: 0.5 - 0.499 is 0.0010000000000000009.
+# This slack keeps the band edge inclusive; it is far below any geometric meaning.
+FLOAT_SLACK = 1e-9
 
 
 def check(value, limit, comparator, band=BAND_MM):
@@ -36,7 +39,7 @@ def check(value, limit, comparator, band=BAND_MM):
         raise ValueError('unknown comparator '+repr(comparator))
     if value is None or limit is None:
         return 'na'
-    if band > 0 and abs(value-limit) <= band:
+    if band > 0 and abs(value-limit) <= band+FLOAT_SLACK:
         return 'boundary'
     if comparator == '<':
         return 'pass' if value < limit else 'fail'
