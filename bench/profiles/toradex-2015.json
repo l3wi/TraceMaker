@@ -974,6 +974,21 @@
       "treatment": "rule",
       "band": 0,
       "note": "No foreign copper/vias between pair legs; unknown corridor alignment is N/A."
+    },
+    {
+      "id": "general.reference_gap",
+      "interface": "*",
+      "measure": "reference_uncovered_mm",
+      "comparator": "<=",
+      "limit": 0,
+      "strength": "should",
+      "source": {
+        "section": "6.8",
+        "page": 26,
+        "table": null
+      },
+      "treatment": "report",
+      "note": "Geometric no-gap screen on the declared reference domain, not stackup or return-current certification. All-net copper fallback is report-only; zero lies in the shared 1 µm boundary band."
     }
   ]
 }

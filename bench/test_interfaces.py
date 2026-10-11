@@ -137,7 +137,7 @@ class InterfaceTests(unittest.TestCase):
 
     def test_profile_limits_and_band_edges(self):
         profile=qr.load_profile('toradex-2015')
-        self.assertEqual(len(profile['rules']),63)
+        self.assertEqual(len(profile['rules']),64)
         kinds={r['interface'] for r in profile['rules']}
         self.assertEqual(len(kinds),15)
         self.assertEqual(qr.rules_for(profile,'pcie','max_length_mm'),[])

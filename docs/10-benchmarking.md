@@ -567,7 +567,9 @@ Per-board provenance hashes the interface manifest. Coverage lists interface con
 unbound lanes; a missing manifest or unknown geometry/role/mode is N/A, never a pass.
 
 The bundled profile transcribes section-7 geometric limits plus the general 4W same-net meander
-spacing, 1.5W bend-segment and no-between-leg-item rules. Clock/spread skew groups, TX/RX budgets and
+spacing, 1.5W bend-segment and no-between-leg-item rules, plus a report-only no-reference-gap screen.
+The gap screen requires declared reference domains; zero uncovered length is boundary under the shared
+1 µm band, not an electrically certified pass. Clock/spread skew groups, TX/RX budgets and
 slot/device-down modes stay distinct. Length/skew in millimetres are planar proxies, **not timing or
 impedance certification**. Approximate lengths, conditional exceptions and other-signal gaps are
 report-only. USB3's printed “minimum <500 µm” comparator is preserved as report-only, not silently
