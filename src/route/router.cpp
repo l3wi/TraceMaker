@@ -97,6 +97,7 @@ struct Router::Impl {
   };
   std::vector<ConnState> cs;
   std::set<NetId> first_net_ids;  // --first-nets
+  std::vector<geom::Box> tree_pad_boxes;  // fixed footprint pad extents, cached only for tree endpoints
   std::unordered_map<std::int64_t, std::uint16_t> history;  // contested lattice cells (PathFinder history cost)
   std::vector<int> init_root;        // copper item -> initial cluster root (fixed copper)
   // With soft zones: routed copper item -> initial clusters of the same-net plane fills it touches, so a via that
@@ -944,6 +945,9 @@ struct Router::Impl {
     const int skip_item = skip_pad >= 0 ? pad_item[static_cast<std::size_t>(skip_pad)] : -1;
     const int footprint_a = skip_pad >= 0 ? b.pads[static_cast<std::size_t>(skip_pad)].footprint : -1;
     const int footprint_b = other_pad >= 0 ? b.pads[static_cast<std::size_t>(other_pad)].footprint : -1;
+    const Coord margin = std::max(netclass(net).clearance, rules.minimums.clearance) + hw;
+    const geom::Box exclude_a = footprint_a >= 0 ? tree_pad_boxes[static_cast<std::size_t>(footprint_a)].inflated(margin) : geom::Box{};
+    const geom::Box exclude_b = footprint_b >= 0 ? tree_pad_boxes[static_cast<std::size_t>(footprint_b)].inflated(margin) : geom::Box{};
     std::vector<int> ids;
     obs->grid().query(wbox, [&](int id) { ids.push_back(id); });
     std::sort(ids.begin(), ids.end());  // copper order, whatever the grid's
@@ -952,8 +956,6 @@ struct Router::Impl {
       const auto& it = items[static_cast<std::size_t>(id)];
       if (it.removed || it.net != net || id == skip_item || !it.box.intersects(wbox)) continue;
       if (it.kind != drc::ItemKind::Track && it.kind != drc::ItemKind::Arc && it.kind != drc::ItemKind::Via && it.kind != drc::ItemKind::Pad) continue;
-      // Do not replace a planned terminal by a fine-pitch neighbour on either endpoint's footprint.
-      if (it.kind == drc::ItemKind::Pad && it.footprint >= 0 && (it.footprint == footprint_a || it.footprint == footprint_b)) continue;
       if (only && !std::binary_search(only->begin(), only->end(), id)) continue;
       int node;
       if (it.owner >= 0) {
@@ -969,6 +971,10 @@ struct Router::Impl {
         std::set<std::int64_t> tried;  // lattice points of this shape already tested
         auto try_point = [&](int gx, int gy) {
           if (gx < w.x0 || gy < w.y0 || gx >= w.x0 + w.w || gy >= w.y0 + w.h) return;
+          const Point p = at(gx, gy);
+          // Copper between the endpoint's pins is no substitute for the planned terminal: it can seal a neighbour.
+          if ((p.x >= exclude_a.x0 && p.x <= exclude_a.x1 && p.y >= exclude_a.y0 && p.y <= exclude_a.y1) ||
+              (p.x >= exclude_b.x0 && p.x <= exclude_b.x1 && p.y >= exclude_b.y0 && p.y <= exclude_b.y1)) return;
           if (!tried.insert(cell_key(0, gx, gy)).second) return;
           if (!geom::closer_than(geom::Shape::point(at(gx, gy), 0), s, 1)) return;  // not on this copper
           const std::int64_t ci = static_cast<std::int64_t>(gy - w.y0) * w.w + (gx - w.x0);
@@ -3373,6 +3379,13 @@ struct Router::Impl {
     drc::UnionFind uf(obs->copper().items.size());
     for (std::size_t i = 0; i < con.root.size(); ++i) uf.unite(static_cast<int>(i), con.root[i]);
     const auto conns = plan(uf);
+    if (opt.tree_attach || opt.plane_tie) {
+      tree_pad_boxes.resize(b.footprints.size());
+      for (std::size_t pi = 0; pi < b.pads.size(); ++pi) {
+        const int fp = b.pads[pi].footprint, item = pad_item[pi];
+        if (fp >= 0 && item >= 0) tree_pad_boxes[static_cast<std::size_t>(fp)].add(obs->copper().items[static_cast<std::size_t>(item)].box);
+      }
+    }
     if (opt.global_route || opt.global_congestion || opt.cut_report) {
       std::vector<GlobalNet> gn;
       for (const auto& c : conns) {
