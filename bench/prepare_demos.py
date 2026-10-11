@@ -5,11 +5,10 @@ tracks, arcs and vias removed (zones and their fills kept), next to copies of th
 router and KiCad's judge read the same net classes and rules.
 
   bench/prepare_demos.py [--out build/demos] [--set planes | NAME ...]
-  bench/prepare_demos.py --pcbench DIR --out build/gndplane --set gndplane
 
 A name is a board file stem looked up in bench/data/kicad/demos/*/ (scripts/fetch_fixtures.sh kicad-demos) and
-tests/boards/*/, or a PCBench directory containing raw.kicad_pcb when --pcbench is supplied.
-Prints the fixture directory for bench/run.py --fixtures.
+tests/boards/*/. Prints the fixture directory for bench/run.py --fixtures. The open-hardware `modern-planes` set has
+its own fetcher, bench/prepare_modern.py.
 """
 import argparse
 import pathlib
@@ -30,10 +29,8 @@ def find(name: str) -> pathlib.Path:
     raise SystemExit(f"board not found: {name} (looked in {', '.join(str(s) for s in SEARCH)})")
 
 
-def prepare(name: str, out: pathlib.Path, pcbench: pathlib.Path | None = None) -> pathlib.Path:
-    src = pcbench / name / "raw.kicad_pcb" if pcbench else find(name)
-    if not src.is_file():
-        raise SystemExit(f"board not found: {src}")
+def prepare(name: str, out: pathlib.Path) -> pathlib.Path:
+    src = find(name)
     dst = out / name / "unrouted.kicad_pcb"
     dst.parent.mkdir(parents=True, exist_ok=True)
     for ext in (".kicad_pro", ".kicad_dru"):
@@ -47,7 +44,6 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default=str(ROOT / "build/demos"))
     ap.add_argument("--set", help="board set file name in bench/sets (e.g. planes)")
-    ap.add_argument("--pcbench", type=pathlib.Path, help="PCBench root: read NAME/raw.kicad_pcb, not zone-stripped fixtures")
     ap.add_argument("names", nargs="*")
     a = ap.parse_args()
     names = list(a.names)
@@ -57,7 +53,7 @@ def main() -> int:
         ap.error("give --set or board names")
     out = pathlib.Path(a.out).resolve()
     for n in names:
-        prepare(n, out, a.pcbench)
+        prepare(n, out)
     print(out)
     return 0
 

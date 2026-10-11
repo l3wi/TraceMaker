@@ -79,17 +79,22 @@ gates of §5.
 | `quick` | the 30 PCBench tier-A boards of `--limit 30 --seed 1` | `--set quick --work 1000000 --route-args "--variants 1"` (≈ 30 s with `--jobs 4`) | every routing change |
 | `mid` | 11 large, hard PCBench boards | `--set mid --work 20000000` | changes to search, plans or rip-up, which can move results at 20 M while `quick` stays identical |
 | `planes` | 7 KiCad demos with zone fills plus `tests/boards/plane_smd`, routing stripped | `bench/prepare_demos.py --set planes`, then `--fixtures build/demos --set planes --work 3000000 --refill`, once plain and once with `--route-args=--soft-zones` | changes to zones, planes and plane targets |
-| `gndplane` | 14 real PCBench boards with inner ground-plane zones; routing stripped, zones and fills retained | `bench/prepare_demos.py --pcbench /path/to/PCBench --out build/gndplane --set gndplane`, then `--fixtures build/gndplane --set gndplane --work 3000000 --jobs 4 --refill --route-args="--variants 1"` | ground-plane strategies on real 4-/6-layer boards, including power boards |
+| `modern-planes` | 16 open-hardware KiCad 7-10 boards (Antmicro, MNT Research, Great Scott Gadgets, Glasgow, OpenMower), 4-8 copper layers, inner GND/power planes, the boards' own net classes and custom rules; routing stripped, zones and fills retained | `bench/prepare_modern.py` (or `scripts/fetch_fixtures.sh modern`), then `--fixtures build/modern-planes --set modern-planes --work 20000000 --jobs 4 --refill --route-args="--variants 1 --soft-zones"` (≈ 4.5 min) | plane strategies, dense modern boards, routing intent (schematics are fetched for review) |
 
-`gndplane` is built from PCBench's **raw** boards: its existing `unrouted.kicad_pcb` fixtures have no zones.
-Preparation reuses `strip_routing`, removes only top-level segments, arcs and vias, and retains zone boundaries,
-fills, pads and placement; project/custom-rule files beside the raw board are copied as for demos.
-The tier requires an inner copper layer where the union of one ground net's zones, clipped to the closed
-Edge.Cuts outline, covers at least 60% of the board. Four candidates have open outlines reported by KiCad and
-are excluded with reasons in `bench/sets/gndplane.txt`; names with spaces remain single fixture names.
-Run all three comparisons with `--refill`, using `--route-args="--variants 1"`,
-`--route-args="--variants 1 --soft-zones"` and
-`--route-args="--variants 1 --soft-zones --tree-attach"`. The set header gives the preparation and run commands.
+`modern-planes` replaced `gndplane` (D105), whose boards were 13 KiCad 5 files without project rules. Every board is
+pinned to a commit in `bench/sets/modern-planes.json` (repository, commit, board path, licence: Apache-2.0,
+CERN-OHL-S/P, 0BSD, CC-BY-4.0). `bench/prepare_modern.py` fetches only the KiCad files and licence texts of each
+commit into `bench/data/modern/` (≈ 220 MB) and writes `build/modern-planes/<name>/unrouted.kicad_pcb` with top-level
+segments, arcs and vias removed (zones, fills, pads and placement kept), the project and custom rules beside it, and
+the human original as `routed.kicad_pcb`. All 16 originals have 0 unconnected items in KiCad 10.0.3 DRC with refilled
+zones; their existing DRC errors (courtyard overlaps, starved thermals, Cynthion's 4 shorting items between net-tie
+pads) are not routing errors. Sizes: six small (25-264 connections), five medium (355-967), five large (1,334-1,934).
+KiCad 10 boards name nets in pad and zone references (`(net "GND")`); the reader handles both forms.
+
+At 3 M work the large boards are barely half routed (router 63 % of 9,925 connections), so the set runs at 20 M
+like `mid`. KiCad's DRC report lists at most 499 unconnected items, so the judged completion of the six boards with
+more is meaningless (0 % for Cynthion, Reform, Glasgow even when the router connected 1,000+); read the route JSON's
+`routed`/`connections` for them. The same cap affects two `mid` boards (Aleste, decelerator4030).
 
 The harness classifies a **plane net** by the same >=60% zone-union test on *any* copper layer, regardless of
 net spelling (power planes count too). Zone contours use even-odd holes and are clipped to the even-odd board

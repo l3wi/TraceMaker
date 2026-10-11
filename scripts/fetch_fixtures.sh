@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Downloads benchmark fixture sets into bench/data (git-ignored; never redistributed) and builds the sets derived
 # from them.
-# Usage: scripts/fetch_fixtures.sh [all|freerouting|dac2020|kicad-demos|pcbench|pcbworld|derived] ...
+# Usage: scripts/fetch_fixtures.sh [all|freerouting|dac2020|kicad-demos|pcbench|pcbworld|modern|derived] ...
 # Default: freerouting dac2020 kicad-demos derived. Sources and licences: docs/10-benchmarking.md.
 #
 # The three default sets are pinned to the commits the published results were measured on (release 0.8.0), so a
@@ -72,6 +72,8 @@ fetch() {
     pcbench)     full_clone https://github.com/PCBench/PCBench.git pcbench ;;
     pcbworld)    full_clone https://github.com/LGAI-Research/PCBWorld.git pcbworld ;;
     derived)     derived; return ;;
+    # Open-hardware KiCad 7-10 plane boards, each pinned to a commit in bench/sets/modern-planes.json (D105).
+    modern)      python3 bench/prepare_modern.py > /dev/null && echo "fetched modern -> $DATA/modern, prepared build/modern-planes"; return ;;
     *) echo "unknown set: $1"; exit 2 ;;
   esac
   local at=""
@@ -81,5 +83,5 @@ fetch() {
 
 sets=("$@")
 [[ ${#sets[@]} -eq 0 ]] && sets=(freerouting dac2020 kicad-demos derived)
-[[ ${sets[0]} == all ]] && sets=(freerouting dac2020 kicad-demos pcbench pcbworld derived)
+[[ ${sets[0]} == all ]] && sets=(freerouting dac2020 kicad-demos pcbench pcbworld modern derived)
 for s in "${sets[@]}"; do fetch "$s"; done

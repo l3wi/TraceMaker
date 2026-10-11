@@ -1552,17 +1552,22 @@ with no track path (unrouted, or joined only through a plane); excess p90 over p
 | `mid`, 20 M (328 pairs) | 53.3 / 59.5 / 58.6 % | 29 / 46 / 18 | 38 / 22 / 49 | 1.93 / 3.04 / 1.06 | 12 of 1,198 |
 | `planes`, 3 M (72 pairs) | 84.3 / 83.7 / 85.8 % | 7 / 5 / 2 | 29 / 31 / 19 | 4.39 / 2.22 / 0.83 | 2 of 218 |
 | `gndplane`, 3 M (225 pairs) | 77.8 / 82.2 / 81.7 % | 7 / 10 / 5 | 117 / 112 / 58 | 1.75 / 1.85 / 0.51 | 8 of 711 |
+| `modern-planes`, 20 M (529 pairs; router completion, D105) | 77.8 / 80.1 / 79.6 % | 13 / 10 / 17 | 251 / 242 / 84 | 0.72 / 1.08 / 0.95 | 11 of 1,927 |
 
-- The intent is met far better: long capacitor-to-pin paths fall by half or more against both arms, the tail by 2-6x,
-  and on the plane sets half of the pairs that met only through the plane get their own track.
+- On the four older sets the intent is met far better: long capacitor-to-pin paths fall by half or more against
+  both arms, the tail by 2-6x, and on the plane sets half of the pairs that met only through the plane get their own
+  track. On `modern-planes`, whose human placement already puts capacitors beside their pins, the gain is in the
+  pairs that get a track at all (251 / 242 → 84 missing) and the plane-via lead (p90 0.71 / 0.70 → 0.38 mm); long
+  pairs rise 10 → 17 against tree attach, because 158 more pairs are routed and some of those are the long ones.
 - It costs completion against tree attach on most boards: `quick` 8 boards worse (kitspace_threeboard 86.6 → 79.0 %,
   esp8266_envmonitor loses its clean pass), `mid` MonApollo 65.1 → 58.1 %, `planes` StickHub 89.8 → 82.8 %; it gains
   on `planes` RoyalBlue54L-Feather 39.0 → 62.3 %. Against plain routing it is better on every set.
 - Plane access of plane pads is unchanged (`gndplane` 19 / 20 / 19 pads without one); with the board's planes
   visible (D104) nearly every capacitor already drops its own via (lead median 0.02 mm).
-- No-branch nets: junctions 0-2 per set in every arm; these sets have few multi-pad high-speed nets, so the effect
-  is shown on the synthetic case (`tests/integration/route_intent.py`) and the cheap prototypes (655_testboard
-  crystal net 1 junction 4.4 mm from the pad → none).
+- No-branch nets: junctions are rare, 0-2 per set and arm, except `modern-planes` with tree attach (plain 2, tree 8,
+  intent 1). These sets have few multi-pad high-speed nets, so the effect is also shown on the synthetic case
+  (`tests/integration/route_intent.py`) and the cheap prototypes (655_testboard crystal net: 1 junction 4.4 mm from
+  the pad → none).
 - An LLM-reviewed manifest (skills/tracemaker-board-prep) on 655_testboard (capacitors spread over separate VCC pins
   instead of all to IC1.7) cut the worst capacitor detour 9.0 → 4.6 mm and the unconnected items 3 → 1; on
   mechkeys_1800-controller it retargeted a capacitor from the regulator's EN pin to IN and added 16 USB data nets the

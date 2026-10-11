@@ -140,3 +140,4 @@
 {"ts": "2026-10-11T17:06:15+02:00", "kind": "decision", "text": "D103 routing intent manifest: LLM/person reviews a crules draft, router applies it (--intent); long decap paths halved on all tiers, completion cost vs tree attach on some boards; opt-in"}
 {"ts": "2026-10-11T17:06:15+02:00", "kind": "decision", "text": "D104 KiCad 5 layerless zone fills now read: 13/14 gndplane boards had no planes for the router; gndplane plain 77.0 -> 77.8 %, tree 81.3 -> 82.2 %"}
 {"ts": "2026-10-11T17:06:15+02:00", "kind": "test", "text": "ctest 215 passed, 3 skipped, 2 failed of 220 (kicad_drc_parity/broken_parity fail as on main: kicad-cli 10.0.3); quick/mid/planes byte-identical without --intent"}
+{"ts": "2026-10-11T18:34:38+02:00", "kind": "decision", "text": "D105 modern-planes replaces gndplane: 16 open-hardware KiCad 7-10 plane boards (Antmicro, MNT, GSG, Glasgow, OpenMower) pinned by commit; 20 M plain/tree/intent 77.8/80.1/79.6 % router completion"}

@@ -24,6 +24,7 @@ import datetime
 import hashlib
 import json
 import os
+import threading
 import pathlib
 import random
 import re
@@ -81,12 +82,17 @@ def drc(path: pathlib.Path, timeout: int = 600, planes: dict | None = None) -> d
     key = hashlib.sha1(f"{path.resolve()}:{st.st_mtime_ns}:{st.st_size}:{REFILL}".encode()).hexdigest()[:16]
     out = DRC_CACHE / f"{key}.json"
     if not out.exists():
+        # Written to a private name and renamed: parallel runs over the same fixtures (one per experiment arm) judge
+        # the same input board, and a reader must never see a half-written report.
+        part = DRC_CACHE / f"{key}.{os.getpid()}.{threading.get_ident()}.part.json"
         try:
             subprocess.run(["kicad-cli", "pcb", "drc", "--format", "json", "--severity-all", "--all-track-errors"] +
-                           (["--refill-zones"] if REFILL else []) + ["-o", str(out), str(path)],
+                           (["--refill-zones"] if REFILL else []) + ["-o", str(part), str(path)],
                            capture_output=True, timeout=timeout)
         except subprocess.TimeoutExpired:
             return None
+        if part.exists():
+            os.replace(part, out)
     if not out.exists():
         return None
     d = json.loads(out.read_text())
@@ -245,7 +251,7 @@ def main() -> int:
     ap.add_argument("--work", type=int, default=0, help="deterministic work budget per board (no knowledge base)")
     ap.add_argument("--refill", action="store_true", help="KiCad refills zones before judging input and output")
     ap.add_argument("--route-args", help="extra route options, space-separated; adds to TM_ROUTE_ARGS (write --route-args=--opt for one option)")
-    ap.add_argument("--set", help="board set in bench/sets/<SET>.txt (quick, mid, planes, gndplane); also names the set in the summary")
+    ap.add_argument("--set", help="board set in bench/sets/<SET>.txt (quick, mid, planes, modern-planes); also names the set in the summary")
     ap.add_argument("--jobs", type=int, default=12)
     ap.add_argument("--seed", type=int, default=1, help="board sampling seed")
     ap.add_argument("--name")

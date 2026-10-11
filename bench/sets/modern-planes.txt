@@ -1,0 +1,20 @@
+# modern-planes (doc 10 §4, D105): 16 open-hardware KiCad 7-10 boards, 4-8 copper layers, inner GND/power planes,
+# real project net classes and custom rules. Sources, commits and licences: bench/sets/modern-planes.json.
+# Preparation: python3 bench/prepare_modern.py        (scripts/fetch_fixtures.sh modern)
+# Run: bench/run.py --fixtures build/modern-planes --set modern-planes --work 20000000 --jobs 4 --refill --route-args="--variants 1 --soft-zones"
+antmicro-m2-oculink-adapter
+antmicro-usb-c-power-adapter
+openmower-xesc-carrier
+openmower-gps-carrier
+mnt-pocket-reform-wifi
+antmicro-framos-csi-adapter
+antmicro-gmsl-deserializer
+antmicro-cm4-lvds-adapter
+openmower-yardforce-mainboard
+openmower-universal-logic
+gsg-cynthion
+antmicro-cm4-baseboard
+gsg-hackrf-pro
+mnt-reform-motherboard30
+glasgow-revd1
+antmicro-ecp5-dc-scm
