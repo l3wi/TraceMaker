@@ -251,6 +251,19 @@ TEST_CASE("stackup: boards without one say so; missing permittivity makes the ga
   CHECK(g.epsilon_r == 0);
 }
 
+TEST_CASE("KiCad 5 single-layer zone fills (no layer token) are on the zone's layer", "[kicad][io]") {
+  // KiCad 5 writes (filled_polygon (pts ...)) without (layer ...); dropping those fills hid every plane of such boards
+  // from the router and the DRC (13 of 14 `gndplane` boards).
+  const auto b = tmk::io::read_board(tmk::sexpr::Document::parse(
+      "(kicad_pcb (version 20171130) (layers (0 Front signal) (1 Inner1_GND signal) (31 Back signal)) (net 0 \"\") (net 1 GND)\n"
+      " (zone (net 1) (net_name GND) (layer Inner1_GND) (polygon (pts (xy 0 0) (xy 10 0) (xy 10 10) (xy 0 10)))\n"
+      "  (filled_polygon (pts (xy 0.5 0.5) (xy 9.5 0.5) (xy 9.5 9.5) (xy 0.5 9.5)))))"));
+  REQUIRE(b.zones.size() == 1);
+  REQUIRE(b.zones[0].fills.size() == 1);
+  CHECK(b.zones[0].fills[0].first == 1);  // copper index of Inner1_GND
+  CHECK(b.zones[0].fills[0].second.size() == 4);
+}
+
 TEST_CASE("stackup: KiCad demo with dielectric sublayers round-trips", "[kicad][io][stackup]") {
   const fs::path p = src_dir() / "bench/data/kicad/demos/tiny_tapeout/tinytapeout-demo.kicad_pcb";
   if (!fs::exists(p)) SKIP("fixtures missing: run scripts/fetch_fixtures.sh");
