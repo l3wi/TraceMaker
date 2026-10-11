@@ -309,7 +309,7 @@ def fills(board):
     return unions, broad, hashlib.sha256(repr(raw).encode()).hexdigest()
 
 
-def retmetric(d, nets, uf, broad):
+def retmetric(d, nets, uf, broad, *, isolated=()):
     """Measure prototype adjacent-plane return gaps and stitching distances.
 
     Segment centres, not track edges, determine gaps. A layer transition counts
@@ -336,7 +336,7 @@ def retmetric(d, nets, uf, broad):
             reference_unions[l] = unary_union([uf[r] for r in refs])
     ground_vias = []
     for via in d["vias"]:
-        if not _GROUND.fullmatch(via["net"]):
+        if not _GROUND.fullmatch(via["net"]) or via["net"] in isolated:
             continue
         top, bottom = indices.get(via["top"]), indices.get(via["bottom"])
         if top is None or bottom is None:
@@ -346,6 +346,8 @@ def retmetric(d, nets, uf, broad):
         touching = {l for l in span if l in uf and uf[l].intersects(disk)}
         ground_vias.append((via, touching))
     for n in sorted(nets):
+        if n in isolated:
+            continue
         segments = segs(d, n)
         lines = [LineString([(s["sx"], s["sy"]), (s["ex"], s["ey"])]) for s in segments]
         for s, line in zip(segments, lines):

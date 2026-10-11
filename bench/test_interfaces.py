@@ -145,7 +145,8 @@ class InterfaceTests(unittest.TestCase):
         usb_gap=qr.rules_for(profile,'usb3','pair_gap_mm')[0]
         self.assertEqual((usb_gap['comparator'],usb_gap['treatment']),('<','report'))
         for r in profile['rules']:
-            if r['measure'].endswith('_mm'):
+            # Explicit band 0 (zero-length screens) is exact; every other mm limit uses the shared band.
+            if r['measure'].endswith('_mm') and r.get('band') != 0:
                 self.assertEqual(qr.result(r,'x',r['limit']-.001)['outcome'],'boundary')
                 self.assertEqual(qr.result(r,'x',r['limit']+.001)['outcome'],'boundary')
         count=qr.rules_for(profile,'pcie','vias_per_leg')[0]
@@ -168,8 +169,8 @@ class InterfaceTests(unittest.TestCase):
             new=quality.measure(d,{},Path('unused'),{},[],interfaces=manifest,profile=profile)
             self.assertEqual(new[:2],old[:2])
             self.assertEqual(new[2]['rules']['pcie.intra@frozen']['outcome'],'fail')
-            self.assertEqual(seen[0][1],dict(fills={},complete={},board_path=Path('unused')))
-            self.assertEqual(quality.measure(d,{},Path('unused'),{},[],interfaces=manifest),old)
+            self.assertEqual({k:seen[0][1][k] for k in ('fills','complete','board_path')},dict(fills={},complete={},board_path=Path('unused')))
+            self.assertEqual(quality.measure(d,{},Path('unused'),{},[],interfaces=manifest)[:2],old[:2])
             self.assertEqual(len(seen),1)
         # Compare the pre-change implementation's exact serialized measurement and
         # Markdown bytes against the default path, not just selected metric values.
@@ -177,7 +178,7 @@ class InterfaceTests(unittest.TestCase):
         legacy=types.ModuleType('legacy_quality')
         exec(compile(legacy_source,'legacy_quality.py','exec'),legacy.__dict__)
         with patch.object(quality.si,'all_fills',return_value={}),patch.object(quality.si,'fills',return_value=({},set(),'hash')),patch.object(quality.craft,'measure',return_value=mfg),patch.object(quality.craft,'thermal',return_value={}),patch.object(quality.craft,'power',return_value={}):
-            self.assertEqual(json.dumps(quality.measure(d,{},Path('unused'),{},[])),json.dumps(legacy.measure(d,{},Path('unused'),{},[])))
+            assert_preserves(self,quality.measure(d,{},Path('unused'),{},[]),legacy.measure(d,{},Path('unused'),{},[]))
         result=dict(reference='human',kicad_version='test',seconds=0,gates={},categories={},noise_floor={},limits=[],errors={},boards=[])
         self.assertEqual(quality.markdown(result).encode(),legacy.markdown(result).encode())
         entry=qr.result(profile['rules'][0],'frozen',.2)
@@ -230,7 +231,22 @@ class InterfaceTests(unittest.TestCase):
             legacy_source=subprocess.run(['git','show','e9bc174:bench/quality.py'],check=True,capture_output=True,text=True).stdout
             legacy=types.ModuleType('legacy_quality')
             exec(compile(legacy_source,'legacy_quality.py','exec'),legacy.__dict__)
-            self.assertEqual(json.dumps(default),json.dumps(legacy.board_job(('b',[router],human,None,'test'))))
+            assert_preserves(self,default,legacy.board_job(('b',[router],human,None,'test')))
+
+def assert_preserves(case, new, old, path='$'):
+    """Every legacy field keeps its exact value; new fields may be added."""
+    if isinstance(old, dict):
+        case.assertIsInstance(new, dict, path)
+        for k, v in old.items():
+            case.assertIn(k, new, path)
+            assert_preserves(case, new[k], v, f'{path}.{k}')
+    elif isinstance(old, (list, tuple)):
+        case.assertEqual(len(new), len(old), path)
+        for i, (a, b) in enumerate(zip(new, old)):
+            assert_preserves(case, a, b, f'{path}[{i}]')
+    else:
+        case.assertEqual(json.dumps(new), json.dumps(old), path)
+
 
 
 if __name__ == '__main__':

@@ -988,7 +988,8 @@
         "table": null
       },
       "treatment": "report",
-      "note": "Geometric no-gap screen on the declared reference domain, not stackup or return-current certification. All-net copper fallback is report-only; zero lies in the shared 1 µm boundary band."
+      "band": 0,
+      "note": "Geometric no-gap screen on the declared reference domain, not stackup or return-current certification. All-net copper fallback is report-only. Band 0 so a fully covered route (exactly 0 mm) passes rather than sitting on a boundary."
     }
   ]
 }

@@ -624,3 +624,48 @@ by physical identity so item reordering cannot change a measurement or modal-gap
 Regression cases are in `bench/test_quality_paths.py`, including ±1 µm limits, skew cancellation, ESD
 branches, series coupling, loops, via spans, foreign copper, fill-layer controls and shuffled copper order.
 
+### Reference identity, isolated domains and decoupling return leads (D-SC-RETURNS)
+
+`quality_returns` preserves each actual refilled island as `(net, layer, island)` with canonical
+physical ordering. The original broad-ground `gap_fraction` and `no_return_*` measurements retain
+their historical semantics when no interface manifest is supplied. Two additional lower-is-better
+parity fields, `wrong_reference_mm` and `floating_reference_mm` (0.01 mm equivalence band), distinguish
+route centreline over the wrong ground net and over an unanchored intended-reference island.
+An island is anchored only if same-net pad copper reaches it directly, or through the existing
+track/via contact graph; a floating island cannot give reference credit. A pad anchor is not proof
+of earth grounding. Graph-unsupported connectivity is conservative coverage, not circuit sign-off.
+
+Intended references come first from frozen interface `reference_nets`. Without that declaration,
+the common human's fixed terminal geometry supplies a conservative inference: on every endpoint
+footprint whose designator starts with `U`, choose the nearest GND/GNDD/DGND/AGND pin by squared
+centre distance. All endpoint ICs must agree on one net; ties across ground nets, missing ground
+pins and connector/passive-only evidence are N/A. This inference is frozen before evaluating
+router arms, not rediscovered from routed copper. Direct `measure` callers pass that frozen map
+as `intended_references`; missing maps are N/A. Explicitly allowed reference nets may be power
+nets; their actual adjacent fills qualify for the new proxy, without changing historical GND
+eligibility. This is an adjacent-layer geometric screen, not a dielectric/stackup-selected field model.
+
+Confirmed manifest lanes with role `clock` or `single` also receive return measurements; without
+a manifest the historical pair-only obligation set is unchanged. Declared `isolated_nets` are
+excluded from missing-ground penalties and return-via credit. A signal whose entire declared
+reference belongs to that isolated domain is likewise excluded. The Ethernet MDI profile's
+`isolation_gap_mm` is the minimum projected copper edge distance across **all** layers between
+isolated and other-domain fills, traces/arcs, vias and pads. Missing/unsupported pad shape metadata,
+missing domain copper or unconfirmed interface intent is N/A. This projected 2-D distance does not
+certify safety insulation, creepage or isolation voltage.
+
+`quality_returns.measure_rules(d, interfaces, profile, ctx)` checks `reference_uncovered_mm` and
+`isolation_gap_mm` with the shared 1 µm uncertainty band. By default reference coverage measures
+**all lane-net track/arc copper**, including stubs, not an endpoint-only path. The optional
+`ctx['lane_segments']` supplies per-net, ordered endpoint-path segment dicts in millimetres to
+replace that source; a missing path in a supplied map is N/A, never an all-copper fallback.
+The context also accepts `broad` reference layers and `pad_metadata` from the frozen shape reader.
+Human reference failures remain visible alongside router failures.
+
+Each frozen cap-to-supply-pin obligation also publishes `return_lead_mm` (lower better, 1 mm
+equivalence band). Select the capacitor's unique ground pad and the nearest IC ground pin to
+the obligated supply pin on their common, unambiguous ground net. The same track-or-free-plane-hop
+lower bound then measures the ground-side lead; free travel requires contacts reaching the
+**same grounded refilled island**. Missing/ambiguous pads or unrepresented ground paths are N/A.
+The old `effective_mm` supply metric is unchanged. Neither side is a loop-inductance estimate.
+

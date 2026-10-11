@@ -23,9 +23,13 @@ import quality_si as si
 import quality_identity as identity
 import quality_rules as qr
 import interfaces as interface_io
+import quality_returns as returns
+import quality_paths as qpaths
 from shapely.geometry import Point
 
-RULE_MODULES = []  # Module names, imported only for an explicitly selected profile.
+# Module names, imported only for an explicitly selected profile; each exposes
+# measure_rules(d, interfaces, profile, ctx) -> list of quality_rules.result dicts.
+RULE_MODULES = ['quality_paths', 'quality_returns']
 
 
 def measure_rules(d, interfaces, profile, ctx):
@@ -39,7 +43,7 @@ def measure_rules(d, interfaces, profile, ctx):
             results[key] = entry
     return {key: results[key] for key in sorted(results)}
 
-def effective_paths(d, manifest, fills):
+def effective_paths(d, manifest, fills, *, _return=True, _graphs=None, _leads=None):
     """Port align.py's lower bound, but require actual contact to the SAME fill island.
 
     Plane transport is still free: this is not loop inductance or current simulation.
@@ -47,7 +51,9 @@ def effective_paths(d, manifest, fills):
     """
     refs = {p['ref'] for p in d['pads']}
     pad_nets = {(p['ref'],p['num']):p['net'] for p in d['pads']}
-    graphs, results, lead_cache = {}, {}, {}
+    graphs, results, lead_cache = _graphs if _graphs is not None else {}, {}, _leads if _leads is not None else {}
+    ground_graphs, ground_leads = {}, {}
+    valid_fills, gd = None, None
     for c in manifest.get('connections',[]):
         key = c['from']+'>'+c['to']
         a, b = iq.split_pad(c['from'],refs), iq.split_pad(c['to'],refs)
@@ -89,6 +95,36 @@ def effective_paths(d, manifest, fills):
         values=[v for v in (t,p) if v is not None]
         results[key]=dict(effective_mm=min(values) if values else None,connected=bool(values),track_mm=t,plane_lead_mm=p,
                           net=net,plane_lower_bound=True)
+        if _return:
+            cap_ground = [p for p in d['pads'] if p['ref'] == a[0] and si._GROUND.fullmatch(p['net'])]
+            pin = g.pads[ib]
+            ic_ground = [p for p in d['pads'] if p['ref'] == b[0] and si._GROUND.fullmatch(p['net'])]
+            choices = [(p, q) for p in cap_ground for q in ic_ground if p['net'] == q['net']]
+            ground_nets = {p['net'] for p, _ in choices}
+            results[key]['return_lead_mm'] = None
+            results[key]['return_reason'] = 'ground pads missing or reference ambiguous'
+            if len(ground_nets) == 1:
+                # Nearest IC ground pin to the obligated supply pin is frozen placement evidence.
+                nearest = min((q['x']-pin['x'])**2+(q['y']-pin['y'])**2 for _, q in choices)
+                choices = [(p, q) for p, q in choices if (q['x']-pin['x'])**2+(q['y']-pin['y'])**2 == nearest]
+                if len({(q['x'], q['y'], tuple(q['layers'])) for _, q in choices}) == 1 and len(cap_ground) == 1:
+                    p, q = min(choices, key=lambda pq: (pq[0]['x'], pq[0]['y'], pq[1]['num']))
+                    ground_connection = {'from': p['ref']+'.'+p['num'], 'to': q['ref']+'.'+q['num']}
+                    if valid_fills is None:
+                        gd = returns.canonical_data(d)
+                        # Only grounded islands can offer free plane transport.
+                        grounded = returns.grounded_islands(gd, fills)
+                        valid_fills = {}
+                        from shapely.ops import unary_union
+                        for (fn, layer, index), island in returns.islands(fills).items():
+                            if grounded[fn, layer, index]:
+                                valid_fills.setdefault((fn, layer), []).append(island)
+                        valid_fills = {k: unary_union(v) for k, v in valid_fills.items()}
+                    ground_result = effective_paths(gd, {'connections': [ground_connection]}, valid_fills, _return=False,
+                                                    _graphs=ground_graphs, _leads=ground_leads)
+                    lead = next(iter(ground_result.values()))['effective_mm']
+                    results[key].update(return_lead_mm=lead, return_net=p['net'],
+                                        return_reason=None if lead is not None else 'ground path unavailable')
     return results
 
 
@@ -98,7 +134,8 @@ def net_complete(d, bad, censored=False):
             for n in d['nets'] if n and not n.startswith('unconnected')}
 
 
-def measure(d, manifest, board, meta, bad, *, censored=False, interfaces=None, profile=None):
+def measure(d, manifest, board, meta, bad, *, censored=False, interfaces=None, profile=None, intended_references=None,
+            pair_endpoints=None):
     categories = {c:{} for c in qc.METRICS}
     ff=si.all_fills(board)
     categories['decoupling']=effective_paths(d,manifest,ff)
@@ -116,6 +153,16 @@ def measure(d, manifest, board, meta, bad, *, censored=False, interfaces=None, p
         # An invalid outline blocks reference-layer inference, not other categories.
         ground,broad,fill_hash={},set(),None
         reference_error=str(error)
+    bindings, isolated = returns.reference_bindings(interfaces)
+    if isolated:
+        from shapely.ops import unary_union
+        ground={layer:unary_union([fill for (net,l),fill in ff.items()
+                                  if l==layer and net not in isolated and si._GROUND.fullmatch(net)])
+                for layer in ground}
+        isolated=isolated | {net for net,refs in bindings.items() if refs and set(refs) <= isolated}
+    # The caller freezes inference on the human; direct callers must supply it.
+    inferred = intended_references or {}
+    grounded = returns.grounded_islands(d, ff)
     candidates=si.pairs(d)
     for p,m in candidates:
         a,b=si.pdata(d,p),si.pdata(d,m)
@@ -123,16 +170,36 @@ def measure(d, manifest, board, meta, bad, *, censored=False, interfaces=None, p
         states=(complete.get(p,False),complete.get(m,False))
         connected=False if False in states else None if None in states else a is not None and b is not None
         if not connected:
-            categories['differential_pairs'][key]=dict(connected=connected,coupled_fraction=None,skew_mm=None,via_imbalance=None)
+            categories['differential_pairs'][key]=dict(connected=connected,coupled_fraction=None,skew_mm=None,via_imbalance=None,
+                                                       segment_skew_mm=None,via_layer_mismatch=None)
         else:
             categories['differential_pairs'][key]=dict(connected=True,skew_mm=abs(a['length']-b['length']),
                                                        via_imbalance=abs(a['vias']-b['vias']),p=p,m=m)
+            # Endpoint-path fields; endpoints are frozen from the human by the caller.
+            categories['differential_pairs'][key].update(qpaths.parity_metrics(d,p,m,pair_endpoints,pad_metadata=meta))
         for n in (p,m):
             if n in categories['return_paths']:
                 continue
-            r=si.retmetric(d,[n],ground,broad)
+            r=si.retmetric(d,[n],ground,broad,isolated=isolated)
             categories['return_paths'][n]=dict(r,connected=complete.get(n,False) and si.pdata(d,n) is not None,
                                               gap_fraction=r['gap_mm']/r['eligible_mm'] if r['gap_mm'] is not None and r['eligible_mm'] else None)
+            categories['return_paths'][n].update(returns.domain_metrics(
+                d,n,ff,broad,bindings.get(n) if n in bindings else inferred.get(n),
+                grounded=grounded,isolated=isolated))
+    for iface in (interfaces or {}).get('interfaces', []):
+        if iface.get('confidence') != 'confirmed':
+            continue
+        for lane in iface['lanes']:
+            if lane['role'] not in ('clock', 'single'):
+                continue
+            for n in sorted(n for n in (lane.get('p'), lane.get('n')) if n):
+                if n in categories['return_paths']:
+                    continue
+                r=si.retmetric(d,[n],ground,broad,isolated=isolated)
+                categories['return_paths'][n]=dict(r,connected=complete.get(n,False),
+                    gap_fraction=r['gap_mm']/r['eligible_mm'] if r['gap_mm'] is not None and r['eligible_mm'] else None)
+                categories['return_paths'][n].update(returns.domain_metrics(
+                    d,n,ff,broad,bindings.get(n),grounded=grounded,isolated=isolated))
     for n,v in craft.power(d).items():
         categories['power'][n]=dict(connected=complete.get(n,False),median_width_mm=v['median_width'],
                                    resistance_35um_ohm=v['resistance_35um_ohm'],neck_fraction=None,
@@ -158,17 +225,19 @@ def measure(d, manifest, board, meta, bad, *, censored=False, interfaces=None, p
     coverage = dict(fill_hash=fill_hash,broad_reference_layers=sorted(broad),
                     reference_error=reference_error,manifest_obligations=len(manifest.get('connections',[])),
                     differential_candidates=len(candidates), thermal_candidates=len(thermals))
-    if profile is not None:
+    if interfaces is not None:
         coverage['interfaces'] = interface_io.coverage(interfaces, d)
+    if profile is not None:
         coverage['rules'] = measure_rules(d, interfaces, profile,
-                                         dict(fills=ff, complete=complete, board_path=board))
+                                         dict(fills=ff, complete=complete, board_path=board, pad_metadata=meta, broad=broad))
     return categories, manufacturing, coverage
 
 
 def board_job(job):
     name,runs,reference,intents,version,*rule_options=job
     interface_dir,profile = rule_options if rule_options else (None,None)
-    interfaces = qr.load_interfaces(interface_dir, name) if profile is not None else None
+    # Interfaces also steer return-path references, so they load without a profile.
+    interfaces = qr.load_interfaces(interface_dir, name)
     interface_path = Path(interface_dir)/(name+'.interfaces.json') if interfaces is not None else None
     paths=[reference]+runs
     result=dict(board=name,runs={},errors={})
@@ -185,6 +254,8 @@ def board_job(job):
         return result
     meta=craft.metadata(human_path)
     human_geometry,meta=identity.canonical_human(io.inspect(human_path,reference,name),human_path,meta)
+    intended_references=returns.inferred_references(human_geometry,human_geometry['nets'])
+    pair_endpoints=qpaths.infer_endpoints(human_geometry)
     published_labels={}
     published_path=runs[0]/'boards'/(name+'.kicad_pcb')
     if published_path.exists():
@@ -211,7 +282,8 @@ def board_job(job):
             bad_nets = judged['unconnected_nets']
             categories,mfg,coverage=measure(data,manifest,filled,meta,bad_nets,
                                             censored=len(report.get('unconnected_items',[]))>=499,
-                                            interfaces=interfaces, profile=profile)
+                                            interfaces=interfaces, profile=profile,
+                                            intended_references=intended_references,pair_endpoints=pair_endpoints)
             matched_keys={p['ref']+'.'+p['num'] for p in data['pads'] if p.get('physical_matched')}
             unmatched_human={p['ref']+'.'+p['num'] for p in human_geometry['pads']} - matched_keys
             coverage['terminal_matching']=dict(terminal_coverage,unmatched_human=sorted(unmatched_human))
@@ -227,13 +299,15 @@ def board_job(job):
                                           placement_sha256=hashlib.sha256(json.dumps(sorted((p['net'],p['x'],p['y'],p['w'],p['h'],p['angle'],tuple(p['layers'])) for p in data['pads'])).encode()).hexdigest(),
                                           engine_diagnostic={k:diagnostic.get(k) for k in ('routed','connections','stop','expansions','seconds')},
                                           whole_board=dict(vias=len(data['vias']),track_arc_mm=sum(si.exact_copper_length(data,n) for n in data['nets'])))
+            arm = result['runs'][str(run)]
             if profile is not None:
-                arm = result['runs'][str(run)]
                 arm['rules'] = coverage.pop('rules')
-                arm['interfaces_sha256'] = io.digest(interface_path) if interface_path else None
+            if interfaces is not None:
+                arm['interfaces_sha256'] = io.digest(interface_path)
                 arm['provenance']['interfaces_sha256'] = arm['interfaces_sha256']
             if run==reference:
-                original,_,_=measure(data,manifest,source,meta,judged['unconnected_nets'])
+                original,_,_=measure(data,manifest,source,meta,judged['unconnected_nets'],interfaces=interfaces,
+                                     intended_references=intended_references,pair_endpoints=pair_endpoints)
                 result['original_human']=original
                 result['human_data']=data
             else:
@@ -397,9 +471,9 @@ def main():
         'Human parity is a practical reference, not SI/current/thermal/assembly certification. Categories have no weighted total.',
         'KiCad is the independent connectivity authority. tracemaker drc has not established uncapped plane/net-tie parity; 499-saturated lists are censored. The ratio is an interim disconnected-item denominator, not proven terminal-component rank.',
         'DRC additions use violation-instance differences, including non-track errors. UUID/description changes and KiCad solder-mask noise can cause baseline differences; inspect reported instances before sign-off.',
-        'Decoupling uses a free-plane-hop lower bound between contacts to the same actual filled island; multilayer island joins and full loop impedance are not modeled. Human-invalid paths are coverage holes, not an allowed defect rate.',
+        'Decoupling supply and return leads use free-plane-hop lower bounds between contacts to the same actual filled island; return hops exclude unanchored islands. Multilayer island joins and full loop impedance are not modeled. Human-invalid paths are coverage holes, not an allowed defect rate.',
         'Differential nets are name-selected, two-terminal graph-qualified candidates. Coupling uses the human modal gap, not a certified impedance target; skew excludes package/vertical-via delay. NetGraph approximates arcs with two chords for connectivity only.',
-        'Return metrics screen adjacent broad GND filled copper. Island grounding, power-reference transfer capacitors and deliberate Ethernet isolation domains are not proven. Unknown reference length and transitions remain visible in per-board JSON.',
+        'Historical returns screen adjacent broad GND fills. New fields preserve intended net/island identity using frozen manifest references or unambiguous nearest endpoint-IC ground pins on the human. Anchoring means pad connectivity, not earth grounding; power-transfer capacitors and actual return-current fields are not certified. Declared Ethernet isolation is excluded from missing-ground penalties; all-layer projected isolation gaps are not safety/creepage sign-off.',
         'Supply resistance is a 35 um copper series-track diagnostic, not a loaded network: planes and parallel paths are omitted. Neck fraction is length below human median width; class neck length is separate.',
         'Thermal pads inferred from central geometry are candidates, not datasheet-certified obligations. Retention counts same-net in-pad vias, not receiving-plane thermal conductance. Small-pad exemptions are board-wide when human has via-in-pad; raw counts remain published.',
         'Pad-entry and acute-junction thresholds are prototype craft heuristics, not IPC errors. Unsupported/custom shapes are unassessable; arcs are omitted from pad-entry/acute screens.',
