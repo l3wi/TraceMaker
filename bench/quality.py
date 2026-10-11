@@ -128,6 +128,8 @@ def effective_paths(d, manifest, fills, *, _return=True, _graphs=None, _leads=No
                     lead = ground_path['effective_mm']
                     results[key].update(return_lead_mm=lead, return_net=p['net'],
                                         return_connected=ground_path['connected'],
+                                        return_endpoints=[{k: terminal[k] for k in ('x', 'y', 'w', 'h', 'angle')}
+                                                          for terminal in (p, q)],
                                         return_reason=None if lead is not None else 'ground path unavailable')
     return results
 
@@ -138,8 +140,23 @@ def net_complete(d, bad, censored=False):
             for n in d['nets'] if n and not n.startswith('unconnected')}
 
 
+def _return_terminal_unconnected(item, unconnected_items):
+    """Identify judged return endpoints by physical position, never renamed refs."""
+    for entry in unconnected_items:
+        for endpoint in entry.get('items', []):
+            if item['return_net'] not in io.bracket_nets(endpoint.get('description', '')):
+                continue
+            pos = endpoint.get('pos', {})
+            if 'x' not in pos or 'y' not in pos:
+                continue
+            x, y = round(pos['x']*1e6), round(pos['y']*1e6)
+            if any(iq.in_pad(p, x, y, margin=identity.TOL_NM-iq.TOL) for p in item['return_endpoints']):
+                return True
+    return False
+
+
 def measure(d, manifest, board, meta, bad, *, censored=False, interfaces=None, profile=None, intended_references=None,
-            pair_endpoints=None):
+            pair_endpoints=None, unconnected_items=()):
     categories = {c:{} for c in qc.METRICS}
     ff=si.all_fills(board)
     categories['decoupling']=effective_paths(d,manifest,ff)
@@ -151,12 +168,14 @@ def measure(d, manifest, board, meta, bad, *, censored=False, interfaces=None, p
             # A model-unrepresented path on a KiCad-connected net is unknown, not unroutable.
             item.update(connected=state,coverage_reason='censored connectivity' if state is None else 'path not represented by plane/track model')
         if 'return_connected' in item and item.get('return_net') is not None:
-            return_state = complete.get(item['return_net'], False)
-            # KiCad's ground-net judgment distinguishes lost return copper from
-            # a connected path that this lower-bound model cannot represent.
-            item['return_connected'] = return_state
-            if return_state is not True:
-                item['return_reason'] = 'ground net incomplete' if return_state is False else 'censored ground connectivity'
+            if censored:
+                item.update(return_connected=None, return_reason='censored ground connectivity')
+            elif item['return_connected'] is not True:
+                # A global ground break does not identify this cap's return loss.
+                lost = (complete.get(item['return_net']) is False
+                        and _return_terminal_unconnected(item, unconnected_items))
+                item.update(return_connected=False if lost else None,
+                            return_reason='ground terminal unconnected' if lost else 'ground path not represented')
     reference_error = None
     try:
         ground,broad,fill_hash=si.fills(board)
@@ -295,6 +314,7 @@ def board_job(job):
             bad_nets = judged['unconnected_nets']
             categories,mfg,coverage=measure(data,manifest,filled,meta,bad_nets,
                                             censored=len(report.get('unconnected_items',[]))>=499,
+                                            unconnected_items=report.get('unconnected_items', []),
                                             interfaces=interfaces, profile=profile,
                                             intended_references=intended_references,pair_endpoints=pair_endpoints)
             matched_keys={p['ref']+'.'+p['num'] for p in data['pads'] if p.get('physical_matched')}
@@ -320,6 +340,8 @@ def board_job(job):
                 arm['provenance']['interfaces_sha256'] = arm['interfaces_sha256']
             if run==reference:
                 original,_,_=measure(data,manifest,source,meta,judged['unconnected_nets'],interfaces=interfaces,
+                                     censored=len(report.get('unconnected_items', []))>=499,
+                                     unconnected_items=report.get('unconnected_items', []),
                                      intended_references=intended_references,pair_endpoints=pair_endpoints)
                 result['original_human']=original
                 result['human_data']=data

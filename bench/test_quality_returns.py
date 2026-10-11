@@ -120,34 +120,59 @@ class ReturnTests(unittest.TestCase):
         r=quality.effective_paths(d,manifest,fills)['C1.1>U1.1']
         self.assertIsNone(r['return_lead_mm'])
         self.assertEqual(r['effective_mm'],10)
-    def test_lost_cap_ground_is_a_return_obligation_loss(self):
+
+    def return_loss_case(self, endpoint_x, *, censored=False, connected=False):
         human = dict(nets=['VCC', 'GND'], copper_layers=['F.Cu', 'B.Cu'], arcs=[], vias=[],
                      pads=[pad('C1', '1', 'VCC', 0, 2), pad('U1', '1', 'VCC', 10, 2),
                            pad('C1', '2', 'GND', 0), pad('U1', '2', 'GND', 10)],
                      tracks=[track('VCC', (0, 2), (10, 2)), track('GND', (0, 0), (10, 0))])
         router = copy.deepcopy(human)
-        router['tracks'] = [t for t in router['tracks'] if t['net'] != 'GND']
+        if not connected:
+            router['tracks'] = [t for t in router['tracks'] if t['net'] != 'GND']
         intent = {'connections': [{'from': 'C1.1', 'to': 'U1.1'}]}
+        # Report references deliberately differ from canonical human references.
+        unconnected = [dict(items=[dict(description='Pad 99 [GND] of ROUTER_RENAMED',
+                                       pos=dict(x=endpoint_x, y=0))])]
         with patch.object(si, 'all_fills', return_value={}), patch.object(si, 'fills', return_value=({}, set(), 'hash')):
             reference, _, _ = quality.measure(human, intent, pathlib.Path('unused'), {}, [])
-            routed, _, _ = quality.measure(router, intent, pathlib.Path('unused'), {}, ['GND'])
-            unknown, _, _ = quality.measure(router, intent, pathlib.Path('unused'), {}, [], censored=True)
-            unrepresented, _, _ = quality.measure(router, intent, pathlib.Path('unused'), {}, [])
+            routed, _, _ = quality.measure(router, intent, pathlib.Path('unused'), {}, ['GND'],
+                                          censored=censored, unconnected_items=unconnected)
         key = 'C1.1>U1.1'
         self.assertEqual(reference['decoupling'][key]['return_lead_mm'], 10)
         self.assertTrue(reference['decoupling'][key]['return_connected'])
         self.assertTrue(routed['decoupling'][key]['connected'])
-        self.assertFalse(routed['decoupling'][key]['return_connected'])
-        self.assertIsNone(unknown['decoupling'][key]['return_connected'])
-        self.assertTrue(unrepresented['decoupling'][key]['return_connected'])
         summary = quality_compare.summarize({'b': reference}, {'T': {'b': routed}})
-        returns_view = summary['decoupling']['return_lead_mm']['arms']['T']['all_obligations']
-        self.assertEqual((returns_view['missing'], returns_view['loss'], returns_view['not_assessable']), (1, 1, 0))
-        supply_view = summary['decoupling']['effective_mm']['arms']['T']['all_obligations']
-        self.assertEqual((supply_view['missing'], supply_view['tie']), (0, 1))
-        for categories in (unknown, unrepresented):
-            view = quality_compare.summarize({'b': reference}, {'T': {'b': categories}})['decoupling']['return_lead_mm']['arms']['T']['all_obligations']
-            self.assertEqual((view['missing'], view['not_assessable']), (0, 1))
+        supply = summary['decoupling']['effective_mm']['arms']['T']['all_obligations']
+        self.assertEqual((supply['missing'], supply['tie']), (0, 1))
+        return routed['decoupling'][key], summary['decoupling']['return_lead_mm']['arms']['T']['all_obligations']
+
+    def test_ground_incomplete_elsewhere_is_not_a_return_loss(self):
+        item, view = self.return_loss_case(50)
+        self.assertIsNone(item['return_connected'])
+        self.assertEqual(item['return_reason'], 'ground path not represented')
+        self.assertEqual((view['missing'], view['loss'], view['not_assessable']), (0, 0, 1))
+
+    def test_lost_cap_ground_is_a_return_obligation_loss(self):
+        # Hit inside the pad extent, not just its exact centre.
+        item, view = self.return_loss_case(.05)
+        self.assertFalse(item['return_connected'])
+        self.assertEqual((view['missing'], view['loss'], view['not_assessable']), (1, 1, 0))
+
+    def test_lost_ic_ground_is_a_return_obligation_loss(self):
+        item, view = self.return_loss_case(9.95)
+        self.assertFalse(item['return_connected'])
+        self.assertEqual((view['missing'], view['loss'], view['not_assessable']), (1, 1, 0))
+
+    def test_censored_ground_is_never_a_return_loss(self):
+        for connected in (False, True):
+            item, view = self.return_loss_case(0, censored=True, connected=connected)
+            self.assertIsNone(item['return_connected'])
+            self.assertEqual((view['missing'], view['loss'], view['not_assessable']), (0, 0, 1))
+
+    def test_ground_path_model_proof_is_not_overridden_by_other_net_breaks(self):
+        item, view = self.return_loss_case(50, connected=True)
+        self.assertTrue(item['return_connected'])
+        self.assertEqual((view['missing'], view['tie'], view['not_assessable']), (0, 1, 0))
 
 
     def test_single_manifest_lane_added_without_changing_legacy_fields(self):

@@ -675,10 +675,14 @@ Each frozen cap-to-supply-pin obligation also publishes `return_lead_mm` (lower 
 equivalence band). Select the capacitor's unique ground pad and the nearest IC ground pin to
 the obligated supply pin on their common, unambiguous ground net. The same track-or-free-plane-hop
 lower bound then measures the ground-side lead; free travel requires contacts reaching the
-**same grounded refilled island**. The separate `return_connected` state is qualified by the judged
-ground-net connectivity: known-incomplete ground is a missing return obligation/loss, censored ground
-is N/A, and a complete ground net with an unrepresented path is a coverage N/A. Missing/ambiguous
-ground-pad bindings remain N/A. Aggregation uses this state only for `return_lead_mm`; the old
+**same grounded refilled island**. A missing return obligation/loss requires both no represented
+ground path and a KiCad unconnected-item endpoint physically matching the cap ground pad or IC ground
+pin on that ground net. Matching uses report positions within the rotated pad extent plus the 1 µm
+identity tolerance, not reference names, because router fixtures may rename references.
+An incomplete ground net elsewhere does not prove this obligation lost: unrepresented paths remain
+N/A. A represented ground path retains its numeric lead despite unrelated breaks on the net.
+Censored judgments (499 or more unconnected items) and missing/ambiguous ground bindings are N/A.
+Aggregation uses the separate `return_connected` state only for `return_lead_mm`; the old
 `effective_mm` supply metric and its supply connectivity are unchanged. Neither side is a loop-inductance estimate.
 
 ### Guide spacing and bend screens (D-SC-SPACING)
