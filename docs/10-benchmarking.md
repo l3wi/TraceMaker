@@ -550,13 +550,30 @@ are recognized. Ancillary USB-PD/HDMI lines, NCSI, analogue ID/QD pairs, SPI SCL
 expansion names are not misclassified as the guide's data interfaces.
 
 Names produce **candidate** obligations. Only independent native connector/IC pad `pinfunction`
-evidence corroborating every lane/leg upgrades the interface to **confirmed**; a footprint outline,
-filename or capacitor alone cannot. Operating mode stays null unless explicitly reviewed. Intended
-reference and isolated-domain nets are not guessed. The draft preserves all pads on each signal net
-as integer-nm physical endpoints, with copper-layer sets and net spelling, independent of reference
-renaming. Recognizable two-pad passive bridges join consistently named lane halves (or an anonymous
-half); their physical endpoints are retained in `series` so measurement can exclude internal series
-pads. More than two possible outer terminals remains ambiguous, not a shortest-path guess.
+evidence corroborating every lane/leg upgrades a draft to **confirmed**; a footprint outline,
+filename or capacitor alone cannot. `--review` rechecks each obligation against physical input pad
+metadata, protocol-specific IC functions and standardized connector contacts. It writes
+`status: reviewed`, an evidence-bearing `review`, and `review_decision: confirmed` or
+`rejected_for_grading`; rejected candidates remain visible, never silently vanish. Generic FPGA
+SERDES, GPIO and FFC contacts cannot prove a protocol. A reviewed identity is not firmware or
+operating-speed certification. Unknown modes remain null; only explicit connector/device topology
+establishes the relevant slot/device-down mode.
+Missing native pin functions can be supplemented by narrow manufacturer pin tables for INA226
+DGS/MSOP-10 (TI SBOS547C), 24LC/AA/FC512 8-pin/DFN (Microchip DS21754M) and DP83848C LQFP-48
+(TI SNLS266E). Their exact pin/package matches and source URLs appear in the review, rather than
+promoting every pin on an I²C-capable chip. Unsupported packages and unverified pin maps stay candidate.
+
+Integer-nm endpoints retain net spelling and copper-layer sets, independent of reference renaming.
+Recognizable two-pad passive bridges join consistently named lane halves (or an anonymous half);
+their physical endpoints remain in `series`. The drafter removes internal series pads and selects
+exactly two outer component terminals per leg when the remaining pads are independently identified
+ESD/TVS, rail-shunt/pull-up, test-point or electrically equivalent duplicate connector contacts.
+Those branch contacts remain as optional `taps`, with an `endpoint_selection` explanation. Unknown
+parts, multidrop buses and multiple unequal destination contacts retain all possible terminals and
+remain ambiguous, not a farthest/shortest-path guess. A single explicit GND pour domain plus GND
+contacts on every selected terminal component can establish reference-domain intent, not a
+stackup certification. Integrated magnetics' internal cable-side nodes are not PCB nets and do not
+establish an on-board isolated domain; unsupported reference/isolation declarations remain empty.
 
 Add `--interfaces DIR --profile toradex-2015` to `bench/quality.py` to publish absolute guide-rule
 results alongside unchanged human-parity grades. Without `--profile` no rule/coverage section or new
@@ -582,6 +599,27 @@ explicitly opt-in context, not new hard gates or current interface-standard comp
 An active profile always publishes interface coverage, including `status: missing` when no manifest
 is supplied or a scheduled board's manifest is absent. Markdown also treats older arms without that
 coverage field as missing, rather than failing report generation.
+
+#### Reviewed-input smoke evidence (D-SC-TERM)
+
+The `sc/integrate` 1936fe0 path/return module registry was exercised against the 11 default non-slow
+`modern-planes` boards: `dp-modern-200M-T` versus `human-modern-planes`, `--profile toradex-2015
+--jobs 2`. Both runs had an empty benchmark error map. Draft inputs took 89.1 s; reviewed inputs
+took 89.7 s. Manifest hashes matched across both arms and the regenerated review files (22 bindings).
+
+| Arm | Draft pass / fail / N/A | Reviewed pass / fail / N/A | N/A fraction, draft → reviewed |
+|---|---:|---:|---:|
+| Human | 74 / 25 / 392 | 145 / 40 / 322 | 79.84% → 63.51% |
+| Router | 66 / 24 / 401 | 136 / 46 / 325 | 81.67% → 64.10% |
+
+Reviewed topology adds 16 slot length/RX-via obligations, so denominators are 491 and 507 rather
+than a silently narrowed cohort. Combined identity-related N/A falls from 440 to 90 and the
+two-endpoint reason from 132 to 118. Unknown-reference N/A rises from 171 to 300 as more confirmed
+paths become evaluable; no reference domain was invented to make these checks pass. Native
+MAX96724 CSI and SN65DSI84 DSI/LVDS pin evidence exposes human as well as router skew violations.
+All 57 prepared boards were reviewed: modern-planes 74 confirmed / 36 candidate interfaces,
+quick 2 / 2 and mid 6 / 11. Genuine multidrop/ambiguous paths and generic FPGA/FFC mappings remain
+N/A; the registered modules, not this drafter, determine which profile measures are implemented.
 
 ### Frozen endpoint and segment checks (D-SC-PATHS)
 

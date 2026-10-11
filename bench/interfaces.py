@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Draft, never approve, frozen interface obligations from prepared INPUT boards.
+"""Draft and conservatively review frozen interface obligations from INPUT boards.
 
 Names establish candidates, independent native pin functions establish corroboration.
 No operating mode, intended reference domain or external cable is guessed.
@@ -14,6 +14,7 @@ import quality_io as io
 import quality_identity as identity
 import plane_metrics as pm
 from prepare_inputs import set_boards
+import interface_evidence as terminal_evidence
 
 
 def tokens(name):
@@ -141,7 +142,7 @@ def native_pin_functions(board):
     return out
 
 
-def draft(d, board, pin_functions=None):
+def draft(d, board, pin_functions=None, pad_metadata=None):
     names = sorted(n for n in d['nets'] if n and not n.startswith('unconnected'))
     pins = pin_functions or {}
     pads = defaultdict(list)
@@ -236,8 +237,16 @@ def draft(d, board, pin_functions=None):
         iface = groups.setdefault((kind, group), dict(id=kind+':'+group, interface=kind, mode=None,
             confidence='candidate', lanes=[], series=[], reference_nets=[], isolated_nets=[]))
         nets = sorted(set(members[root(p)] + (members[root(n)] if n else [])))
-        ep = {endpoint_key(endpoint(q)): endpoint(q) for net in nets for q in pads[net]}
-        lane = dict(id=label, role=role, p=p, n=n, endpoints=[ep[k] for k in sorted(ep)])
+        endpoints, taps, selections = [], [], []
+        inner = {endpoint_key(e) for b in selected for e in b['endpoints']}
+        for leg in (p, n):
+            if not leg:
+                continue
+            ps = [q for net in members[root(leg)] for q in pads[net]]
+            chosen, branch, reason = terminal_evidence.choose(ps, pad_metadata, inner)
+            endpoints += chosen; taps += branch; selections.append(reason)
+        lane = dict(id=label, role=role, p=p, n=n, endpoints=sorted(endpoints, key=endpoint_key),
+                    taps=sorted(taps, key=endpoint_key), endpoint_selection='; '.join(selections))
         iface['lanes'].append(lane)
         for b in selected:
             if b['a'] in nets and b['b'] in nets and b not in iface['series']:
@@ -307,6 +316,7 @@ def main():
     ap.add_argument('--input', type=Path, help='explicit INPUT/human .kicad_pcb; requires --board')
     ap.add_argument('--fixtures', type=Path, help='prepared input root override')
     ap.add_argument('--out', required=True, type=Path)
+    ap.add_argument('--review', action='store_true', help='review protocol identity against input pin/part evidence; never guess missing modes')
     args = ap.parse_args()
     if not args.set and not args.board:
         ap.error('supply --set or --board')
@@ -322,7 +332,14 @@ def main():
         if source is None:
             raise FileNotFoundError('prepared INPUT missing: '+name)
         d = io.inspect(source, args.out, name)
-        manifest = draft(d, name, native_pin_functions(source))
+        physical, _, native_root = terminal_evidence.native(source, d)
+        parts_pads = defaultdict(list)
+        for p in d['pads']:
+            parts_pads[p['ref']].append(p)
+        metadata = dict(pads=physical, parts_pads=parts_pads)
+        manifest = draft(d, name, native_pin_functions(source), metadata)
+        if args.review:
+            terminal_evidence.review(manifest, d, metadata, native_root)
         manifest['source'] = dict(path=str(source.resolve()), sha256=io.digest(source))
         (args.out/(name+'.interfaces.json')).write_text(json.dumps(manifest, indent=2)+'\n')
         print(name, len(manifest['interfaces']), sum(len(i['lanes']) for i in manifest['interfaces']))

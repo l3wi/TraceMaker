@@ -13,6 +13,7 @@ from unittest.mock import patch
 import interfaces as iface
 import quality
 import quality_rules as qr
+import interface_evidence as evidence
 
 
 def board(names):
@@ -22,6 +23,18 @@ def board(names):
             pads.append(dict(ref='U'+str(end+1),num=str(index+1),net=name,x=end*10000000,
                              y=index*1000000,w=200000,h=200000,angle=0,layers=['F.Cu']))
     return dict(nets=list(names),pads=pads,tracks=[],arcs=[],vias=[],copper_layers=['F.Cu','B.Cu'])
+
+
+def metadata(d, parts):
+    pads = {}
+    parts_pads = {}
+    for p in d['pads']:
+        value, footprint = parts.get(p['ref'], ('unknown', 'unknown'))
+        pads[iface.endpoint_key(iface.endpoint(p))] = dict(
+            ref=p['ref'], pin=p['num'], value=value, footprint=footprint,
+            description='', function=p.get('function', ''))
+        parts_pads.setdefault(p['ref'], []).append(p)
+    return dict(pads=pads, parts_pads=parts_pads)
 
 
 class InterfaceTests(unittest.TestCase):
@@ -134,6 +147,152 @@ class InterfaceTests(unittest.TestCase):
             path=Path(directory)/'usb.kicad_pcb'
             path.write_text('(kicad_pcb (footprint "USB" (pad "1" smd rect (net 1 "USB_DP") (pinfunction "USB_DP"))))')
             self.assertEqual(dict(iface.native_pin_functions(path)),{'USB_DP':{'USB_DP'}})
+
+    def test_usb_esd_testpoint_and_duplicate_connector_contacts_are_taps(self):
+        d = board(['USB_DP', 'USB_DM'])
+        for p in d['pads']:
+            p['ref'] = 'J1' if p['ref'] == 'U2' else 'U1'
+            p['function'] = 'DP' if p['net'].endswith('DP') else 'DM'
+        for index, net in enumerate(d['nets']):
+            for ref, x in [('U5', 4000000), ('TP1', 6000000)]:
+                d['pads'].append(dict(d['pads'][0], ref=ref, net=net, num=str(index+1),
+                                      x=x, y=index*1000000))
+            # Two equivalent Type-C contacts, not two separate destinations.
+            d['pads'].append(dict(d['pads'][2*index+1], num='B'+str(index+6), x=10020000))
+        parts = {'U1':('USB3300', 'QFN32'), 'J1':('USB_C', 'USB_C_Receptacle'),
+                 'U5':('TPD4E001', 'SOT23'), 'TP1':('TestPoint', 'TestPoint')}
+        md = metadata(d, parts)
+        manifest = iface.draft(d, 'usb-taps', pad_metadata=md)
+        lane = manifest['interfaces'][0]['lanes'][0]
+        self.assertEqual(len(lane['endpoints']), 4)
+        self.assertEqual(len(lane['taps']), 6)
+        self.assertEqual({e['x_nm'] for e in lane['endpoints']}, {0, 10000000})
+        reversed_d = copy.deepcopy(d)
+        for values in reversed_d.values():
+            values.reverse()
+        self.assertEqual(iface.draft(reversed_d, 'usb-taps', pad_metadata=metadata(reversed_d, parts)), manifest)
+        reviewed = evidence.review(manifest, d, md, ['kicad_pcb'])
+        self.assertEqual(reviewed['interfaces'][0]['confidence'], 'confirmed')
+        self.assertEqual(reviewed['status'], 'reviewed')
+
+    def test_i2c_pullups_excluded_but_unknown_shunts_not_discarded(self):
+        d = board(['I2C_SCL', 'I2C_SDA'])
+        for p in d['pads']:
+            p['ref'] = 'J1' if p['ref'] == 'U2' else 'U1'
+            p['function'] = 'SCL' if p['net'].endswith('SCL') else 'SDA'
+        parts = {'U1':('EEPROM', 'SOIC8'), 'J1':('Header', 'PinHeader')}
+        for index, net in enumerate(d['nets']):
+            ref = 'R'+str(index+1)
+            parts[ref] = ('4k7', 'R0402')
+            d['pads'] += [dict(d['pads'][0],ref=ref,num=str(j+1),net=n,x=4000000+j*1000000,y=index*1000000)
+                          for j,n in enumerate((net, '+3V3'))]
+        manifest = iface.draft(d, 'i2c', pad_metadata=metadata(d, parts))
+        self.assertTrue(all(len(l['endpoints']) == 2 and len(l['taps']) == 1
+                            for l in manifest['interfaces'][0]['lanes']))
+        d['pads'][-1]['net'] = 'unknown_analogue'
+        manifest = iface.draft(d, 'i2c', pad_metadata=metadata(d, parts))
+        self.assertTrue(any(len(l['endpoints']) > 2 for l in manifest['interfaces'][0]['lanes']))
+
+    def test_ethernet_series_caps_select_two_outer_terminals_per_leg(self):
+        d = board(['ETH0_PAIR_A_P', 'ETH0_PAIR_A_N', 'Net-(C1-Pad2)', 'Net-(C2-Pad2)'])
+        d['pads'] = [dict(d['pads'][0], ref='U1'), dict(d['pads'][2], ref='U1'),
+                     dict(d['pads'][5], ref='J1'), dict(d['pads'][7], ref='J1')]
+        parts = {'U1':('KSZ9031', 'QFN48'), 'J1':('RJ45', 'RJ45')}
+        for index, (a,b) in enumerate(zip(d['nets'][:2], d['nets'][2:])):
+            ref = 'C'+str(index+1)
+            parts[ref] = ('100n', 'C0402')
+            d['pads'] += [dict(d['pads'][0],ref=ref,num=str(j+1),net=n,x=4000000+j*1000000,y=index*1000000)
+                          for j,n in enumerate((a,b))]
+        manifest = iface.draft(d, 'ethernet', pad_metadata=metadata(d, parts))
+        interface = manifest['interfaces'][0]
+        self.assertEqual(len(interface['series']), 2)
+        self.assertEqual(len(interface['lanes'][0]['endpoints']), 4)
+        self.assertEqual({e['x_nm'] for e in interface['lanes'][0]['endpoints']}, {0, 10000000})
+        renamed = copy.deepcopy(d)
+        for p in renamed['pads']:
+            p['ref'] = 'changed_'+p['ref']
+        self.assertEqual(iface.coverage(manifest, renamed)['lanes_not_bound'], [])
+
+    def test_review_requires_protocol_evidence_and_has_stable_ground_intent(self):
+        d = board(['CSI_D0_P', 'CSI_D0_N'])
+        for p in d['pads']:
+            p['ref'] = 'J1' if p['ref'] == 'U2' else 'U1'
+            if p['ref'] == 'U1':
+                p['function'] = 'DA0_'+('P' if p['net'].endswith('_P') else 'N')
+        for ref in ('J1', 'U1'):
+            d['pads'].append(dict(d['pads'][0], ref=ref, num='99', net='GND', x=20000000))
+        parts = {'U1':('MAX96724GTN', 'QFN56'), 'J1':('FFC', 'Conn_FFC')}
+        root = ['kicad_pcb', ['net', 1, 'GND'], ['zone', ['net', 1]]]
+        md = metadata(d, parts)
+        manifest = evidence.review(iface.draft(d, 'camera', pad_metadata=md), d, md, root)
+        self.assertEqual(manifest['interfaces'][0]['confidence'], 'confirmed')
+        self.assertEqual(manifest['interfaces'][0]['reference_nets'], ['GND'])
+        self.assertIsNone(manifest['interfaces'][0]['mode'])
+        reversed_d = copy.deepcopy(d)
+        for values in reversed_d.values():
+            values.reverse()
+        reversed_md = metadata(reversed_d, parts)
+        self.assertEqual(evidence.review(iface.draft(reversed_d, 'camera', pad_metadata=reversed_md),
+                                        reversed_d, reversed_md, root), manifest)
+        parts['U1'] = ('ECP5', 'BGA')
+        rejected_md = metadata(d, parts)
+        rejected = evidence.review(iface.draft(d, 'camera', pad_metadata=rejected_md), d, rejected_md, root)
+        self.assertEqual(rejected['interfaces'][0]['review_decision'], 'rejected_for_grading')
+        self.assertEqual(rejected['interfaces'][0]['confidence'], 'candidate')
+
+    def test_review_pin_contracts_and_token_controls(self):
+        meta = dict(ref='J1', value='xcore', footprint='xcore:xcore', function='I2C1.SDA', pin='92')
+        lane = dict(id='SDA', role='single')
+        self.assertIsNotNone(evidence.supports('i2c', lane, 'p', meta))
+        meta['function'] = 'SPI_SCLK'
+        self.assertIsNone(evidence.supports('i2c', dict(id='SCL',role='clock'), 'p', meta))
+        meta['function'] = 'USB0_D+'
+        self.assertIsNotNone(evidence.supports('usb2', dict(id='D',role='data'), 'p', meta))
+        self.assertIsNone(evidence.supports('usb2', dict(id='D',role='data'), 'n', meta))
+        meta.update(function='D+', value='ADC', footprint='QFN')
+        self.assertIsNone(evidence.supports('usb2', dict(id='D',role='data'), 'p', meta))
+        meta.update(function='', value='NGFF-KEY-E', footprint='TE-2199230-4', pin='35')
+        self.assertIsNotNone(evidence.supports('pcie', dict(id='TX0',role='tx'), 'p', meta))
+        self.assertIsNone(evidence.supports('pcie', dict(id='TX0',role='tx'), 'n', meta))
+        meta.update(value='ECP5', footprint='BGA')
+        self.assertIsNone(evidence.supports('pcie', dict(id='TX0',role='tx'), 'p', meta))
+        meta.update(function='SDIO_DATA0', value='Bus_M.2', footprint='M.2', pin='13')
+        self.assertIsNotNone(evidence.supports('sdio', dict(id='D0',role='single'), 'p', meta))
+
+    def test_manufacturer_pin_tables_are_package_and_pin_specific(self):
+        lane = dict(id='SDA', role='single')
+        meta = dict(ref='U1', value='INA226', footprint='MSOP-10', pin='4', function='')
+        self.assertIn('SBOS547C', evidence.supports('i2c', lane, 'p', meta))
+        meta['pin'] = '5'
+        self.assertIsNone(evidence.supports('i2c', lane, 'p', meta))
+        meta.update(value='24LC512', footprint='DFN500X600X95-9N', pin='5')
+        self.assertIn('DS21754M', evidence.supports('i2c', lane, 'p', meta))
+        meta.update(footprint='TSSOP-14', pin='8')
+        self.assertIsNone(evidence.supports('i2c', lane, 'p', meta))
+        meta.update(value='DP83848CVV_NOPB', footprint='PT48', pin='14')
+        self.assertIn('SNLS266E', evidence.supports('ethernet_mdi',dict(id='RX',role='data'),'p',meta))
+        self.assertIsNone(evidence.supports('ethernet_mdi',dict(id='RX',role='data'),'n',meta))
+        meta.update(value='DP83848K', footprint='VQFN40')
+        self.assertIsNone(evidence.supports('ethernet_mdi',dict(id='RX',role='data'),'p',meta))
+
+    def test_overlapping_native_owners_are_unknown_and_order_independent(self):
+        d = board(['USB_DP', 'USB_DM'])
+        d['pads'][1]['x'] = d['pads'][0]['x']
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'overlap.kicad_pcb'
+            fps = []
+            for ref in ('U1', 'U2'):
+                fps.append('(footprint "QFN32" (property "Reference" "'+ref+'") '
+                           '(property "Value" "USB3300") '
+                           '(pad "1" smd rect (pinfunction "DP")) '
+                           '(pad "2" smd rect (pinfunction "DM")))')
+            path.write_text('(kicad_pcb '+''.join(fps)+')')
+            physical, _, _ = evidence.native(path, d)
+            self.assertNotIn(iface.endpoint_key(iface.endpoint(d['pads'][0])), physical)
+            self.assertEqual(len(physical), 2)
+            reversed_d = copy.deepcopy(d)
+            reversed_d['pads'].reverse()
+            self.assertEqual(evidence.native(path, reversed_d)[0], physical)
 
     def test_profile_limits_and_band_edges(self):
         profile=qr.load_profile('toradex-2015')
