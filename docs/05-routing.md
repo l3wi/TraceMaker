@@ -1327,6 +1327,41 @@ all other connections, so that ground would take no channels from signals: `plan
 cannot make; left to the end they find their channels taken. Plane drops already go early without it (a pad
 inside a fill gets a connection of length 0, and connections are routed shortest first).
 
+**Revision (2026-10-11, D102).** Why tree routing lost connections, found by instrumenting LimeSDR on `gndplane` (3 M,
+`--soft-zones`: plain 746, tree 598 of 814). Five failed searches spent 3.1 M of the 3 M budget (about 620 k
+expansions each; the 602 successes cost 0.17 M in total), so 150 connections were never attempted. The failed
+searches had no tree cells: they were ordinary pad-to-pad searches into a pin (U13.3, U17.3) that an earlier GND
+connection had sealed. With tree cells the GND connection U13.19 → U13.4 started on neighbouring GND pin 2 instead
+of the exposed pad and wrapped outside pin 3. The forward search then flooded its window; a reverse search from
+the sealed pin ends after about 4.7 k expansions. Three changes, all under `--tree-attach`:
+
+- **Target-side reachability proof.** The exact cost-free flood fill of §13 also runs for tree, soft and zone
+  searches, and floods from the target cells toward the source, where a sealed pin is a small pocket: first
+  searches get a 1,024-visit probe, retries the full check. It admits every path the A* could find (soft-passable
+  copper passable, via landings optimistic); `--reach-verify` found 0 mismatches over 179 unreachable verdicts on
+  the four tiers.
+- **Distance bound to tree goals.** The obstacle-free octile distance to the nearest goal cell is always computed;
+  the heuristic is the larger of it (plus one via where every goal needs a layer change) and the cost-to-go field,
+  and it replaces the 0 used on field misses. Both are admissible, so A* stays optimal.
+- **No tree cells among the pins of one package for a connection inside it.** When both planned pads are on one
+  footprint, no other copper inside that footprint's pad box (grown by clearance and half a track) is offered.
+  Connections between packages still branch freely (excluding the box for every connection lost logicbone 46).
+
+Results (single variant, KiCad-judged; `gnd`/`planes` with `--soft-zones` and refill):
+
+| Set | Plain | Tree before | Tree now | Boards worse than plain |
+|---|---|---|---|---|
+| `quick`, 1 M | 89.2 %, 1,720 routed, 205 vias | 89.3 %, 1,726, 182 | 90.6 %, 1,757, 196 | atmel_programmer −1, scimpy −1 |
+| `mid`, 20 M | 53.3 %, 7,554, 1,580 | 55.6 %, 7,665, 1,219 | 59.5 %, 7,898, 1,428 | none |
+| `gndplane`, 3 M | 77.0 %, 2,869, 759 | 75.0 %, 2,715, 565 | 81.3 %, 3,043, 685 | rxadc −4 |
+| `planes`, 3 M | 84.3 %, 764, 176 | 83.6 %, 755, 176 | 83.7 %, 757, 176 | pic_programmer −5, interf_u −2 |
+
+Rejected in the same round: capping tree searches and retrying plain (10 k / 60 k caps, or every search after the
+first failure: 8-11 `quick` boards worse); a bounded reverse probe before every strict search (helps `planes` even
+without tree routing but costs 10+ `quick` boards); restricting tree cells to the planned pads' box + 2 mm, to
+routes without dependents, to tracks and vias only, or to nets without plane connections (none recovered
+LimeSDR). Still opt-in: four boards lose connections against plain routing.
+
 ## 41. Automatic inner-plane protection (2026-10-10, D96)
 
 `--protect-planes` is opt-in and uses the shared route-job parser: CLI, Python `args`, and the plugin's

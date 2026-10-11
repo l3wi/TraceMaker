@@ -190,8 +190,9 @@ down beside the board and reported.
   clipped to the board outline, cover at least 60% of the board. Unions with `--no-tracks-on`; outer layers
   remain routable. Vias still reach the planes. Detected layer/net/coverage appear in the log and route JSON.
 - `--tree-attach`: a connection may branch off any copper already joined to its pads (a trunk, a via, another pad of
-  the cluster) instead of running back to the planned pad. Less copper and fewer vias; on large boards it also
-  routes more (doc 05 §40). Off by default: a few small boards lose a connection at small budgets.
+  the cluster) instead of running back to the planned pad. Fewer vias and more connections routed: `mid` 53.3 →
+  59.5 %, ground-plane boards 77.0 → 81.3 % (doc 05 §40). Off by default: four benchmark boards still lose 1-5
+  connections against plain routing.
 - `--plane-tie`: a pad's plane connection may end on nearby copper of its net that already reaches the plane (a
   neighbour's via, a through-hole pad in the plane) instead of its own via, so boxed-in ground pins of ball arrays
   and fine-pitch packages still connect (doc 05 §43). Opt-in; use with `--soft-zones` on plane boards.

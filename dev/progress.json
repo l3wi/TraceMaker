@@ -800,8 +800,8 @@
      "done": false
     },
     {
-     "text": "Tree-attach failed searches flood the window (no distance bound to tree goals): LimeSDR on gndplane 746 -> 598 at 3 M",
-     "done": false
+     "text": "Tree-attach losses: target-side reachability proof, distance bound to tree goals, no tree cells among one package's pins (D102): quick 90.6 %, mid 59.5 %, gndplane 81.3 % vs plain 89.2/53.3/77.0 %; LimeSDR 598 -> 753",
+     "done": true
     }
    ]
   }
