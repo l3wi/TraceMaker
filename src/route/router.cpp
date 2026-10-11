@@ -1257,12 +1257,16 @@ struct Router::Impl {
       if (opt.work_budget == 0 && el > 10.0 && field_seconds > 0.3 * el) fields_off = true;
     }
     const bool have_field = use_field && field_ok;
-    // With tree goals spread over the window and no field, the octile bound to the planned pad is no lower bound
-    // and one to the goals' bounding box is too weak to steer: take the exact octile distance to the nearest goal
-    // cell (any layer, obstacles ignored), by the two-pass chamfer transform, which is exact for 8-connected steps
-    // of cost step/diag.
+    // Tree goals invalidate the bound to the planned pad. Always build the exact obstacle-free octile
+    // distance to their cells, including when a field exists: a field miss still needs a useful lower bound.
+    // The two-pass chamfer transform is exact for 8-connected steps of cost step/diag.
     goal_dist.clear();
-    if (!tree_end.empty() && !have_field && !zone_target) {  // a plane target has no useful bound (below)
+    model::LayerMask goal_layers = 0;
+    if (!tree_end.empty()) {
+      for (const auto& [l, ci] : dst.cells) goal_layers |= model::layer_bit(l);
+      if (zone_target) goal_layers |= model::layer_bit(zone_layer);
+    }
+    if (!tree_end.empty() && !zone_target) {
       constexpr std::int64_t kFar = std::int64_t{1} << 50;
       goal_dist.assign(cells, kFar);
       for (const auto& [l, ci] : dst.cells) goal_dist[static_cast<std::size_t>(ci)] = 0;
@@ -1287,20 +1291,20 @@ struct Router::Impl {
         }
     }
     auto h = [&](int fl, int gx, int gy) -> std::int64_t {
+      // No goal on this layer means every path pays at least one via, independently of its XY distance.
+      const std::int64_t mandatory_via = goal_layers && !(goal_layers & model::layer_bit(fl)) ? via_cost : 0;
+      if (zone_target) return !goal_layers ? (fl != zone_layer ? via_cost : std::int64_t{0}) : mandatory_via;
+      std::int64_t bound = 0;
+      if (!goal_dist.empty())
+        bound = goal_dist[static_cast<std::size_t>(gy - w.y0) * static_cast<std::size_t>(w.w) + static_cast<std::size_t>(gx - w.x0)] + mandatory_via;
       if (have_field) {
         const std::int32_t v = field[static_cast<std::size_t>(fl) * cells + static_cast<std::size_t>(gy - w.y0) * static_cast<std::size_t>(w.w) +
                                      static_cast<std::size_t>(gx - w.x0)];
-        // Never prune on the field: where it claims "unreachable" fall back to the octile bound, so the search
-        // stays complete even if the field's view of blocked cells is stale or wrong.
-        if (v < gpu::kFieldInf) return static_cast<std::int64_t>(static_cast<double>(v) * opt.heuristic_weight);
+        // Never prune on the field: its "unreachable" cells use the obstacle-free bound. The maximum
+        // of two admissible bounds is admissible, including when the field caps its via cost.
+        if (v < gpu::kFieldInf) return static_cast<std::int64_t>(static_cast<double>(std::max(bound, static_cast<std::int64_t>(v))) * opt.heuristic_weight);
       }
-      // A fill can be anywhere nearby, but changing to its layer costs at least one via.
-      // Tree goals may already reach the plane on this layer; then no via cost is mandatory.
-      if (zone_target) return tree_end.empty() && fl != zone_layer ? via_cost : std::int64_t{0};
-      if (!goal_dist.empty())
-        return static_cast<std::int64_t>(static_cast<double>(goal_dist[static_cast<std::size_t>(gy - w.y0) * static_cast<std::size_t>(w.w) + static_cast<std::size_t>(gx - w.x0)]) *
-                                         opt.heuristic_weight);
-      if (!tree_end.empty()) return std::int64_t{0};  // field miss with tree goals: no cheap admissible bound
+      if (!goal_dist.empty()) return static_cast<std::int64_t>(static_cast<double>(bound) * opt.heuristic_weight);
       const Point p = at(gx, gy);
       const std::int64_t dx = std::llabs(p.x - tp.x), dy = std::llabs(p.y - tp.y);
       const std::int64_t mn = std::min(dx, dy), mx = std::max(dx, dy);
