@@ -91,6 +91,13 @@ struct RouterOptions {
   // Plane ties (doc 05 §43): a connection into a plane may instead end on copper of its net that already reaches
   // the plane (a through pad or via in it, a neighbour's routed via), whichever the search finds cheaper.
   bool plane_tie = false;
+  // Routing intent (doc 05 §44, D103), resolved from a reviewed manifest (crules/intent.hpp). Pad pairs routed as
+  // their own pad-to-pad connections; pads that get their own connection into a plane fill of their net; nets that
+  // never branch. Their connections are `exact`: they start and end only on their own pads or plane, never on other
+  // copper of the net, whatever tree_attach and plane_tie say. Empty = no intent (routing unchanged).
+  std::vector<std::pair<int, int>> intent_pairs;
+  std::vector<int> intent_plane_pads;
+  std::vector<model::NetId> no_branch_nets;
   bool optimize = true;         // post-routing clean-up: re-route connections to save vias and length
   bool escape_plan = false;     // reserve escape corridors for the pins of dense packages (route/escape.hpp, M9)
   bool escape_second_ring = false;  // second-ring balls escape between two outer balls instead of by dog-bone
@@ -128,6 +135,8 @@ struct Connection {
   int pad_a = -1, pad_b = -1;   // board pad indices (pad_b = -1 when the target is a zone fill)
   int zone_b = -1;              // copper item index of a zone fill (plane) to connect into, or -1
   Coord length = 0;             // straight-line distance
+  bool exact = false;           // routing intent: ends on its own pads/plane only (no tree attach, no plane tie)
+  bool must_route = false;      // routing intent pair or plane pad: routed with its own copper even when other routes join its ends
 };
 
 struct RouteResult {
@@ -160,6 +169,9 @@ struct RouteResult {
   std::string stop;
   Coord pitch = 0;
   std::vector<std::string> failures;  // one line per unrouted connection
+  // Routing intent connections that failed a pass and were relaxed to ordinary connections ("net: REF.NUM -> REF.NUM"
+  // or "-> plane"), in the order they were relaxed (doc 05 §44).
+  std::vector<std::string> intent_relaxed;
   struct Unrouted {
     std::string net, a, b;  // "REF.NUM" (b = "zone" for plane connections)
     std::string reason, detail;

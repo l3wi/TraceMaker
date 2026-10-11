@@ -19,6 +19,7 @@
 #include <set>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "core/rng.hpp"
 #include "drc/connectivity.hpp"
@@ -97,6 +98,10 @@ struct Router::Impl {
   };
   std::vector<ConnState> cs;
   std::set<NetId> first_net_ids;  // --first-nets
+  // Routing intent (doc 05 §44), by net: pad pairs and plane pads (in manifest order), and no-branch nets.
+  std::map<NetId, std::vector<std::pair<int, int>>> intent_pairs;
+  std::map<NetId, std::vector<int>> intent_plane;
+  std::set<NetId> no_branch_ids;
   std::vector<geom::Box> tree_pad_boxes;  // fixed footprint pad extents, cached only for tree endpoints
   std::unordered_map<std::int64_t, std::uint16_t> history;  // contested lattice cells (PathFinder history cost)
   std::vector<int> init_root;        // copper item -> initial cluster root (fixed copper)
@@ -240,6 +245,9 @@ struct Router::Impl {
     if (opt.soft_zones) soft_fills = std::make_unique<drc::ZoneFills>(obs->copper());
     for (std::size_t n = 0; n < b.nets.size(); ++n)
       if (std::find(opt.first_nets.begin(), opt.first_nets.end(), b.nets[n].name) != opt.first_nets.end()) first_net_ids.insert(static_cast<NetId>(n));
+    for (const auto& [pa, pb] : opt.intent_pairs) intent_pairs[b.pads[static_cast<std::size_t>(pa)].net].emplace_back(pa, pb);
+    for (const int p : opt.intent_plane_pads) intent_plane[b.pads[static_cast<std::size_t>(p)].net].push_back(p);
+    no_branch_ids.insert(opt.no_branch_nets.begin(), opt.no_branch_nets.end());
     obs->set_vias_off_pads(opt.vias_off_pads, static_cast<Coord>(opt.vias_off_pads_below_mm * 1e6));
     if (opt.via_in_pad) find_inner_balls();
     use_cache = !obs->needs_exact_routing();
@@ -420,6 +428,7 @@ struct Router::Impl {
         if (!c.pads.empty() || plane) groups.push_back(c);
       }
       if (groups.size() < 2) continue;
+      apply_intent(net, groups, out);
       // Prim over clusters; a pad may connect to another cluster's pad or into its zone fill (plane).
       const std::size_t k = groups.size();
       std::vector<std::uint8_t> in(k, 0);
@@ -483,9 +492,86 @@ struct Router::Impl {
     } else {
       std::stable_sort(out.begin(), out.end(), [](const Connection& a, const Connection& c) { return a.length < c.length; });
     }
+    // Routing intent: every connection of a no-branch net ends on its own pads or plane only.
+    for (auto& c : out)
+      if (no_branch_ids.count(c.net)) c.exact = true;
     if (!first_net_ids.empty())
       std::stable_partition(out.begin(), out.end(), [&](const Connection& c) { return first_net_ids.count(c.net) > 0; });
     return out;
+  }
+
+  // Routing intent (doc 05 §44) for one net, before its spanning tree. Decided on the clusters of fixed copper: each
+  // intent pad pair in different clusters becomes a pad-to-pad connection, and each plane pad whose cluster has no
+  // plane fill a connection into the nearest plane fill it can reach (ties: lower copper item). Both are exact and
+  // must_route (they are obligations, not links: a pad pair joined through the plane still gets its track). The
+  // clusters they join are then merged, in first-appearance order, so the spanning tree adds no second link.
+  template <class Cluster>
+  void apply_intent(NetId net, std::vector<Cluster>& groups, std::vector<Connection>& out) const {
+    const auto ip = intent_pairs.find(net);
+    const auto pp = intent_plane.find(net);
+    if (ip == intent_pairs.end() && pp == intent_plane.end()) return;
+    auto group_of = [&](int pad) {
+      for (std::size_t g = 0; g < groups.size(); ++g)
+        if (std::find(groups[g].pads.begin(), groups[g].pads.end(), pad) != groups[g].pads.end()) return static_cast<int>(g);
+      return -1;
+    };
+    std::vector<int> up(groups.size());
+    for (std::size_t g = 0; g < up.size(); ++g) up[g] = static_cast<int>(g);
+    auto find = [&](int g) {
+      while (up[static_cast<std::size_t>(g)] != g) g = up[static_cast<std::size_t>(g)] = up[static_cast<std::size_t>(up[static_cast<std::size_t>(g)])];
+      return g;
+    };
+    auto unite = [&](int a, int c) {
+      a = find(a), c = find(c);
+      if (a != c) up[static_cast<std::size_t>(std::max(a, c))] = std::min(a, c);
+    };
+    auto obligation = [&](Connection c) {
+      c.exact = c.must_route = true;
+      out.push_back(c);
+    };
+    auto is_plane = [&](int z) { return zone_fill_area(obs->copper(), std::vector<int>{z}) >= kPlaneTargetArea; };
+    if (ip != intent_pairs.end())
+      for (const auto& [pa, pb] : ip->second) {
+        const int ga = group_of(pa), gb = group_of(pb);
+        if (ga < 0 || gb < 0 || ga == gb) continue;  // net not routed, or fixed copper already joins them
+        const Point A = b.pads[static_cast<std::size_t>(pa)].pos, B = b.pads[static_cast<std::size_t>(pb)].pos;
+        obligation(Connection{net, pa, pb, -1, static_cast<Coord>(std::hypot(static_cast<double>(A.x - B.x), static_cast<double>(A.y - B.y)))});
+        unite(ga, gb);
+      }
+    if (pp != intent_plane.end())
+      for (const int p : pp->second) {
+        const int gp = group_of(p);
+        if (gp < 0) continue;
+        const auto& own = groups[static_cast<std::size_t>(gp)].zones;
+        if (std::any_of(own.begin(), own.end(), is_plane)) continue;  // fixed copper already joins it to a plane
+        const Point P = b.pads[static_cast<std::size_t>(p)].pos;
+        int best_g = -1, best_z = -1;
+        double best_d = 0;
+        for (std::size_t g = 0; g < groups.size(); ++g) {
+          if (static_cast<int>(g) == gp) continue;
+          for (const int z : groups[g].zones) {
+            if (!is_plane(z) || !reaches(p, z)) continue;
+            const double d = zone_dist(P, z);
+            if (best_z < 0 || d < best_d || (d == best_d && z < best_z)) best_g = static_cast<int>(g), best_z = z, best_d = d;
+          }
+        }
+        if (best_z < 0) continue;  // no plane of the net this pad can reach: the spanning tree decides
+        obligation(Connection{net, p, -1, best_z, static_cast<Coord>(best_d)});
+        unite(gp, best_g);
+      }
+    std::vector<Cluster> merged;
+    std::vector<int> slot(groups.size(), -1);
+    for (std::size_t g = 0; g < groups.size(); ++g) {
+      const int r = find(static_cast<int>(g));
+      if (slot[static_cast<std::size_t>(r)] < 0) {
+        slot[static_cast<std::size_t>(r)] = static_cast<int>(merged.size());
+        merged.emplace_back();
+      }
+      auto& m = merged[static_cast<std::size_t>(slot[static_cast<std::size_t>(r)])];
+      m.pads.insert(m.pads.end(), groups[g].pads.begin(), groups[g].pads.end());
+      m.zones.insert(m.zones.end(), groups[g].zones.begin(), groups[g].zones.end());
+    }
+    groups = std::move(merged);
   }
 
   // ---------------------------------------------------------------------------------------------------
@@ -672,6 +758,7 @@ struct Router::Impl {
           std::max(std::abs(tx - cong_end[0]), std::abs(ty - cong_end[1])) > 1 && std::max(std::abs(tx - cong_end[2]), std::abs(ty - cong_end[3])) > 1)
         hc += (global.util[ti] - opt.global_congestion_from) * cong_pen;
     }
+    if (!sibling.empty() && sibling.count(cell_key(layer, gx, gy))) hc += sibling_pen;
     if (st == 1) return static_cast<std::int64_t>(opt.soft_cost_mm * 1e6) + hc * 4;
     if (st == 3) return 3 * pitch + hc;
     return hc;
@@ -885,8 +972,13 @@ struct Router::Impl {
     }
     return u;
   }
-  // Coupled pairs keep their own geometry rules: they neither branch nor get branched from.
-  bool tree_ok() const { return current < 0 || pair_partner.empty() || pair_partner[static_cast<std::size_t>(current)] < 0; }
+  // Coupled pairs keep their own geometry rules: they neither branch nor get branched from. Intent connections
+  // (doc 05 §44) end on their own pads or plane only.
+  bool tree_ok() const {
+    if (current < 0) return true;
+    if (cs[static_cast<std::size_t>(current)].c.exact) return false;
+    return pair_partner.empty() || pair_partner[static_cast<std::size_t>(current)] < 0;
+  }
   // Does another routed connection start or end on this connection's copper?
   bool anchored(int ci) const {
     for (const auto& o : cs)
@@ -1816,6 +1908,39 @@ struct Router::Impl {
   // Pad-to-tree routing: start and goal cells on tree copper of the last search -> connectivity node of the copper.
   std::unordered_map<std::int64_t, int> tree_start, tree_end;
   std::vector<std::int64_t> goal_dist;  // per window cell: octile distance to the nearest goal (tree searches only)
+  // Routing intent (doc 05 §44): lattice cells where a track of the current connection of a no-branch net would
+  // touch track or via copper of its net other than its own (fixed copper, other connections' routes). Entering one
+  // costs sibling_pen per step, so the net's routes meet at pads instead of sharing copper and splitting off it (a
+  // branch). A cost, not a block: a pad reachable only along such copper still gets routed.
+  std::unordered_set<std::int64_t> sibling;
+  Coord sibling_pen = 0;
+  std::map<NetId, std::vector<int>> no_branch_fixed;  // fixed track, arc and via items of each no-branch net
+  void add_sibling_cells(const drc::CopperItem& it, Coord hw) {
+    const int x0 = std::max(0, to_ix(it.box.x0 - hw) - 1), x1 = std::min(nx - 1, to_ix(it.box.x1 + hw) + 1);
+    const int y0 = std::max(0, to_iy(it.box.y0 - hw) - 1), y1 = std::min(ny - 1, to_iy(it.box.y1 + hw) + 1);
+    for (int gy = y0; gy <= y1; ++gy)
+      for (int gx = x0; gx <= x1; ++gx) {
+        const geom::Shape pt = geom::Shape::point(at(gx, gy), hw);
+        if (!std::any_of(it.shapes.begin(), it.shapes.end(), [&](const geom::Shape& s) { return geom::closer_than(pt, s, 1); })) continue;
+        for (int l = 0; l < nl; ++l)
+          if (it.layers & model::layer_bit(l)) sibling.insert(cell_key(l, gx, gy));
+      }
+  }
+  void collect_siblings(const Connection& c) {
+    sibling.clear();
+    if (!c.exact || !no_branch_ids.count(c.net)) return;
+    const Coord hw = track_width(c.net) / 2;
+    sibling_pen = 8 * pitch;
+    const auto& items = obs->copper().items;
+    if (const auto f = no_branch_fixed.find(c.net); f != no_branch_fixed.end())
+      for (const int id : f->second)
+        if (!items[static_cast<std::size_t>(id)].removed) add_sibling_cells(items[static_cast<std::size_t>(id)], hw);
+    for (std::size_t o = 0; o < cs.size(); ++o) {
+      if (static_cast<int>(o) == current || !cs[o].routed || cs[o].c.net != c.net) continue;
+      for (const int id : cs[o].items)
+        if (!items[static_cast<std::size_t>(id)].removed) add_sibling_cells(items[static_cast<std::size_t>(id)], hw);
+    }
+  }
   bool search_and_commit(const Connection& c, bool soft_mode) {
     soft = soft_mode;
     // Skip an attempt that already failed in exactly this situation.
@@ -1837,8 +1962,10 @@ struct Router::Impl {
       cong_end = {global.tile_of_x(pa.x), global.tile_of_y(pa.y), global.tile_of_x(pb.x), global.tile_of_y(pb.y)};
     }
     corr = (opt.global_route && !global.corridor.empty() && current >= 0 && static_cast<std::size_t>(current) < global.corridor.size()) ? &global.corridor[static_cast<std::size_t>(current)] : nullptr;
+    collect_siblings(c);
     const bool ok = search_and_commit_inner(c);
     corr = nullptr;
+    sibling.clear();
     if (!ok && !bypass_nogoods) nogoods[ng] = 1;
     return ok;
   }
@@ -1933,11 +2060,13 @@ struct Router::Impl {
     return false;
   }
 
-  // Are the connection's pads already joined through fixed copper and other routed connections of its net?
+  // Are the connection's pads already joined through fixed copper and other routed connections of its net? Intent
+  // obligations (must_route, doc 05 §44) count fixed copper only: other routes joining their ends do not satisfy them.
   bool joined(int ci) {
     const auto& c = cs[static_cast<std::size_t>(ci)].c;
     const int ra = pad_root(c.pad_a), rb = end_root(c);
     if (ra == rb) return true;
+    if (c.must_route) return false;
     const RootUnion u = net_roots(c.net);
     return u.find(ra) == u.find(rb);
   }
@@ -3413,6 +3542,13 @@ struct Router::Impl {
     drc::UnionFind uf(obs->copper().items.size());
     for (std::size_t i = 0; i < con.root.size(); ++i) uf.unite(static_cast<int>(i), con.root[i]);
     const auto conns = plan(uf);
+    if (!no_branch_ids.empty())
+      for (std::size_t i = 0; i < obs->copper().items.size(); ++i) {
+        const auto& it = obs->copper().items[i];
+        if (it.owner < 0 && no_branch_ids.count(it.net) &&
+            (it.kind == drc::ItemKind::Track || it.kind == drc::ItemKind::Arc || it.kind == drc::ItemKind::Via))
+          no_branch_fixed[it.net].push_back(static_cast<int>(i));
+      }
     if (opt.tree_attach || opt.plane_tie) {
       tree_pad_boxes.resize(b.footprints.size());
       for (std::size_t pi = 0; pi < b.pads.size(); ++pi) {
@@ -3666,6 +3802,14 @@ struct Router::Impl {
         } else {
           ++cs[static_cast<std::size_t>(ci)].fails;
           if (!st.dead) failed.push_back(ci);
+          // Routing intent (doc 05 §44): an intent connection that failed a pass is relaxed to an ordinary one (tree
+          // attach and joins through other routes allowed again), so the net still completes; the relaxation is
+          // reported, the intent is not silently dropped.
+          if (st.c.exact || st.c.must_route) {
+            st.c.exact = st.c.must_route = false;
+            res.intent_relaxed.push_back(b.nets[static_cast<std::size_t>(st.c.net)].name + ": " + pad_label(st.c.pad_a) + " -> " +
+                                         (st.c.pad_b >= 0 ? pad_label(st.c.pad_b) : std::string("plane")));
+          }
           if (opt.sink) {
             const Point a = b.pads[static_cast<std::size_t>(st.c.pad_a)].pos;
             const Point e = st.c.pad_b >= 0 ? b.pads[static_cast<std::size_t>(st.c.pad_b)].pos : a;

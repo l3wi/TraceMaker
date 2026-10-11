@@ -40,6 +40,7 @@ struct RouteJob {
   bool reroute = false;
   std::vector<std::string> reroute_nets;
   std::string rules_override;     // --rules-override: user override file (JSON, doc 15 §6.3); empty = none
+  std::string intent;             // --intent: routing intent manifest (JSON, doc 05 §44); empty = none
   // --no-tracks-on / --layer-cost (doc 05 §29): copper layer names, and "LAYER=FACTOR" entries. Resolved against
   // the board into opt.no_track_layers / opt.layer_cost_pm; an unknown layer or a bad factor throws.
   std::vector<std::string> no_tracks_on;

@@ -196,6 +196,12 @@ down beside the board and reported.
 - `--plane-tie`: a pad's plane connection may end on nearby copper of its net that already reaches the plane (a
   neighbour's via, a through-hole pad in the plane) instead of its own via, so boxed-in ground pins of ball arrays
   and fine-pitch packages still connect (doc 05 §43). Opt-in; use with `--soft-zones` on plane boards.
+- `--intent FILE`: route with a reviewed routing intent manifest (doc 05 §44): decoupling capacitor → IC pin pairs
+  get their own short track, listed pads drop their own plane via, listed nets (USB data, crystal lines, pairs) never
+  branch. Draft one with `tracemaker rules BOARD --intent-draft FILE`, review it (by hand or with an LLM following
+  `skills/tracemaker-board-prep/SKILL.md`), then route. An intent connection that cannot be routed is relaxed to
+  ordinary routing and listed in the log and JSON (`intent.relaxed`). `bench/intent_quality.py` measures how well a
+  routed board keeps a manifest.
 - The route log ends with `stopped: complete|work|time|deadline|exhausted` (JSON `stop`). `time` means the
   `--time` limit (default 120 s) ended the run before `--work` did: the result then depends on machine load.
 - `--kb FILE` / `--no-kb`: persistent run and failure history, enabled by default at

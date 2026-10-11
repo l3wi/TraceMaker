@@ -14,6 +14,7 @@
 #include <thread>
 
 #include "crules/engine.hpp"
+#include "crules/intent.hpp"
 #include "drc/copper.hpp"
 #include "drc/rule_engine.hpp"
 #include "route/diff_pair.hpp"
@@ -189,6 +190,10 @@ void add_route_options(CLI::App& app, RouteJob& job, bool require_paths) {
       ->check(CLI::IsMember({"off", "report", "soft", "on"}));
   route->add_option("--rules-override", r_job.rules_override,
                     "User override file for --component-rules (JSON, doc 15 §6.3): disable rules, assert/deny categories, set parameters")
+      ->check(CLI::ExistingFile);
+  route->add_option("--intent", r_job.intent,
+                    "Routing intent manifest (JSON, doc 05 §44): pad pairs routed as their own connections, pads with their own plane "
+                    "via, nets that never branch; draft one with `tracemaker rules BOARD --intent-draft FILE` and review it")
       ->check(CLI::ExistingFile);
   route->add_option("--emit-items", r_items, "Write the new tracks and vias as JSON (for the KiCad plugin)");
   route->footer("Exit codes: 0 every planned connection routed (not KiCad DRC sign-off); "
@@ -414,6 +419,15 @@ RouteJobResult run_route_job(RouteJob job) {
       log("component rules: generated custom rules written to " + side);
     }
   }
+  // Routing intent (doc 05 §44, D103): a reviewed manifest, resolved against the board (unknown pads/nets throw).
+  if (!job.intent.empty()) {
+    const auto r = crules::resolve_intent(lb.board, crules::load_intent_file(job.intent), job.intent);
+    opt.intent_pairs = r.pairs;
+    opt.intent_plane_pads = r.plane_pads;
+    opt.no_branch_nets = r.no_branch_nets;
+    log(fmt("routing intent: %zu connection(s), %zu plane pad(s), %zu no-branch net(s) from %s", r.pairs.size(), r.plane_pads.size(),
+            r.no_branch_nets.size(), job.intent.c_str()));
+  }
   // Custom rules the router cannot apply (unreadable conditions, position-dependent disallow rules) are named
   // here, not only by `tracemaker drc`: the routed board may break them (rule 6).
   {
@@ -487,6 +501,12 @@ RouteJobResult run_route_job(RouteJob job) {
     for (const auto& plane : protected_planes)
       out.summary["protected_planes"].push_back({{"layer", lb.board.copper_name(plane.layer)},
           {"net", lb.board.nets[static_cast<std::size_t>(plane.net)].name}, {"coverage", plane.coverage}});
+  }
+  if (!job.intent.empty()) {
+    out.summary["intent"] = {{"file", job.intent}, {"connections", opt.intent_pairs.size()}, {"plane_pads", opt.intent_plane_pads.size()},
+                             {"no_branch_nets", opt.no_branch_nets.size()}, {"relaxed", res.intent_relaxed}};
+    log(fmt("routing intent: %zu intent connection(s) relaxed to ordinary routing", res.intent_relaxed.size()));
+    for (const auto& r : res.intent_relaxed) log("  relaxed: " + r);
   }
   out.summary["unrouted"] = nlohmann::json::array();
   auto layer_names = [&](model::LayerMask mask) {

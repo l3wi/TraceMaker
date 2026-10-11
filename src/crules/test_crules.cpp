@@ -11,6 +11,7 @@
 #include "crules/catalogue.hpp"
 #include "crules/detect.hpp"
 #include "crules/engine.hpp"
+#include "crules/intent.hpp"
 #include "crules/names.hpp"
 #include "crules/topology.hpp"
 #include "geom/shape.hpp"
@@ -770,4 +771,82 @@ TEST_CASE("ethernet: four layers, MagJack, through-hole magnetics", "[crules][et
     INFO(e->detail);
     CHECK(e->detail.find("role magnetics not bound") != std::string::npos);
   }
+}
+
+namespace {
+std::string intent_error(const model::Board& b, const std::string& text) {
+  try {
+    resolve_intent(b, parse_intent(text, "m.json"), "m.json");
+  } catch (const std::exception& e) {
+    return e.what();
+  }
+  return "";
+}
+}  // namespace
+
+TEST_CASE("routing intent: draft from detections, round trip, resolution", "[crules][intent]") {
+  Builder B = demo_board();
+  const auto& b = B.b;
+  const Intent in = draft_intent(b, builtin_catalogue(), detect(b, builtin_catalogue()));
+  std::set<std::string> pairs, planes, nets;
+  for (const auto& c : in.connections) pairs.insert(c.from + ">" + c.to);
+  for (const auto& p : in.plane_pads) planes.insert(p.pad);
+  for (const auto& n : in.no_branch_nets) nets.insert(n.net);
+  CHECK(pairs.count("C3.1>U1.1"));                         // decap supply pad to the VDD pin
+  CHECK(planes.count("C3.1"));
+  CHECK(planes.count("C3.2"));                             // its ground return
+  CHECK_FALSE(pairs.count("C1.1>U1.5"));                   // load caps are not decoupling
+  for (const char* n : {"/OSC_IN", "/OSC_OUT", "/USB_DP", "/USB_DM"}) CHECK(nets.count(n));
+  CHECK_FALSE(nets.count("+5V"));                          // VBUS is power, not a no-branch line
+  CHECK_FALSE(nets.count("GND"));
+  for (const auto& c : in.connections) CHECK_FALSE(c.why.empty());
+
+  // What the draft says is what the router gets back after a write/read round trip.
+  const auto r1 = resolve_intent(b, in, "draft");
+  const auto r2 = resolve_intent(b, parse_intent(intent_json(in).dump(), "rt"), "rt");
+  CHECK(r1.pairs == r2.pairs);
+  CHECK(r1.plane_pads == r2.plane_pads);
+  CHECK(r1.no_branch_nets == r2.no_branch_nets);
+  REQUIRE_FALSE(r1.pairs.empty());
+  CHECK(b.pads[static_cast<std::size_t>(r1.pairs.front().first)].net == b.pads[static_cast<std::size_t>(r1.pairs.front().second)].net);
+}
+
+TEST_CASE("routing intent: a bad manifest names the entry", "[crules][intent]") {
+  Builder B = demo_board();
+  const auto& b = B.b;
+  CHECK(intent_error(b, R"({"version": 1, "connections": [{"from": "C3.1", "to": "U1.1"}], "plane_pads": [{"pad": "C3.2"}],
+                            "no_branch_nets": [{"net": "/USB_DP"}]})").empty());
+  CHECK(intent_error(b, R"({"version": 2})").find("version must be 1") != std::string::npos);
+  CHECK(intent_error(b, R"({"version": 1, "pairs": []})").find("unknown key 'pairs'") != std::string::npos);
+  CHECK(intent_error(b, R"({"version": 1, "connections": [{"from": "C9.1", "to": "U1.1"}]})").find("connections[0].from: no footprint") !=
+        std::string::npos);
+  CHECK(intent_error(b, R"({"version": 1, "connections": [{"from": "C3.7", "to": "U1.1"}]})").find("C3 has no pad 7") != std::string::npos);
+  CHECK(intent_error(b, R"({"version": 1, "connections": [{"from": "C3.1", "to": "U1.2"}]})").find("is on +3V3 but U1.2 is on GND") !=
+        std::string::npos);
+  CHECK(intent_error(b, R"({"version": 1, "connections": [{"from": "C3.1", "to": "C3.1"}]})").find("same pad") != std::string::npos);
+  CHECK(intent_error(b, R"({"version": 1, "plane_pads": [{"pad": "J1.4"}]})").find("has no net") != std::string::npos);
+  CHECK(intent_error(b, R"({"version": 1, "no_branch_nets": [{"net": "/USB_D"}]})").find("no_branch_nets[0]: no net '/USB_D'") !=
+        std::string::npos);
+  CHECK(intent_error(b, R"({"version": 1, "no_branch_nets": [{"net": ""}]})").find("must be a non-empty string") != std::string::npos);
+}
+
+TEST_CASE("routing intent: no capacitor-to-ball pair for an inner ball of an array", "[crules][intent]") {
+  Builder B;
+  // A 3 x 3 ball array whose centre ball B2 is VDD, and a 100 nF capacitor on VDD/GND beside it.
+  std::vector<std::tuple<std::string, std::string, std::string>> balls;
+  for (const char* row : {"A", "B", "C"})
+    for (int col = 1; col <= 3; ++col) {
+      const std::string num = std::string(row) + std::to_string(col);
+      balls.emplace_back(num, num == "B2" ? "+1V8" : num == "A1" ? "GND" : "/IO_" + num, num == "B2" ? "VDD" : num == "A1" ? "VSS" : "IO");
+    }
+  const int u = B.add("U1", "Package_BGA:BGA-9_3x3_1.0mm", "FPGA", {50 * MM, 40 * MM}, balls);
+  const auto& up = B.b.footprints[static_cast<std::size_t>(u)].pads;
+  for (std::size_t i = 0; i < up.size(); ++i)
+    B.b.pads[static_cast<std::size_t>(up[i])].pos = Point{50 * MM + static_cast<Coord>(i % 3) * MM, 40 * MM + static_cast<Coord>(i / 3) * MM};
+  B.add("C1", "Capacitor_SMD:C_0402_1005Metric", "100nF", {54 * MM, 41 * MM}, {{"1", "+1V8", ""}, {"2", "GND", ""}});
+  const Detection det = detect(B.b, builtin_catalogue());
+  REQUIRE(find(det, B.b, "ic_decoupling", "C1"));
+  const Intent in = draft_intent(B.b, builtin_catalogue(), det);
+  CHECK(in.connections.empty());          // C1 -> U1.B2 would need the ball's fan-out via
+  CHECK_FALSE(in.plane_pads.empty());     // its own plane vias are still drafted
 }

@@ -802,6 +802,18 @@
     {
      "text": "Tree-attach losses: target-side reachability proof, distance bound to tree goals, no tree cells among one package's pins (D102): quick 90.6 %, mid 59.5 %, gndplane 81.3 % vs plain 89.2/53.3/77.0 %; LimeSDR 598 -> 753",
      "done": true
+    },
+    {
+     "text": "Routing intent manifest (D103, doc 05 §44): rules --intent-draft, route --intent, skills/tracemaker-board-prep, bench/intent_quality.py; long decap paths quick 7/14 -> 2, mid 29/46 -> 18, planes 7/5 -> 2, gndplane 7/10 -> 5 (plain/tree -> intent); completion 89.8/58.6/85.8/81.7 % vs tree 90.6/59.5/83.7/82.2 %; opt-in",
+     "done": true
+    },
+    {
+     "text": "KiCad 5 layerless zone fills read on the zone's layer (D104): 13/14 gndplane boards gain their planes; plain 77.0 -> 77.8 %, tree 81.3 -> 82.2 %; quick/mid/planes byte-identical",
+     "done": true
+    },
+    {
+     "text": "Routing intent completion cost vs --tree-attach (StickHub 89.8 -> 82.8 %, kitspace_threeboard 86.6 -> 79.0 %)",
+     "done": false
     }
    ]
   }

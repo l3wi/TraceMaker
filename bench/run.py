@@ -44,6 +44,7 @@ EXTRA = os.environ.get("TM_ROUTE_ARGS", "").split()  # extra route options for e
 THREADS = 1
 WORK = 0         # --work N: deterministic work budget per board (0: wall-clock --time only)
 REFILL = False   # --refill: KiCad refills zones before judging
+INTENTS = None   # --intents DIR: route each board with DIR/<board>.intent.json (drafted from its input when missing)
 DRC_CACHE = ROOT / "build/drc/kicad"
 # Violation types that routing cannot cause; ignored when counting added errors.
 NOT_ROUTING = {"lib_footprint_issues", "lib_footprint_mismatch", "silk_overlap", "silk_over_copper", "silk_edge_clearance",
@@ -191,7 +192,15 @@ def run_board(name: str, outdir: pathlib.Path, time_limit: float) -> dict:
     try:
         # --work: deterministic (no knowledge base, which learns across boards of a run); --time stays a safety stop.
         budget = ["--work", str(WORK), "--no-kb"] if WORK else ["--kb", str(outdir / "kb.sqlite")]
-        p = subprocess.run([str(TM), "route", str(src), "-o", str(out), "--time", str(time_limit), "--threads", str(THREADS), "--json", str(out) + ".route.json"] + budget + EXTRA,
+        intent = []
+        if INTENTS is not None:
+            # Routing intent (doc 05 §44): a reviewed manifest, or the component-rule draft of the input when none exists.
+            man = INTENTS / f"{name}.intent.json"
+            if not man.exists():
+                subprocess.run([str(TM), "rules", str(src), "--intent-draft", str(man)], check=True, capture_output=True)
+            intent = ["--intent", str(man)]
+            res["intent"] = str(man)
+        p = subprocess.run([str(TM), "route", str(src), "-o", str(out), "--time", str(time_limit), "--threads", str(THREADS), "--json", str(out) + ".route.json"] + budget + intent + EXTRA,
                            capture_output=True, text=True, timeout=time_limit * 3 + 60)
         res["exit"] = p.returncode
         if p.returncode not in (0, 3):
@@ -250,12 +259,16 @@ def main() -> int:
     ap.add_argument("--place-args", help="extra tracemaker-place options, space-separated (quote the whole string)")
     ap.add_argument("--board-list", help="file with one board name per line (# comments)")
     ap.add_argument("--set-name", help="name of the board set for the summary (default: the tier)")
+    ap.add_argument("--intents", help="route with DIR/<board>.intent.json routing intent manifests (doc 05 §44); missing ones are drafted from the input")
     a = ap.parse_args()
-    global THREADS, SRC_FIX, PLACE_ARGS, WORK, REFILL, EXTRA
+    global THREADS, SRC_FIX, PLACE_ARGS, WORK, REFILL, EXTRA, INTENTS
     PLACE_ARGS = (a.place_args or "").split()
     THREADS = a.threads
     WORK, REFILL = a.work, a.refill
     EXTRA = EXTRA + (a.route_args or "").split()
+    if a.intents:
+        INTENTS = pathlib.Path(a.intents).resolve()
+        INTENTS.mkdir(parents=True, exist_ok=True)
     if a.time is None:
         a.time = 3600.0 if a.work else 60.0
     if a.fixtures:
@@ -323,6 +336,7 @@ def main() -> int:
         "completion": round(sum(r["completion"] for r in judged) / n, 4) if n else None,
         "seconds": round(sum(r.get("seconds", 0) for r in judged), 1),
         "time_limit_s": a.time, "threads": a.threads, "work": a.work, "refill": a.refill, "route_args": " ".join(EXTRA),
+        "intents": str(INTENTS) if INTENTS else None,
         "fr_rc12_clean_pass": round(fr_clean / len(fr_rows), 4) if fr_rows else None,
         "fr_241_clean_pass": round(sum(r["fr_241"]["clean"] for r in fr241) / len(fr241), 4) if fr241 else None,
         "both_clean": both, "only_tracemaker_clean": only_tm, "only_freerouting_clean": only_fr,

@@ -1492,3 +1492,86 @@ Before the bound of §41, plane drops searched with no lower bound and boxed-in 
 ties then helped widely (`planes` 78.2 % → 82.2 %, plane_smd 29 → 42). With the bound, plane drops succeed where a
 via fits and a tie mostly trades a via for track on a signal layer, which costs other nets there. It stays opt-in,
 for boards whose plane pins sit in ball arrays.
+
+## 44. Routing intent manifest (2026-10-11, D103)
+
+**Problem.** Completion, copper and vias say nothing about whether a board is routed well. A paired study of
+`--tree-attach` (§40) found three local regressions the totals hide: a decoupling capacitor reaching its IC pin
+through a long detour (Teensy C12 → U5.5, 2.8 → 8.9 mm), ground pins sharing a neighbour's via instead of dropping
+their own, and T-junctions on USB, Ethernet and crystal nets. Three adversarial reviews agreed that routing order
+cannot fix these: they are obligations on specific pads and nets, and the router needs them stated.
+
+**Split of responsibilities.** Deciding the intent is board preparation, done once and reviewed; applying it is
+deterministic:
+
+| Step | Who |
+|---|---|
+| Detect categories, bind roles (doc 15) and draft a manifest: `tracemaker rules BOARD --intent-draft FILE` | TraceMaker |
+| Review the draft against schematic, datasheets and nets: fix pins, drop bulk/bootstrap caps, add missed USB/crystal nets, cite evidence per entry | a person, or an LLM following `skills/tracemaker-board-prep/SKILL.md` |
+| Resolve the file against the board (unknown or ambiguous pads/nets are errors naming the entry) and route with it: `tracemaker route --intent FILE` | TraceMaker |
+| Measure the result against the same manifest: `bench/intent_quality.py` | TraceMaker |
+
+Without `--intent` routing is unchanged (byte-identical on every tier).
+
+**The manifest** (`src/crules/intent.hpp`, JSON, version 1): `connections` (pad pairs `REF.NUM`), `plane_pads`,
+`no_branch_nets`, each entry with an optional `why`. The draft takes instances at the apply threshold: each
+`ic_decoupling` instance gives its capacitor supply pad → bound IC pin (DEC-01) and both capacitor pads as plane pads
+(DEC-03, via at the capacitor); point-to-point interfaces (USB, USB-C, Ethernet, HDMI/DP, LVDS, MIPI, PCIe, SATA,
+crystal, RF line) give the nets of their `max_stub`, `diff_pair` and `via_limit` roles as no-branch nets. Power paths,
+ESD-protected nets, CAN/RS-485 buses, motor gates and analog inputs carry such rules too but may branch, so they
+are not drafted (VBUS was, until the unit test caught it). No pair is drafted to an inner ball of a pad array (a pin
+with neighbours left, right, above and below in its row and column): a capacitor reaches such a ball through its
+fan-out via, and on `mid` sbc 45 drafted capacitor-to-ball pairs were unroutable and starved other nets.
+
+**What the router does** (`router.cpp` `apply_intent`, `collect_siblings`):
+
+- Before each net's spanning tree, on the clusters of fixed copper: an intent pair in different clusters becomes a
+  pad-to-pad connection, and a plane pad whose cluster has no plane fill becomes a connection from the pad into the
+  nearest plane fill it can reach. Both are `exact` (no tree start or goal, no plane tie: they start and end on
+  their own pads or plane) and `must_route`: other routes joining their ends do not satisfy them, so a capacitor
+  and its pin joined only through the plane still get their track. The clusters they join are merged before the
+  spanning tree, which therefore adds no second link.
+- Every connection of a no-branch net is `exact`. Its search pays 8 lattice pitches per step in cells where its
+  track would touch other copper of its net (fixed tracks and vias, other connections' routes), so the net's routes
+  meet at pads instead of sharing copper and splitting off it. A cost, not a block.
+- Intent connections take part in ordering, negotiation, rip-up and clean-up like any other (no protection from
+  rip-up: the reviews warned that protected priority starves completion, D99).
+- An intent connection that fails a pass is relaxed to an ordinary connection (tree attach and joins through other
+  routes allowed again), so the net still completes; the relaxation is logged and listed in the route JSON
+  (`intent.relaxed`). The rule wins whenever it can be met; when it cannot, completion wins and the violation is
+  reported, never dropped silently.
+
+**Results** (`--variants 1`, protocol budgets; P plain, T `--tree-attach`, R `--tree-attach --intent` with each
+board's unreviewed draft; `bench/intent_quality.py` judges all three against the same manifest; planes/gndplane with
+`--soft-zones`). *Long* = intent pair whose track path exceeds the straight line by more than 2 mm; *missing* = pair
+with no track path (unrouted, or joined only through a plane); excess p90 over pairs with a path.
+
+| Set | Completion P / T / R | Long pairs P / T / R | Missing P / T / R | Excess p90 mm P / T / R | Relaxed |
+|---|---|---|---|---|---|
+| `quick`, 1 M (105 pairs) | 89.2 / 90.6 / 89.8 % | 7 / 14 / 2 | 15 / 10 / 16 | 1.36 / 3.04 / 0.53 | 2 of 315 |
+| `mid`, 20 M (328 pairs) | 53.3 / 59.5 / 58.6 % | 29 / 46 / 18 | 38 / 22 / 49 | 1.93 / 3.04 / 1.06 | 12 of 1,198 |
+| `planes`, 3 M (72 pairs) | 84.3 / 83.7 / 85.8 % | 7 / 5 / 2 | 29 / 31 / 19 | 4.39 / 2.22 / 0.83 | 2 of 218 |
+| `gndplane`, 3 M (225 pairs) | 77.8 / 82.2 / 81.7 % | 7 / 10 / 5 | 117 / 112 / 58 | 1.75 / 1.85 / 0.51 | 8 of 711 |
+
+- The intent is met far better: long capacitor-to-pin paths fall by half or more against both arms, the tail by 2-6x,
+  and on the plane sets half of the pairs that met only through the plane get their own track.
+- It costs completion against tree attach on most boards: `quick` 8 boards worse (kitspace_threeboard 86.6 → 79.0 %,
+  esp8266_envmonitor loses its clean pass), `mid` MonApollo 65.1 → 58.1 %, `planes` StickHub 89.8 → 82.8 %; it gains
+  on `planes` RoyalBlue54L-Feather 39.0 → 62.3 %. Against plain routing it is better on every set.
+- Plane access of plane pads is unchanged (`gndplane` 19 / 20 / 19 pads without one); with the board's planes
+  visible (D104) nearly every capacitor already drops its own via (lead median 0.02 mm).
+- No-branch nets: junctions 0-2 per set in every arm; these sets have few multi-pad high-speed nets, so the effect
+  is shown on the synthetic case (`tests/integration/route_intent.py`) and the cheap prototypes (655_testboard
+  crystal net 1 junction 4.4 mm from the pad → none).
+- An LLM-reviewed manifest (skills/tracemaker-board-prep) on 655_testboard (capacitors spread over separate VCC pins
+  instead of all to IC1.7) cut the worst capacitor detour 9.0 → 4.6 mm and the unconnected items 3 → 1; on
+  mechkeys_1800-controller it retargeted a capacitor from the regulator's EN pin to IN and added 16 USB data nets the
+  capped detection missed.
+
+It stays opt-in: the manifest is a statement of intent the user (or a reviewed draft) makes, and on these budgets it
+trades completion for it.
+
+**Known limits.** Two routes leaving one pad by the same off-lattice escape still share that escape (a junction
+about 1 mm from the pad centre on one crystal net); a plane pad whose cluster already reaches a plane through
+fixed copper (a pour around it) gets no extra via. `bench/intent_quality.py` models track copper and zone outlines,
+not refilled fills.

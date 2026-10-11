@@ -14,6 +14,7 @@
 #include "app/route_job.hpp"
 #include "core/rng.hpp"
 #include "crules/engine.hpp"
+#include "crules/intent.hpp"
 #include "drc/drc.hpp"
 #include "io/kicad/project_reader.hpp"
 #include "route/router.hpp"
@@ -132,7 +133,7 @@ int cmd_drc(const std::string& path, const std::string& json_out, tmk::Coord eps
 
 // Component-aware layout rules (design doc 15 §7): detections, bound roles and every rule's status. Read-only.
 int cmd_rules(const std::string& path, const std::string& mode_s, const std::string& json_out, const std::string& dru_out, const std::string& roles_from,
-              const std::string& catalogue_path, const std::string& override_path, const std::string& project) {
+              const std::string& catalogue_path, const std::string& override_path, const std::string& project, const std::string& intent_out) {
   namespace cr = tmk::crules;
   const auto lb = tmk::io::read_board_file(path);
   const auto rules = tmk::io::read_design_rules(path, project);
@@ -163,6 +164,15 @@ int cmd_rules(const std::string& path, const std::string& mode_s, const std::str
   if (!dru_out.empty()) {
     std::ofstream(dru_out) << cr::dru_sidecar(lb.board, cat, det);
     std::printf("generated custom rules written to %s\n", dru_out.c_str());
+  }
+  if (!intent_out.empty()) {
+    // A draft for review (doc 05 §44): the board file name only, so the manifest does not carry a local path.
+    auto in = cr::draft_intent(lb.board, cat, det);
+    in.board = std::filesystem::path(path).filename().string();
+    in.comment = "Draft from component rules: review every entry (skills/tracemaker-board-prep) before routing with --intent";
+    std::ofstream(intent_out) << cr::intent_json(in).dump(1) << "\n";
+    std::printf("routing intent draft written to %s: %zu connection(s), %zu plane pad(s), %zu no-branch net(s)\n", intent_out.c_str(),
+                in.connections.size(), in.plane_pads.size(), in.no_branch_nets.size());
   }
   return 0;
 }
@@ -405,7 +415,7 @@ int main(int argc, char** argv) {
   inspect->add_option("--json", inspect_json, "Also write the board as JSON (KiCad truth schema)");
 
   auto* crules_cmd = app.add_subcommand("rules", "Detect component categories and report the component-aware layout rules (doc 15)");
-  std::string cr_path, cr_json, cr_dru, cr_cat, cr_roles_from, cr_override, cr_mode = "soft";
+  std::string cr_path, cr_json, cr_dru, cr_cat, cr_roles_from, cr_override, cr_intent, cr_mode = "soft";
   std::string cr_project;
   crules_cmd->add_option("--project", cr_project, "Read this project and its same-stem .kicad_dru");
   crules_cmd->add_option("board", cr_path, "Board file")->required()->check(CLI::ExistingFile);
@@ -414,6 +424,7 @@ int main(int argc, char** argv) {
       ->check(CLI::IsMember({"report", "soft", "on"}));
   crules_cmd->add_option("--dru", cr_dru, "Write the generated custom rules (sidecar .kicad_dru) to this file");
   crules_cmd->add_option("--roles-from", cr_roles_from, "Detect and bind roles on this version of the board (e.g. the placement input), measure on the given one");
+  crules_cmd->add_option("--intent-draft", cr_intent, "Write a routing intent manifest drafted from the detections (doc 05 §44) for review");
   crules_cmd->add_option("--catalogue", cr_cat, "Catalogue JSON to use instead of the built-in one (scripts/crules_catalogue.py output)");
   crules_cmd->add_option("--rules-override", cr_override,
                          "User override file (JSON, doc 15 §6.3): disable rules, assert/deny categories, set parameters")
@@ -530,7 +541,7 @@ int main(int argc, char** argv) {
       }
       return 0;
     }
-    if (*crules_cmd) return cmd_rules(cr_path, cr_mode, cr_json, cr_dru, cr_roles_from, cr_cat, cr_override, cr_project);
+    if (*crules_cmd) return cmd_rules(cr_path, cr_mode, cr_json, cr_dru, cr_roles_from, cr_cat, cr_override, cr_project, cr_intent);
     if (*selftest) return cmd_selftest_edit(st_in, st_out);
     if (*dseg) return cmd_debug_seg(ds_board, ds_pts, ds_layer, ds_width, ds_net);
     if (*esc) return cmd_escape(esc_board, esc_json, esc_flow, esc_soft, esc_vop ? esc_vop_below : 0.0, esc_project);

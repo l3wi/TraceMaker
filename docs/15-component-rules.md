@@ -1463,6 +1463,12 @@ the placement default on that evidence; decap behaviour is the open item.
 
 So keep-outs are a real constraint with a completion cost on dense boards; they stay opt-in.
 
+**Routing intent (2026-10-11, D103).** DEC-01/DEC-03 (capacitor → pin path, via at the capacitor) and the no-stub
+rules of point-to-point interfaces (USB2-05, USBC-03) and crystals (XTAL-03 nets) reach the router through a
+reviewed manifest, not directly from detection: `tracemaker rules --intent-draft` writes the draft, a person or an
+LLM reviews it, `tracemaker route --intent` applies it (doc 05 §44). Ordered chains (USB2-08), maximum stub lengths
+and per-role via limits are still not enforced.
+
 ### 14.5 Stackup and impedance (P4)
 
 **Stackup.** `(setup (stackup …))` is read into `Board::stackup` (§14.1). Of the 1,157 PCBench boards, **none** of the

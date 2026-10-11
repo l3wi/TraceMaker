@@ -69,6 +69,10 @@ set_tests_properties(tree_attach PROPERTIES LABELS "route;integration" TIMEOUT 6
 # A plane connection with --plane-tie ends on a through pad already in the plane (no via); connected in both DRCs.
 add_test(NAME plane_tie COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/plane_tie.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/plane_tie)
 set_tests_properties(plane_tie PROPERTIES LABELS "route;integration" TIMEOUT 300)
+# Routing intent manifest (doc 05 §44, D103): a decoupling pair gets its own track and its pad its own plane via; a
+# no-branch net meets its copper at pads only; a manifest naming an unknown pad is an error naming the entry.
+add_test(NAME route_intent COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/route_intent.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/route_intent)
+set_tests_properties(route_intent PROPERTIES LABELS "route;integration" TIMEOUT 300)
 # Frozen KiCad 10 custom-rule item/pair multisets (expected.json names the judging version); normal runs do not require KiCad.
 add_test(NAME rule_parity COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/rule_parity/run.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/rule_parity)
 set_tests_properties(rule_parity PROPERTIES LABELS "integration;rules" TIMEOUT 300)
