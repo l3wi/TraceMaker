@@ -934,6 +934,8 @@ struct Router::Impl {
   // a start or goal with no pad leg. Zone fills are not offered: plane connections have their own targets. Only
   // cells a track end may occupy are offered. `node_at`: cell key -> connectivity node of the copper there. `mark`:
   // goal flags to set.
+  // When `skip_pad` and `other_pad` share a footprint, its pad extents plus clearance and half width are excluded:
+  // planned endpoint cells stay, but an intra-package tie cannot land among their neighbours on tree copper.
   void add_tree_cells(const Window& w, NetId net, const RootUnion& u, int root, int skip_pad, const std::vector<int>* only, Endpoint& e,
                       std::unordered_map<std::int64_t, int>& node_at, std::vector<std::uint8_t>* mark, int other_pad = -1) {
     const std::size_t cells = static_cast<std::size_t>(w.w) * static_cast<std::size_t>(w.h);
