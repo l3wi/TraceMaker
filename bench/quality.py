@@ -20,6 +20,7 @@ import quality_compare as qc
 import quality_craft as craft
 import quality_si as si
 import quality_identity as identity
+import quality_spacing as spacing
 from shapely.geometry import Point
 
 
@@ -131,8 +132,10 @@ def measure(d, manifest, board, meta, bad, *, censored=False):
     for key,v in manufacturing['per_pad_entry'].items():
         categories['pad_entry'][key]=dict(off_axis=int(v['off']),corner=int(v['corner']),wider_than_face=int(v['wide']),
                                          connected=complete.get(pad_net[key],False),local_contact=True)
+    spacing_fields = spacing.measure(d, complete)
     for n in sorted(complete):
         categories['routing_craft'][n]=dict(acute_junctions=manufacturing.get('acute_by_net',{}).get(n,0),connected=complete[n])
+        categories['routing_craft'][n].update(spacing_fields.get(n, {}))
         pads={(p['ref'],p['num']) for p in d['pads'] if p['net']==n}
         obligations=max(0,len(pads)-1)
         if obligations:
