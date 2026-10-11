@@ -934,7 +934,7 @@ struct Router::Impl {
   // cells a track end may occupy are offered. `node_at`: cell key -> connectivity node of the copper there. `mark`:
   // goal flags to set.
   void add_tree_cells(const Window& w, NetId net, const RootUnion& u, int root, int skip_pad, const std::vector<int>* only, Endpoint& e,
-                      std::unordered_map<std::int64_t, int>& node_at, std::vector<std::uint8_t>* mark) {
+                      std::unordered_map<std::int64_t, int>& node_at, std::vector<std::uint8_t>* mark, const geom::Box* scope = nullptr) {
     const std::size_t cells = static_cast<std::size_t>(w.w) * static_cast<std::size_t>(w.h);
     const Coord hw = track_width(net) / 2;
     std::set<std::int64_t> seen;  // the endpoint's own cells and cells already offered
@@ -965,6 +965,8 @@ struct Router::Impl {
         std::set<std::int64_t> tried;  // lattice points of this shape already tested
         auto try_point = [&](int gx, int gy) {
           if (gx < w.x0 || gy < w.y0 || gx >= w.x0 + w.w || gy >= w.y0 + w.h) return;
+          const Point p = at(gx, gy);
+          if (scope && (p.x < scope->x0 || p.x > scope->x1 || p.y < scope->y0 || p.y > scope->y1)) return;
           if (!tried.insert(cell_key(0, gx, gy)).second) return;
           if (!geom::closer_than(geom::Shape::point(at(gx, gy), 0), s, 1)) return;  // not on this copper
           const std::int64_t ci = static_cast<std::int64_t>(gy - w.y0) * w.w + (gx - w.x0);
@@ -1137,8 +1139,13 @@ struct Router::Impl {
         const RootUnion u = net_roots(net, current);
         const int ra = u.find(pad_root(c.pad_a)), rb = u.find(pad_root(c.pad_b));
         if (ra != rb) {
-          add_tree_cells(w, net, u, ra, c.pad_a, nullptr, src, tree_start, nullptr);
-          add_tree_cells(w, net, u, rb, c.pad_b, nullptr, dst, tree_end, &is_target);
+          // Keep signal junctions near their planned connection rather than across the whole search window.
+          const Point a = b.pads[static_cast<std::size_t>(c.pad_a)].pos, z = b.pads[static_cast<std::size_t>(c.pad_b)].pos;
+          constexpr Coord margin = 2'000'000;
+          const geom::Box scope{std::min(a.x, z.x) - margin, std::min(a.y, z.y) - margin,
+                                std::max(a.x, z.x) + margin, std::max(a.y, z.y) + margin};
+          add_tree_cells(w, net, u, ra, c.pad_a, nullptr, src, tree_start, nullptr, &scope);
+          add_tree_cells(w, net, u, rb, c.pad_b, nullptr, dst, tree_end, &is_target, &scope);
         }
       }
     }
