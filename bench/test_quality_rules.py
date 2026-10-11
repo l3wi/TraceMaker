@@ -19,6 +19,9 @@ class RuleTests(unittest.TestCase):
             self.assertEqual(rules.check(0.1509, 0.15, comparator), 'boundary')
         self.assertEqual(rules.check(0.1489, 0.15, '<'), 'pass')
         self.assertEqual(rules.check(0.1511, 0.15, '<'), 'fail')
+        # A value exactly 1 µm from the limit is on the band edge despite float error.
+        self.assertEqual(rules.check(0.499, 0.5, '>'), 'boundary')
+        self.assertEqual(rules.check(0.4989, 0.5, '>'), 'fail')
         self.assertEqual(rules.check(0.1511, 0.15, '>'), 'pass')
         # Counts are exact: no band, inclusive comparator decides equality.
         self.assertEqual(rules.check(2, 2, '<=', band=0), 'pass')
