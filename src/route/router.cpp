@@ -1065,8 +1065,10 @@ struct Router::Impl {
   enum class Miss { None, Enclosed, Window, Budget };
   bool reach_check_now = false;  // run the reachability pre-check before the next search
   std::vector<std::uint32_t> rstamp;  // flood-fill visited marks (generation stamps)
+  std::vector<std::uint32_t> reach_source;  // source cells exempted by the reverse relaxed flood
   std::vector<std::size_t> reach_q;
   long reach_checks = 0, reach_pruned = 0, reach_visits = 0, reach_mismatch = 0;
+  long reach_reference_expansions = 0;  // A* work avoided by proved misses, measured with --reach-verify
   bool reach_said_no = false;  // this search's pre-check found no path
   long expansion_cap = 0;  // > 0: per-search expansion limit overriding opt.max_expansions (reverse probes)
   Miss last_miss = Miss::None;
@@ -1097,6 +1099,7 @@ struct Router::Impl {
       std::fill(sn.begin(), sn.end(), SNode{0, 0, -1});
       std::fill(cstamp.begin(), cstamp.end(), 0u);
       std::fill(vstamp.begin(), vstamp.end(), 0u);
+      std::fill(reach_source.begin(), reach_source.end(), 0u);
       std::fill(rstamp.begin(), rstamp.end(), 0u);
       gen = 1;
     }
@@ -1171,13 +1174,23 @@ struct Router::Impl {
     // Reachability pre-check (doc 05 §13): a flood fill over the same legality tests as the A* below, but with no
     // bend states, turn limits or costs, so it admits every path the A* could find. "Unreachable" is therefore
     // exact, found with one visit per lattice point instead of up to nine heap-ordered expansions, and the cell
-    // cache it fills is reused by the A* when a path exists. Run only where a failure is likely (reach_check_now).
-    if (reach_check_now && !soft && !zone_target && c.pad_b >= 0) {
+    // cache it fills is reused by the A* when a path exists. A target pocket is much cheaper to exhaust
+    // than the open source side. Probe ordinary pad-to-pad searches from the target on first attempts;
+    // bound that probe so successful searches cannot spend their whole budget in the flood.
+    const bool ordinary_reach = opt.tree_attach && opt.reach_check != 0 && c.pad_b >= 0 && tree_start.empty() && tree_end.empty();
+    if ((reach_check_now || ordinary_reach) && ((!soft && !zone_target && c.pad_b >= 0) || opt.tree_attach)) {
       const std::size_t lcells = cells * static_cast<std::size_t>(nl);
       if (rstamp.size() < lcells) rstamp.assign(lcells, 0);
-      const std::size_t cap = static_cast<std::size_t>(expansion_cap > 0 ? expansion_cap : opt.max_expansions);
+      const bool reverse_reach = opt.tree_attach && c.pad_b >= 0;
+      if (reverse_reach) {
+        if (reach_source.size() < lcells) reach_source.assign(lcells, 0);
+        for (const auto& [l, ci] : src.cells)
+          reach_source[static_cast<std::size_t>(l) * cells + static_cast<std::size_t>(ci)] = gen;
+      }
+      const std::size_t search_cap = static_cast<std::size_t>(expansion_cap > 0 ? expansion_cap : opt.max_expansions);
+      const std::size_t cap = ordinary_reach && !reach_check_now ? std::min<std::size_t>(1'024, search_cap) : search_cap;
       reach_q.clear();
-      for (const auto& [l, ci] : src.cells) {
+      for (const auto& [l, ci] : reverse_reach ? dst.cells : src.cells) {
         const std::size_t i = static_cast<std::size_t>(l) * cells + static_cast<std::size_t>(ci);
         if (rstamp[i] == gen) continue;
         rstamp[i] = gen;
@@ -1186,7 +1199,7 @@ struct Router::Impl {
       bool found = false, edge = false;
       for (std::size_t head = 0; head < reach_q.size() && reach_q.size() <= cap; ++head) {
         const std::size_t i = reach_q[head];
-        if (is_target[i] == 1) {
+        if (reverse_reach ? reach_source[i] == gen : target(static_cast<int>(i / cells), static_cast<std::int64_t>(i % cells))) {
           found = true;
           break;
         }
@@ -1199,20 +1212,28 @@ struct Router::Impl {
           if (ncx < 0 || ncy < 0 || ncx >= w.w || ncy >= w.h) continue;
           const std::size_t ni = static_cast<std::size_t>(l) * cells + static_cast<std::size_t>(ncy) * static_cast<std::size_t>(w.w) + static_cast<std::size_t>(ncx);
           if (rstamp[ni] == gen) continue;
-          if (is_target[ni] != 1 && cell_cost(w, l, ncx, ncy, net, hw) < 0) continue;
+          if (is_target[ni] != 1 && (!reverse_reach || reach_source[ni] != gen) && cell_cost(w, l, ncx, ncy, net, hw) < 0) {
+            // A* can land a via on a cell whose track disk is blocked (e.g. a track-only keepout),
+            // then leave it. Admit those predecessors too: the reverse graph must be a superset.
+            if (!reverse_reach || (!blind_for(net) && !micro_for(net) &&
+                (!opt.allow_vias || nl < 2 || via_cost_at(w, ncx, ncy, net, vd, vdrill) < 0))) continue;
+          }
           rstamp[ni] = gen;
           reach_q.push_back(ni);
         }
         // Layer change: a through via, or (optimistically) any blind/buried or micro via when those are allowed.
         auto via_useful = [&] {  // avoid legality checks when every usable layer is reached
           for (int l2 = 0; l2 < nl; ++l2)
-            if (l2 != l && rstamp[static_cast<std::size_t>(l2) * cells + ci] != gen && layer_ok(net, l2)) return true;
+            if (l2 != l && rstamp[static_cast<std::size_t>(l2) * cells + ci] != gen &&
+                (layer_ok(net, l2) || target(l2, static_cast<std::int64_t>(ci)) ||
+                 (reverse_reach && reach_source[static_cast<std::size_t>(l2) * cells + ci] == gen))) return true;
           return false;
         };
         if (nl > 1 && via_useful() && (blind_for(net) || micro_for(net) || (opt.allow_vias && via_cost_at(w, cx, cy, net, vd, vdrill) >= 0)))
           for (int l2 = 0; l2 < nl; ++l2) {
             const std::size_t ni = static_cast<std::size_t>(l2) * cells + ci;
-            if (l2 == l || rstamp[ni] == gen || !layer_ok(net, l2)) continue;
+            if (l2 == l || rstamp[ni] == gen ||
+                (!layer_ok(net, l2) && !target(l2, static_cast<std::int64_t>(ci)) && (!reverse_reach || reach_source[ni] != gen))) continue;
             rstamp[ni] = gen;
             reach_q.push_back(ni);
           }
@@ -1231,6 +1252,13 @@ struct Router::Impl {
           last_miss = edge ? Miss::Window : Miss::Enclosed;
           return false;
         }
+      }
+      // The flood probes zone targets in a different order from A*. Do not let those lazy marks exempt
+      // additional planar cells from A*'s legality checks (only the original tree/pad goals are pre-marked).
+      if (zone_target) {
+        std::fill(is_target.begin(), is_target.end(), 0);
+        for (const auto& [l, ci] : dst.cells)
+          is_target[static_cast<std::size_t>(l) * cells + static_cast<std::size_t>(ci)] = 1;
       }
     }
     const std::int64_t step = pitch, diag = static_cast<std::int64_t>(std::llround(static_cast<double>(pitch) * std::numbers::sqrt2));
@@ -1420,6 +1448,7 @@ struct Router::Impl {
       }
     }
     if (reach_said_no && goal != SIZE_MAX) ++reach_mismatch;
+    if (reach_said_no) reach_reference_expansions += expanded;
     res.expansions += expanded;
     (goal == SIZE_MAX ? exp_fail : exp_ok) += expanded;
     if (goal == SIZE_MAX) (soft ? (corr_hard ? xf_soft_conf : xf_soft_wide) : (corr_hard ? xf_strict_conf : xf_strict_wide)) += expanded;
@@ -3712,6 +3741,8 @@ struct Router::Impl {
     if (reach_checks) std::fprintf(stderr, "reachability checks: %ld, %ld proved unreachable, %ld cells visited%s\n", reach_checks, reach_pruned, reach_visits,
                                   opt.reach_verify ? (reach_mismatch ? ", MISMATCHES" : ", verified (0 mismatches)") : "");
     if (reach_mismatch) std::fprintf(stderr, "reachability mismatches: %ld\n", reach_mismatch);
+    if (opt.reach_verify && reach_checks)
+      std::fprintf(stderr, "reachability reference expansions: %ld (avoided by proved misses without --reach-verify)\n", reach_reference_expansions);
     std::fprintf(stderr, "failed-search expansions: strict confined %ld, strict wide %ld, negotiated confined %ld, negotiated wide %ld\n", xf_strict_conf,
                  xf_strict_wide, xf_soft_conf, xf_soft_wide);
     if (opt.escape_report) {  // pins of deep arrays per ring: to route, and with every connection routed

@@ -4,7 +4,7 @@
 
   reach_verify.py <tracemaker> <work dir> [board]
 
-Routes a PCBench board with the pre-check on every strict search and --reach-verify, which runs the A* even
+Routes a PCBench board with tree attachment, the pre-check on every search and --reach-verify, which runs the A* even
 where the flood fill proved no path and counts any path it finds. Passes when at least one search was proved
 unreachable and there were no mismatches. Exit 77 (skipped) when the fixture is missing.
 """
@@ -26,7 +26,7 @@ def main() -> int:
         return 77
     work.mkdir(parents=True, exist_ok=True)
     p = subprocess.run([str(tm), "route", str(src), "-o", str(work / "out.kicad_pcb"), "--work", "15000000", "--time", "3600",
-                        "--threads", "1", "--variants", "1", "--no-kb", "--reach-check", "2", "--reach-verify"], capture_output=True, text=True)
+                        "--threads", "1", "--variants", "1", "--no-kb", "--tree-attach", "--reach-check", "2", "--reach-verify"], capture_output=True, text=True)
     out = p.stdout + p.stderr
     m = re.search(r"reachability checks: (\d+), (\d+) proved unreachable", out)
     if not m:
