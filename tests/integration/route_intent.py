@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Routing intent manifest (doc 05 §44, D103).
+"""Routing intent manifest (doc 05 §45, D110).
 
   route_intent.py <tracemaker> <workdir>
 

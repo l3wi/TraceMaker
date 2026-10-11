@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Pad-to-tree routing (doc 05 §40, D92).
+"""Pad-to-tree routing (doc 05 §41, D99).
 
   tree_attach.py <tracemaker> <workdir>
 

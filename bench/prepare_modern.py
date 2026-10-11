@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Fetch and prepare the `modern-planes` set (doc 10 §4, D105): open-hardware KiCad 7-10 boards with inner planes,
+"""Fetch and prepare the `modern-planes` set (doc 10 §4, D112): open-hardware KiCad 7-10 boards with inner planes,
 pinned to commits in bench/sets/modern-planes.json.
 
   bench/prepare_modern.py [--data bench/data/modern] [--out build/modern-planes] [NAME ...]

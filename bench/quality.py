@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Gated human-parity PCB scorecard (D107); no weighted quality total.
+"""Gated human-parity PCB scorecard (D114); no weighted quality total.
 
 bench/quality.py RUN [RUN ...] --reference HUMAN_RUN --intents DIR --json OUT --md OUT
 Requires Shapely >= 2, KiCad CLI, and tracemaker inspect (TM_BINARY override).
@@ -330,7 +330,7 @@ def main():
     started=time.monotonic()
     reference=resolve_run(args.reference);runs=list(dict.fromkeys(resolve_run(p) for p in args.runs))
     version=subprocess.run([io.KICAD,'version'],check=True,capture_output=True,text=True).stdout.strip()
-    # The compared runs schedule the boards (a set without its `#slow` boards, D108); the human run is only their reference.
+    # The compared runs schedule the boards (a set without its `#slow` boards, D115); the human run is only their reference.
     names=sorted(set().union(*(set(roster(r)) for r in runs)))
     jobs=[(name,runs,reference,args.intents,version) for name in names]
     with ProcessPoolExecutor(max_workers=args.jobs) as pool:

@@ -1,4 +1,4 @@
-# modern-planes (doc 10 §4, D105): 16 open-hardware KiCad 7-10 boards, 4-8 copper layers, inner GND/power planes,
+# modern-planes (doc 10 §4, D112): 16 open-hardware KiCad 7-10 boards, 4-8 copper layers, inner GND/power planes,
 # real project net classes and custom rules. Sources, commits and licences: bench/sets/modern-planes.json.
 # Preparation: python3 bench/prepare_modern.py        (scripts/fetch_fixtures.sh modern)
 # Run: bench/run.py --set modern-planes --work 200000000 --jobs 4 --refill --route-args="--variants 1 --soft-zones --keep-vias-off-pads --diff-pairs"

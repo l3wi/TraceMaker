@@ -132,6 +132,11 @@ TEST_CASE("project rules retain KiCad 10 defaults key by key", "[rules][io]") {
   check_defaults(io::read_design_rules(f.pcb.string()));
   std::ofstream(pro) << R"({"board":{"design_settings":{"rules":{"min_clearance":0}}},"net_settings":{"classes":[{"name":"Default"}]}})";
   check_defaults(io::read_design_rules(f.pcb.string()));
+  CHECK(io::read_design_rules(f.pcb.string()).use_height_for_length);
+  std::ofstream(pro) << R"({"board":{"design_settings":{"rules":{"use_height_for_length_calcs":false}}}})";
+  const auto flat = io::read_design_rules(f.pcb.string());
+  check_defaults(flat);
+  CHECK_FALSE(flat.use_height_for_length);
   std::ofstream(pro) << R"({"board":{"design_settings":{"rules":{"min_track_width":0.12,"min_via_diameter":0,"min_hole_clearance":0.15}}},"net_settings":{"classes":[{"name":"Default","track_width":0.17}]}})";
   const auto custom = io::read_design_rules(f.pcb.string());
   CHECK(custom.minimums.track_width == 120'000);
@@ -1124,4 +1129,27 @@ TEST_CASE("net-tie bridges admit pad entry locally without merging nets", "[rule
   const auto checked = drc::run_drc(lb.board, rules);
   for (const auto& violation : checked.violations)
     CHECK((violation.type != "clearance" && violation.type != "shorting_items"));
+}
+
+TEST_CASE("constraint flags in brackets: within_diff_pairs is kept, anything else without a value is warned about", "[rules]") {
+  const std::string dru =
+      "(version 1)\n"
+      "(rule \"pair skew\" (constraint skew (max 0.1mm) (within_diff_pairs)))\n"
+      "(rule \"no value\" (constraint skew (max)))\n"
+      "(rule \"unknown flag\" (constraint length (min 10mm) (some_new_flag)))\n";
+  const Files f("flags", board_text(""), dru);
+  const auto rules = io::read_design_rules(f.pcb.string());
+  REQUIRE(rules.custom.size() == 3);
+  const auto& pair = rules.custom[0].constraints.front();
+  CHECK(pair.max == std::optional<Coord>(100'000));
+  CHECK(pair.items == std::vector<std::string>{"within_diff_pairs"});
+  CHECK_FALSE(rules.custom[1].constraints.front().max.has_value());
+  CHECK(rules.custom[1].constraints.front().items.empty());
+  CHECK(rules.custom[2].constraints.front().items.empty());
+  auto warned = [&](const std::string& text) {
+    return std::any_of(rules.warnings.begin(), rules.warnings.end(), [&](const std::string& w) { return w.find(text) != std::string::npos; });
+  };
+  CHECK_FALSE(warned("pair skew"));
+  CHECK(warned("rule 'no value': cannot read value of max"));
+  CHECK(warned("rule 'unknown flag': cannot read value of some_new_flag"));
 }

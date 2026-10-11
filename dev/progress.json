@@ -740,51 +740,51 @@
    "deliverables": "Pad-to-tree routing, net-tie and solder-jumper legality, a scriptable route contract (rule source, structured failures, exit codes, Python parity, per-net reroute)",
    "tasks": [
     {
-     "text": "Pad-to-tree routing, opt-in --tree-attach (mid 53.3 -> 55.6 %, 23 % fewer vias; quick mean equal, 4 boards -1/-2; D92, doc 05 \u00a740)",
+     "text": "Pad-to-tree routing, opt-in --tree-attach (mid 53.3 -> 55.6 %, 23 % fewer vias; quick mean equal, 4 boards -1/-2; D99, doc 05 \u00a741)",
      "done": true
     },
     {
-     "text": "Plane nets' pad-to-pad connections last: closed, dropped (planes 77.3 -> 75.9 %, reporting board -5; D92)",
+     "text": "Plane nets' pad-to-pad connections last: closed, dropped (planes 77.3 -> 75.9 %, reporting board -5; D99)",
      "done": true
     },
     {
-     "text": "Net-tie bridges and allow_soldermask_bridges jumpers as KiCad 10.0.6 judges them; custom-pad circle primitives (D93)",
+     "text": "Net-tie bridges and allow_soldermask_bridges jumpers as KiCad 10.0.6 judges them; custom-pad circle primitives (D100)",
      "done": true
     },
     {
-     "text": "Route contract: --project, rule sources and warnings in log/JSON, structured unrouted reasons, documented exit codes, Python args parity, --reroute-nets (D94)",
+     "text": "Route contract: --project, rule sources and warnings in log/JSON, structured unrouted reasons, documented exit codes, Python args parity, --reroute-nets (D101)",
      "done": true
     },
     {
-     "text": "Ground-plane regression tier: 14 raw PCBench boards retaining inner planes, plane/signal judge and copper breakdown, hard/soft/tree baselines at 3 M (D95)",
+     "text": "Ground-plane regression tier: 14 raw PCBench boards retaining inner planes, plane/signal judge and copper breakdown, hard/soft/tree baselines at 3 M (D102)",
      "done": true
     },
     {
-     "text": "Opt-in --protect-planes: >=60% clipped same-net outline union on inner layers; shared CLI/Python/plugin parser, logs/JSON, no tracks but vias still reach planes (D96, doc 05 \u00a741)",
+     "text": "Opt-in --protect-planes: >=60% clipped same-net outline union on inner layers; shared CLI/Python/plugin parser, logs/JSON, no tracks but vias still reach planes (D103, doc 05 \u00a742)",
      "done": true
     },
     {
-     "text": "Fix plane-search zero heuristic: mandatory via lower bound except with tree goals; OtterCast 76->257 protected and 259->294 off at 3 M; gndplane judged completion 75.6->78.0% protected, 76.5->77.0% off, DRC failures retained (D96)",
+     "text": "Fix plane-search zero heuristic: mandatory via lower bound except with tree goals; OtterCast 76->257 protected and 259->294 off at 3 M; gndplane judged completion 75.6->78.0% protected, 76.5->77.0% off, DRC failures retained (D103)",
      "done": true
     },
     {
-     "text": "Plane drops from a pad's island of existing copper with --tree-attach, not through routed copper or stale fills (D97, doc 05 \u00a742)",
+     "text": "Plane drops from a pad's island of existing copper with --tree-attach, not through routed copper or stale fills (D104, doc 05 \u00a743)",
      "done": true
     },
     {
-     "text": "Plane ties, opt-in --plane-tie: boxed-in plane pins end on copper already in the plane; with the plane-drop bound it helps ball arrays only (gndplane 77.0 -> 77.3 %, OtterCast +49; planes 84.3 -> 82.6 %; D98, doc 05 \u00a743)",
+     "text": "Plane ties, opt-in --plane-tie: boxed-in plane pins end on copper already in the plane; with the plane-drop bound it helps ball arrays only (gndplane 77.0 -> 77.3 %, OtterCast +49; planes 84.3 -> 82.6 %; D105, doc 05 \u00a744)",
      "done": true
     },
     {
-     "text": "Route reports why it stopped (complete/work/time/deadline/exhausted) and warns on a time-limit stop (D101)",
+     "text": "Route reports why it stopped (complete/work/time/deadline/exhausted) and warns on a time-limit stop (D108)",
      "done": true
     },
     {
-     "text": "KiCad 10 project-less/missing-key defaults (D100): synthetic judge regression; quick 30/30 identical; OtterCast track_width errors 60 -> 0, routed 259 -> 207 (correct minimum binds), gndplane 13/14 identical; f4fc's 45 existing items_not_allowed remain",
+     "text": "KiCad 10 project-less/missing-key defaults (D107): synthetic judge regression; quick 30/30 identical; OtterCast track_width errors 60 -> 0, routed 259 -> 207 (correct minimum binds), gndplane 13/14 identical; f4fc's 45 existing items_not_allowed remain",
      "done": true
     },
     {
-     "text": "Repeated-route KB safety: reporting-only history, no failed-first order or variant reselection; deterministic fixture-free integration regression; default quick 30/30 byte-identical (D99, doc 06 §4.1)",
+     "text": "Repeated-route KB safety: reporting-only history, no failed-first order or variant reselection; deterministic fixture-free integration regression; default quick 30/30 byte-identical (D106, doc 06 §4.1)",
      "done": true
     },
     {
@@ -800,15 +800,15 @@
      "done": false
     },
     {
-     "text": "Tree-attach losses: target-side reachability proof, distance bound to tree goals, no tree cells among one package's pins (D102): quick 90.6 %, mid 59.5 %, gndplane 81.3 % vs plain 89.2/53.3/77.0 %; LimeSDR 598 -> 753",
+     "text": "Tree-attach losses: target-side reachability proof, distance bound to tree goals, no tree cells among one package's pins (D109): quick 90.6 %, mid 59.5 %, gndplane 81.3 % vs plain 89.2/53.3/77.0 %; LimeSDR 598 -> 753",
      "done": true
     },
     {
-     "text": "Routing intent manifest (D103, doc 05 §44): rules --intent-draft, route --intent, skills/tracemaker-board-prep, bench/intent_quality.py; long decap paths quick 7/14 -> 2, mid 29/46 -> 18, planes 7/5 -> 2, gndplane 7/10 -> 5 (plain/tree -> intent); completion 89.8/58.6/85.8/81.7 % vs tree 90.6/59.5/83.7/82.2 %; opt-in",
+     "text": "Routing intent manifest (D110, doc 05 §45): rules --intent-draft, route --intent, skills/tracemaker-board-prep, bench/intent_quality.py; long decap paths quick 7/14 -> 2, mid 29/46 -> 18, planes 7/5 -> 2, gndplane 7/10 -> 5 (plain/tree -> intent); completion 89.8/58.6/85.8/81.7 % vs tree 90.6/59.5/83.7/82.2 %; opt-in",
      "done": true
     },
     {
-     "text": "KiCad 5 layerless zone fills read on the zone's layer (D104): 13/14 gndplane boards gain their planes; plain 77.0 -> 77.8 %, tree 81.3 -> 82.2 %; quick/mid/planes byte-identical",
+     "text": "KiCad 5 layerless zone fills read on the zone's layer (D111): 13/14 gndplane boards gain their planes; plain 77.0 -> 77.8 %, tree 81.3 -> 82.2 %; quick/mid/planes byte-identical",
      "done": true
     },
     {
@@ -816,7 +816,7 @@
      "done": true
     },
     {
-     "text": "modern-planes tier replaces gndplane (D105): 16 open-hardware KiCad 7-10 plane boards pinned by commit, 0 unconnected in their originals; 20 M router completion plain/tree/intent 77.8/80.1/79.6 %",
+     "text": "modern-planes tier replaces gndplane (D112): 16 open-hardware KiCad 7-10 plane boards pinned by commit, 0 unconnected in their originals; 20 M router completion plain/tree/intent 77.8/80.1/79.6 %",
      "done": true
     },
     {
@@ -824,28 +824,32 @@
      "done": false
     },
     {
-     "text": "Honest four-set inputs and saved refill/human benchmark path (D106): 65 fixtures, fixed zones/no-track vias retained, 4 PCBench copper-coverage warnings without dropping roster boards; standard off-pad/diff-pair protocol and quality work sweeps documented; deterministic missing/zero/duplicate design UUID repair prevents legacy-conversion keepout artifacts",
+     "text": "Honest four-set inputs and saved refill/human benchmark path (D113): 65 fixtures, fixed zones/no-track vias retained, 4 PCBench copper-coverage warnings without dropping roster boards; standard off-pad/diff-pair protocol and quality work sweeps documented; deterministic missing/zero/duplicate design UUID repair prevents legacy-conversion keepout artifacts",
      "done": true
     },
     {
-     "text": "Human-parity better-board scorecard (D107): independent electrical/DRC/manufacturing/thermal gates, eight separate quality categories, physical PCBench terminal matching, common-connected/service cohorts, macro/pooled grades, paired-board intervals and refill/self noise controls; eight deterministic measurement/cache regressions",
+     "text": "Human-parity better-board scorecard (D114): independent electrical/DRC/manufacturing/thermal gates, eight separate quality categories, physical PCBench terminal matching, common-connected/service cohorts, macro/pooled grades, paired-board intervals and refill/self noise controls; eight deterministic measurement/cache regressions",
      "done": true
     },
     {
-     "text": "One work budget per set (quick 100 M, mid and modern-planes 200 M), `#slow` boards (1,000+ connections) only with run.py --full, planes set retired (D108)",
+     "text": "One work budget per set (quick 100 M, mid and modern-planes 200 M), `#slow` boards (1,000+ connections) only with run.py --full, planes set retired (D115)",
      "done": true
     },
     {
-     "text": "Full D106 baseline before committing: human + P/T/R with --full on quick, mid, modern-planes, then bench/quality.py",
+     "text": "Full D113 baseline before committing: human + P/T/R with --full on quick, mid, modern-planes, then bench/quality.py",
      "done": false
     },
     {
-     "text": "Soft-zone pour connectivity: with pours restored, quick boards finish yet KiCad reports 34-40 GND items unconnected after refill (the router's tracks split the pour it counted as joined). A raster estimate + repair prototype (branch wip/router-fixes-premerge) gave quick T/100 M 34 -> 1 unconnected, 18 -> 29/30 clean; superseded by origin/main's exact engine refill (D85), to be verified after the merge",
-     "done": false
+     "text": "Soft-zone pour connectivity verified with origin/main's exact engine refill/repair (D85), without merging wip/router-fixes-premerge: merged quick T/100 M cuts KiCad unconnected 34 -> 2 and raises clean boards 18 -> 28/30; no added errors or worse board. Inkjet and swd-and-uart each retain one unconnected item, also counted by the engine. Results: bench/results/merged-quick-T",
+     "done": true
     },
     {
      "text": "Router quality gaps vs human (modern-planes, review 2026-10-11): diff-pair coupling (with --diff-pairs 45/84 pairs coupled; fine-pitch pair fan-in fails, survey and draft on wip/router-fixes-premerge), return vias at layer changes (1 mm parity 65 %; compare main's D92 stitching), supply widths 0.625x human (main's --widen-power), off-axis pad entry 32 % vs 21 %",
      "done": false
+    },
+    {
+     "text": "origin/main 0.9.0 merge (D116/D117): shared options preserve tree/planes/intent and TUI/config/buses/SRJ/passes; decision collisions renumbered to D99-D115. Metal build warning-free; full CTest 276 pass, 3 skip, 2 pre-existing KiCad 10.0.3 parity failures; 18 benchmark Python tests pass; quick and modern+intent protocol smoke routes execute",
+     "done": true
     }
    ]
   }

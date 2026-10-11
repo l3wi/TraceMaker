@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
-// Routing intent manifest (doc 05 §44, D103): the electrical intent the router must keep, as a reviewed file.
+// Routing intent manifest (doc 05 §45, D110): the electrical intent the router must keep, as a reviewed file.
 //
 // Deciding the intent (which capacitor decouples which pin, which nets must not branch) is board preparation:
 // `draft_intent` proposes it from the component rules (doc 15), a person or an LLM following

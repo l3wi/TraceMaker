@@ -118,7 +118,7 @@ failure record (`ECO_REJECTED`) keyed by the cut signature, so the same move is 
 SQLite file (WAL mode) at `~/.local/share/tracemaker/kb.sqlite`, enabled by default; `--kb FILE` selects a
 private file and `--no-kb` disables both reads and writes. The implemented tables are `runs`,
 `variant_stats` (plays/wins per feature bucket) and `failed_connections` (historical counts per exact board
-content hash). They support reporting and offline analysis, **not routing decisions** (D99). The broader
+content hash). They support reporting and offline analysis, **not routing decisions** (D106). The broader
 tables below remain design targets, not claims about the current schema.
 
 | Table | Key | Content | Used for |
@@ -138,7 +138,7 @@ tables below remain design targets, not claims about the current schema.
   ordering arm in the bandit, never as the only one. (Prior art: DreamerV3+FR and PCBWorld show RL over
   ordering decisions can lift completion; TraceMaker keeps it optional and benchmark-gated.)
 
-### 4.1 Repeat-run safety (D99)
+### 4.1 Repeat-run safety (D106)
 
 The KB never changes connection order, the requested portfolio arms, or routing budgets. Given the same
 board bytes, rules, options and seed, fixed-work runs produce the same copper and work counts with a fresh,
@@ -231,6 +231,6 @@ contribution, and their benefit must be shown by ablation in the benchmark (road
 | T1 | Activity ordering: failed connections retried hardest (most failures) first | Done | `run` |
 | T2 | Nogoods: (connection, mode, signature of routed copper in the window) attempts that failed are not repeated until the surroundings change | Done | `search_and_commit` |
 | T2 | Strategy selection: portfolio of 8 router variants in parallel threads, best kept | Done | `route_portfolio` |
-| T3 | Persistent SQLite run/variant statistics and per-board historical unrouted counts; reporting only, no ordering or portfolio selection (D99) | Done | `learn/knowledge_base.cpp`, `tracemaker route --kb`; `kb_repeat` integration regression |
+| T3 | Persistent SQLite run/variant statistics and per-board historical unrouted counts; reporting only, no ordering or portfolio selection (D106) | Done | `learn/knowledge_base.cpp`, `tracemaker route --kb`; `kb_repeat` integration regression |
 | T3 | Learned models (congestion predictor, ordering policy) | Not started | |
 | — | Conflict graph between nets, precedence learning, Luby restarts | Not started | |

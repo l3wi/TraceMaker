@@ -61,6 +61,57 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual((root / 'run/boards/board.kicad_pcb').read_text(), 'original human')
             self.assertEqual((root / 'run/boards/board.kicad_dru').read_text(), 'human rules')
 
+    def test_routing_keeps_measurements_intent_and_saved_judge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            fixtures = root / 'fixtures'
+            fixture = fixtures / 'board'
+            fixture.mkdir(parents=True)
+            (fixture / 'unrouted.kicad_pcb').write_text('input')
+            (fixture / 'routed.kicad_pcb').write_text('human')
+            intents = root / 'intents'
+            intents.mkdir()
+            manifest = intents / 'board.intent.json'
+            manifest.write_text('{}')
+            report = {
+                'routed': 5, 'connections': 5, 'tracks': 3, 'vias': 1, 'seconds': 9,
+                'variant_seconds': 2, 'variants': [{'variant': 0, 'seconds': 2}],
+                'expansions': 100, 'work': {'setup': {'expansions': 10}},
+                'work_all_variants': {'setup': {'expansions': 20}}, 'stop': 'complete',
+                'style': {'connections': 5}, 'widen': {'widened': 1}, 'stitch': {'added': 1},
+            }
+            before = {'errors': {}, 'routed_errors': {}, 'unconnected': 5}
+            after = {'errors': {}, 'routed_errors': {}, 'unconnected': 0}
+            def route(cmd, timeout):
+                self.assertEqual(cmd[cmd.index('--intent') + 1], str(manifest))
+                self.assertEqual(cmd[cmd.index('--work') + 1], '100')
+                self.assertIn('--no-kb', cmd)
+                output = pathlib.Path(cmd[cmd.index('-o') + 1])
+                output.write_text('routed')
+                pathlib.Path(cmd[cmd.index('--json') + 1]).write_text(json.dumps(report))
+                return 0, '', '', 12.5
+            def judge(path, **kwargs):
+                if kwargs.get('saved') is not None:
+                    kwargs['saved'].write_text('refilled')
+                return before if path.name == 'unrouted.kicad_pcb' else after
+            with patch.object(harness, 'SRC_FIX', fixtures), patch.object(harness, 'HUMAN', False), \
+                    patch.object(harness, 'REFILL', True), patch.object(harness, 'PLACE_MODE', None), \
+                    patch.object(harness, 'INTENTS', intents), patch.object(harness, 'WORK', 100), \
+                    patch.object(harness, 'plane_nets', return_value=None), \
+                    patch.object(harness, 'dead_pins', return_value=0), \
+                    patch.object(harness, 'run_measured', side_effect=route) as measured, \
+                    patch.object(harness, 'style_of', return_value={'connections': 5}) as reference, \
+                    patch.object(harness, 'drc', side_effect=judge):
+                row = harness.run_board('board', root / 'run', 1)
+            self.assertTrue(row['clean'])
+            self.assertEqual(row['cpu_s'], 12.5)
+            self.assertEqual(row['intent'], str(manifest))
+            self.assertEqual(row['refilled_board'], 'boards/board.refilled.kicad_pcb')
+            for key, value in report.items():
+                self.assertEqual(row[key], value)
+            measured.assert_called_once()
+            self.assertEqual(reference.call_args.args[0], fixture / 'routed.kicad_pcb')
+
 
 if __name__ == '__main__':
     unittest.main()

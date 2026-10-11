@@ -63,4 +63,8 @@ model::NetId net_tie_allowed_net(const CopperModel& copper, const geom::Shape& p
 model::NetId net_tie_net_at(const CopperModel& copper, int footprint, geom::Point point, int layer,
                           Coord epsilon = 500, model::NetId requested_net = 0);
 
+// Closed loops chained from Edge.Cuts pieces whose ends meet within `tol`; pieces that close no loop are dropped
+// (`all_closed`, if given, tells whether any was).
+std::vector<std::vector<model::Point>> edge_loops(const std::vector<geom::Shape>& edges, Coord tol = 2'000, bool* all_closed = nullptr);
+
 }  // namespace tmk::drc

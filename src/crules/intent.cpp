@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Routing intent manifest (doc 05 §44, D103): reading, resolving against a board, and the component-rule draft.
+// Routing intent manifest (doc 05 §45, D110): reading, resolving against a board, and the component-rule draft.
 #include "crules/intent.hpp"
 
 #include <algorithm>

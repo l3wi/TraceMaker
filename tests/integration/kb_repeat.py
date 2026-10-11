@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Persistent history must not change a budgeted route or its portfolio (D99).
+"""Persistent history must not change a budgeted route or its portfolio (D106).
 
 Ten short connections precede one expensive connection on a fixture-free board. The budget fits the ten short
-ones (16 work units each at the 0.065 mm pitch of KiCad's default 0.2 mm class, D100) but not the long one. With the
+ones (16 work units each at the 0.065 mm pitch of KiCad's default 0.2 mm class, D107) but not the long one. With the
 pitch of the old 0.25 mm default, at 240 work units the old failed-first policy routed 10, then only 1, then 10.
 Also check historical variant wins cannot replace a configured portfolio, and
 that editing the input changes its history key even when its filename is unchanged.

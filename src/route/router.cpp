@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "route/router.hpp"
+#include "route/bus.hpp"
 #include "route/diff_pair.hpp"
 #include "route/escape.hpp"
 #include "route/escape_flow.hpp"
@@ -86,6 +87,7 @@ struct Router::Impl {
     int rips = 0, fails = 0;
     std::string why;                 // last failure explanation
     bool coupled = false;            // routed as half of a differential pair: clean-up leaves it alone
+    bool bus_lane = false;           // routed as a lane of its bus (leads its bundle or followed a lane): via clean-up leaves it alone
     // Boxed in even by a negotiated search, which may cross every other net's routed copper: only fixed copper
     // encloses the pin (M9). Retrying it in later passes and restarts only spends budget others could use.
     bool dead = false;
@@ -98,7 +100,7 @@ struct Router::Impl {
   };
   std::vector<ConnState> cs;
   std::set<NetId> first_net_ids;  // --first-nets
-  // Routing intent (doc 05 §44), by net: pad pairs and plane pads (in manifest order), and no-branch nets.
+  // Routing intent (doc 05 §45), by net: pad pairs and plane pads (in manifest order), and no-branch nets.
   std::map<NetId, std::vector<std::pair<int, int>>> intent_pairs;
   std::map<NetId, std::vector<int>> intent_plane;
   std::set<NetId> no_branch_ids;
@@ -146,12 +148,12 @@ struct Router::Impl {
   }
 
   double elapsed() const { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
-  // Out of budget? The work budget (search expansions) is deterministic; wall time is only a safety net. Which limit
-  // was hit first is kept for the result (RouteResult::stop): a time stop makes the output machine-dependent.
+  // Work is deterministic; wall time is a safety net. Reserve a share for polish without losing the final stop reason.
+  double budget_scale = 1.0;
   bool out_of_budget() const {
     if (opt.deadline && res.routed < res.connections && elapsed() > opt.deadline->load(std::memory_order_relaxed)) return stop_hit("deadline");
-    if (opt.work_budget > 0 && res.expansions >= opt.work_budget) return stop_hit("work");
-    if (elapsed() > opt.time_limit_s) return stop_hit("time");
+    if (opt.work_budget > 0 && static_cast<double>(res.expansions) >= static_cast<double>(opt.work_budget) * budget_scale) return stop_hit("work");
+    if (elapsed() > opt.time_limit_s * budget_scale) return stop_hit("time");
     return false;
   }
   bool stop_hit(const char* limit) const {
@@ -159,6 +161,9 @@ struct Router::Impl {
     return true;
   }
   mutable const char* stopped_by = nullptr;  // first limit out_of_budget reported
+  // Work profile (D88): the phase now running and its counters.
+  WorkPhase phase = WorkPhase::Setup;
+  WorkCounts& wc() { return res.work.phase[static_cast<std::size_t>(phase)]; }
   void emit(const std::string& s) {
     if (opt.sink) opt.sink->publish(s);
   }
@@ -478,7 +483,31 @@ struct Router::Impl {
         upd(nxt);
       }
     }
-    if (opt.order == 1) {
+    if (opt.order == 3) {
+      // Deep pins of dense packages first (doc 16): a ball in the third ring needs the channels that outer balls'
+      // escapes would otherwise take. Depth = distance of the pad centre to the edge of its footprint's pad cloud,
+      // in 1/4 pitches of the footprint's pads, so balls of one ring tie and then go shortest first.
+      std::map<int, geom::Box> cloud;
+      std::map<int, int> count;
+      for (const auto& pd : b.pads) {
+        if (pd.footprint < 0) continue;
+        cloud[pd.footprint].add(pd.pos);
+        ++count[pd.footprint];
+      }
+      auto depth = [&](int pad) -> Coord {
+        if (pad < 0) return 0;
+        const auto& pd = b.pads[static_cast<std::size_t>(pad)];
+        if (pd.footprint < 0 || count[pd.footprint] < 8) return 0;
+        const auto& bx = cloud[pd.footprint];
+        return std::min({pd.pos.x - bx.x0, bx.x1 - pd.pos.x, pd.pos.y - bx.y0, bx.y1 - pd.pos.y});
+      };
+      const Coord q = std::max<Coord>(pitch, 1) * 10;  // ring quantum: ball pitch is ~20 lattice steps
+      std::stable_sort(out.begin(), out.end(), [&](const Connection& a, const Connection& c) {
+        const Coord da = std::max(depth(a.pad_a), depth(a.pad_b)) / q, dc = std::max(depth(c.pad_a), depth(c.pad_b)) / q;
+        if (da != dc) return da > dc;
+        return a.length < c.length;
+      });
+    } else if (opt.order == 1) {
       std::stable_sort(out.begin(), out.end(), [](const Connection& a, const Connection& c) { return a.length > c.length; });
     } else if (opt.order == 2) {
       // Shortest first with seeded jitter (up to 2x length), for portfolio diversity.
@@ -497,10 +526,11 @@ struct Router::Impl {
       if (no_branch_ids.count(c.net)) c.exact = true;
     if (!first_net_ids.empty())
       std::stable_partition(out.begin(), out.end(), [&](const Connection& c) { return first_net_ids.count(c.net) > 0; });
+    if (!opt.buses.empty()) order_buses(out);
     return out;
   }
 
-  // Routing intent (doc 05 §44) for one net, before its spanning tree. Decided on the clusters of fixed copper: each
+  // Routing intent (doc 05 §45) for one net, before its spanning tree. Decided on the clusters of fixed copper: each
   // intent pad pair in different clusters becomes a pad-to-pad connection, and each plane pad whose cluster has no
   // plane fill a connection into the nearest plane fill it can reach (ties: lower copper item). Both are exact and
   // must_route (they are obligations, not links: a pad pair joined through the plane still gets its track). The
@@ -651,7 +681,7 @@ struct Router::Impl {
   std::int64_t hist_cost(int layer, int gx, int gy) const {
     if (history.empty()) return 0;
     const auto it = history.find(cell_key(layer, gx, gy));
-    return it == history.end() ? 0 : static_cast<std::int64_t>(it->second) * pitch * 2;
+    return it == history.end() ? 0 : static_cast<std::int64_t>(static_cast<double>(it->second) * static_cast<double>(pitch) * opt.history_weight);
   }
   // Consecutive per-cell lookups usually use the same net and width.
   NetId cc_net = -1;
@@ -678,10 +708,16 @@ struct Router::Impl {
   // Blocked by fixed copper (or a positional disallow rule) alone (legal without the lattice margin otherwise)?
   bool fixed_point_blocked(int layer, int gx, int gy, NetId net, Coord hw) {
     const Point p = at(gx, gy);
-    if (!use_cache) return obs->disk_state(p, layer, hw, net, 0, true) == 2;
+    if (!use_cache) {
+      ++wc().fixed_checks;
+      return obs->disk_state(p, layer, hw, net, 0, true) == 2;
+    }
     auto& cc = cache_for(net);
     const std::size_t gi = (static_cast<std::size_t>(layer) * static_cast<std::size_t>(ny) + static_cast<std::size_t>(gy)) * static_cast<std::size_t>(nx) + static_cast<std::size_t>(gx);
-    if (cc.tight[gi] == INT32_MIN) cc.tight[gi] = obs->fixed_code(p, layer, hw, 0, cc.rep);
+    if (cc.tight[gi] == INT32_MIN) {
+      cc.tight[gi] = obs->fixed_code(p, layer, hw, 0, cc.rep);
+      ++wc().fixed_checks;
+    }
     return !code_ok(cc.tight[gi], net) || rule_state(p, layer, hw, 0, net) == 2;
   }
 
@@ -708,16 +744,23 @@ struct Router::Impl {
     const int rs = rule_state(p, layer, hw, margin, net);
     if (rs == 2) return 2;
     if (!use_cache) {
+      ++wc().fixed_checks;
       int st = rs == 3 ? 2 : obs->disk_state(p, layer, hw, net, margin, soft);
       if (st == 2 && obs->disk_state(p, layer, hw, net, 0, soft) != 2) st = 3;
       return st;
     }
     auto& cc = cache_for(net);
     const std::size_t gi = (static_cast<std::size_t>(layer) * static_cast<std::size_t>(ny) + static_cast<std::size_t>(gy)) * static_cast<std::size_t>(nx) + static_cast<std::size_t>(gx);
-    if (cc.margin[gi] == INT32_MIN) cc.margin[gi] = obs->fixed_code(p, layer, hw, margin, cc.rep);
+    if (cc.margin[gi] == INT32_MIN) {
+      cc.margin[gi] = obs->fixed_code(p, layer, hw, margin, cc.rep);
+      ++wc().fixed_checks;
+    }
     int st = 0;
     if (!code_ok(cc.margin[gi], net) || rs == 3) {
-      if (cc.tight[gi] == INT32_MIN) cc.tight[gi] = obs->fixed_code(p, layer, hw, 0, cc.rep);
+      if (cc.tight[gi] == INT32_MIN) {
+        cc.tight[gi] = obs->fixed_code(p, layer, hw, 0, cc.rep);
+        ++wc().fixed_checks;
+      }
       if (!code_ok(cc.tight[gi], net)) return 2;
       st = 3;
     }
@@ -736,6 +779,7 @@ struct Router::Impl {
       cstamp[idx] = gen;
       const std::int64_t key = cell_key(layer, gx, gy);
       ++obs->checks;
+      ++wc().cell_checks;
       cell_state[idx] = static_cast<std::uint8_t>(learned_block.count({block_owner(net), key}) ? 2 : point_state(layer, gx, gy, net, hw));
       cell_hist[idx] = cell_state[idx] == 2 ? 0 : hist_cost(layer, gx, gy);  // history only changes between searches
     }
@@ -744,6 +788,23 @@ struct Router::Impl {
     const std::int64_t rc = reserved_cost(layer, gx, gy, net);
     if (rc < 0) return -1;
     std::int64_t hc = cell_hist[idx] + rc;
+    if (bus_mode != 0 && !bus_guide[lat_index(layer, gx, gy)]) {  // bus lane: off the neighbour lane's guide (doc 05 §38)
+      if (bus_mode == 2) return -1;
+      hc += bus_pen;
+    }
+    if (pkg_on) {  // inside a ball-grid package, tracks on its pad layer cost more: escapes take a dog-bone via early (doc 16 F3)
+      const Point p = at(gx, gy);
+      for (const auto& bx : pkg_boxes)
+        if (layer == bx.layer && p.x >= bx.box.x0 && p.x <= bx.box.x1 && p.y >= bx.box.y0 && p.y <= bx.box.y1) {
+          hc += pkg_pen;
+          break;
+        }
+    }
+    if (lp_on && layer != lp_layer) hc += lp_pen;  // layer assignment: tracks off the preferred layer (doc 16 F2)
+    if (gd_on && !gd_mask[lat_index(layer, gx, gy)]) {  // preferred path of the connection (doc 16 F1)
+      if (gd_hard) return -1;
+      hc += gd_pen;
+    }
     if (corr || cong_pen > 0) {
       const Point p = at(gx, gy);
       const int tx = std::clamp(global.tile_of_x(p.x), 0, global.tiles_x - 1), ty = std::clamp(global.tile_of_y(p.y), 0, global.tiles_y - 1);
@@ -759,7 +820,7 @@ struct Router::Impl {
         hc += (global.util[ti] - opt.global_congestion_from) * cong_pen;
     }
     if (!sibling.empty() && sibling.count(cell_key(layer, gx, gy))) hc += sibling_pen;
-    if (st == 1) return static_cast<std::int64_t>(opt.soft_cost_mm * 1e6) + hc * 4;
+    if (st == 1) return soft_unit + hc * 4;
     if (st == 3) return 3 * pitch + hc;
     return hc;
   }
@@ -773,11 +834,15 @@ struct Router::Impl {
       const Coord margin = pitch * 71 / 100 + 1;
       int st;
       if (!use_cache) {
+        ++wc().fixed_checks;
         st = obs->via_state(p, d, drill, net, margin, soft);
       } else {
         auto& cc = cache_for(net);
         const std::size_t gi = static_cast<std::size_t>(gy) * static_cast<std::size_t>(nx) + static_cast<std::size_t>(gx);
-        if (cc.via[gi] == INT32_MIN) cc.via[gi] = obs->fixed_via_code(p, d, drill, margin, cc.rep);
+        if (cc.via[gi] == INT32_MIN) {
+          cc.via[gi] = obs->fixed_via_code(p, d, drill, margin, cc.rep);
+          ++wc().fixed_checks;
+        }
         // Positional rules are judged on the via itself (vias sit exactly on lattice points), as via_state does.
         st = code_ok(cc.via[gi], net) && !obs->via_disallowed(p, d, net, 0, nl - 1, model::ViaType::Through) ? 0 : 2;
         if (st != 2) {
@@ -798,7 +863,7 @@ struct Router::Impl {
       if (rc < 0) return -1;
       extra = std::max(extra, rc);
     }
-    return extra + (via_state[idx] == 1 ? static_cast<std::int64_t>(opt.soft_cost_mm * 1e6) : 0);
+    return extra + (via_state[idx] == 1 ? soft_unit : 0);
   }
 
   // Lattice cells of the window inside a pad's copper on each of its layers (falls back to cells next to the
@@ -937,7 +1002,7 @@ struct Router::Impl {
 
   struct PathNode { int layer, gx, gy; };
 
-  // ---- pad-to-tree routing (doc 05 §40) ----
+  // ---- pad-to-tree routing (doc 05 §41) ----
   // Connectivity of one net's copper as it stands. Nodes are initial copper clusters (init_root values, >= 0) and
   // routed connections (node_of_owner, <= -2). A route joins what its two ends physically touch -- with tree
   // routing that may be another route's copper rather than its planned pads -- and, with soft zones, the plane
@@ -973,7 +1038,7 @@ struct Router::Impl {
     return u;
   }
   // Coupled pairs keep their own geometry rules: they neither branch nor get branched from. Intent connections
-  // (doc 05 §44) end on their own pads or plane only.
+  // (doc 05 §45) end on their own pads or plane only.
   bool tree_ok() const {
     if (current < 0) return true;
     if (cs[static_cast<std::size_t>(current)].c.exact) return false;
@@ -1074,6 +1139,8 @@ struct Router::Impl {
           for (int l = 0; l < nl; ++l) {
             if (!(it.layers & model::layer_bit(l)) || !layer_ok(net, l)) continue;
             const std::int64_t key = cell_key(l, gx, gy);
+            // Tree endpoints must obey the same hard guide as planar steps, including zero-cost search seeds.
+            if ((bus_mode == 2 && !bus_guide[lat_index(l, gx, gy)]) || (gd_hard && !gd_mask[lat_index(l, gx, gy)])) continue;
             if (seen.count(key) || point_state(l, gx, gy, net, hw) == 2) continue;
             const std::size_t mi = static_cast<std::size_t>(l) * cells + static_cast<std::size_t>(ci);
             if (mark && (*mark)[mi] == 1) continue;
@@ -1161,6 +1228,8 @@ struct Router::Impl {
       ++field_cpu_runs;
     }
     field_ok = true;
+    ++wc().fields;
+    wc().field_cells += static_cast<long>(cells) * nl;
     field_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0f).count();
   }
 
@@ -1220,12 +1289,12 @@ struct Router::Impl {
       const auto it = target_extra.find(i);
       return it == target_extra.end() ? 0 : it->second;
     };
-    // Pad-to-tree routing (doc 05 §40): the copper already joined to either end is a start or a goal too, so the
+    // Pad-to-tree routing (doc 05 §41): the copper already joined to either end is a start or a goal too, so the
     // connection branches off its net's tree instead of running back to the planned pad. A connection into a plane
-    // starts anywhere on the pad's island (§42: hand-routed GND tracks tying pads together; the via drops where
+    // starts anywhere on the pad's island (§43: hand-routed GND tracks tying pads together; the via drops where
     // there is room, not at the planned pad). Not on copper joined to it by routing (such a start holds only while
     // those routes stay: `planes` RoyalBlue54L-Feather lost 8 connections) or by a stale fill (pad_island).
-    // Plane ties (§43): copper already joined to the plane is a goal of a plane connection too.
+    // Plane ties (§44): copper already joined to the plane is a goal of a plane connection too.
     tree_start.clear();
     tree_end.clear();
     if (tree_ok()) {
@@ -1343,6 +1412,8 @@ struct Router::Impl {
       }
       const long visited = static_cast<long>(reach_q.size());
       res.expansions += visited;  // counted as work so --work budgets stay deterministic
+      wc().flood_cells += visited;
+      ++wc().searches;
       reach_visits += visited;
       ++reach_checks;
       if (!found && reach_q.size() <= cap) {
@@ -1366,6 +1437,7 @@ struct Router::Impl {
     }
     const std::int64_t step = pitch, diag = static_cast<std::int64_t>(std::llround(static_cast<double>(pitch) * std::numbers::sqrt2));
     const std::int64_t via_cost = static_cast<std::int64_t>(opt.via_cost_mm * via_cost_mult * 1e6);
+    const std::int64_t dir_pen = static_cast<std::int64_t>(auto_dir_pen * static_cast<double>(pitch));
     // Cost-to-go field (GPU) for large windows: exact distances to the targets through cells not known to be
     // blocked by fixed copper; a lower bound on the true cost, so A* stays optimal while expanding far less.
     const bool use_field = !zone_target && opt.field_heuristic && use_cache && !fields_off &&
@@ -1497,6 +1569,7 @@ struct Router::Impl {
           extra = textra(static_cast<std::size_t>(l) * cells + static_cast<std::size_t>(nci));
         }
         std::int64_t cost = on_layer((d & 1) ? diag : step, l) + extra;
+        if (dir_pen > 0 && !(d & 1) && ((d == 0 || d == 4) != ((l % 2 == 0) != opt.layer_dir_swap))) cost += dir_pen;  // against the layer's preferred direction (doc 16)
         if (dir != kNoDir && d != dir) cost += ((std::min((d - dir + 8) % 8, (dir - d + 8) % 8) == 1) ? step / 2 : 2 * step);
         const std::size_t ns = sidx(l, nci, d);
         if ((sn[ns].tag & kGenMask) == gen && sn[ns].g <= gs + cost) continue;
@@ -1531,7 +1604,7 @@ struct Router::Impl {
           if (vs == 2 && blind_for(net)) vs = obs->via_state_span(vp, vd, vdrill, net, vm, soft, nullptr, std::min(l, l2), std::max(l, l2));
           if (vs == 2) continue;
           const std::size_t ns = sidx(l2, ci, kNoDir);
-          const std::int64_t ng = gs + via_cost * 3 / 2 + (vs == 1 ? static_cast<std::int64_t>(opt.soft_cost_mm * 1e6) : 0) +
+          const std::int64_t ng = gs + via_cost * 3 / 2 + (vs == 1 ? soft_unit : 0) +
                                   textra(static_cast<std::size_t>(l2) * cells + static_cast<std::size_t>(ci));
           if ((sn[ns].tag & kGenMask) == gen && sn[ns].g <= ng) continue;
           const std::int64_t hn = h(l2, w.x0 + cx, w.y0 + cy);
@@ -1557,6 +1630,8 @@ struct Router::Impl {
     if (reach_said_no && goal != SIZE_MAX) ++reach_mismatch;
     if (reach_said_no) reach_reference_expansions += expanded;
     res.expansions += expanded;
+    wc().expansions += expanded;
+    ++wc().searches;
     (goal == SIZE_MAX ? exp_fail : exp_ok) += expanded;
     if (goal == SIZE_MAX) (soft ? (corr_hard ? xf_soft_conf : xf_soft_wide) : (corr_hard ? xf_strict_conf : xf_strict_wide)) += expanded;
     (goal == SIZE_MAX ? n_fail : n_ok) += 1;
@@ -1598,6 +1673,7 @@ struct Router::Impl {
   // learns blocked cells) when the exact check fails.
   bool commit(const Connection& c, const std::vector<PathNode>& path) {
     const NetId net = c.net;
+    ++wc().commits;
     const Coord width = track_width(net);
     const Coord vd = via_diameter(net);
     const Coord vdrill = via_drill(net);
@@ -1727,6 +1803,16 @@ struct Router::Impl {
         commit_why = "would rip a --first-nets connection";
         return false;
       }
+    if (!net_bus.empty() && !bus_net(net))  // a bus is ripped by its own kind only (doc 05 §38)
+      for (int v : victims)
+        if (bus_net(cs[static_cast<std::size_t>(v)].c.net)) {
+          commit_why = "would rip a bus connection";
+          return false;
+        }
+    if (opt.max_victims > 0 && static_cast<int>(victims.size()) > opt.max_victims) {
+      commit_why = "would rip too many connections at once";
+      return false;
+    }
     for (int v : victims)
       if (cs[static_cast<std::size_t>(v)].rips >= rip_cap) {
         commit_why = "would rip a connection already ripped too often";
@@ -1848,8 +1934,10 @@ struct Router::Impl {
     st.routed = false;
     const bool was_coupled = st.coupled;
     st.coupled = false;
+    st.bus_lane = false;
     if (!cascade) ++st.rips;
     ++res.rips;
+    ++wc().rips;
     pending.push_back(v);
     if (was_coupled && !pair_partner.empty()) {  // the other half goes too: the pair is re-routed coupled or not at all
       const int p = pair_partner[static_cast<std::size_t>(v)];
@@ -1908,7 +1996,7 @@ struct Router::Impl {
   // Pad-to-tree routing: start and goal cells on tree copper of the last search -> connectivity node of the copper.
   std::unordered_map<std::int64_t, int> tree_start, tree_end;
   std::vector<std::int64_t> goal_dist;  // per window cell: octile distance to the nearest goal (tree searches only)
-  // Routing intent (doc 05 §44): lattice cells where a track of the current connection of a no-branch net would
+  // Routing intent (doc 05 §45): lattice cells where a track of the current connection of a no-branch net would
   // touch track or via copper of its net other than its own (fixed copper, other connections' routes). Entering one
   // costs sibling_pen per step, so the net's routes meet at pads instead of sharing copper and splitting off it (a
   // branch). A cost, not a block: a pad reachable only along such copper still gets routed.
@@ -1951,7 +2039,7 @@ struct Router::Impl {
     wb.add(pb0);
     wb = wb.inflated(6'000'000 + c.length / 4);
     const std::uint64_t ng = splitmix64(window_signature(wb) ^ (static_cast<std::uint64_t>(current) << 3) ^ (soft_mode ? 1u : 0u) ^
-                                        (force_escapes ? 2u : 0u) ^ (static_cast<std::uint64_t>(width_override) << 20));
+                                        (force_escapes ? 2u : 0u) ^ (static_cast<std::uint64_t>(width_override) << 20) ^ (!conn_guide.empty() && current >= 0 && conn_guide[static_cast<std::size_t>(current)] >= 0 ? 4u : 0u));
     if (!bypass_nogoods && nogoods.count(ng)) {
       ++nogood_skips;
       why = "skipped: identical earlier attempt failed (nogood)";
@@ -1963,7 +2051,38 @@ struct Router::Impl {
     }
     corr = (opt.global_route && !global.corridor.empty() && current >= 0 && static_cast<std::size_t>(current) < global.corridor.size()) ? &global.corridor[static_cast<std::size_t>(current)] : nullptr;
     collect_siblings(c);
-    const bool ok = search_and_commit_inner(c);
+    const int gi = (current >= 0 && static_cast<std::size_t>(current) < conn_guide.size()) ? conn_guide[static_cast<std::size_t>(current)] : -1;
+    if (!conn_lpref.empty() && current >= 0 && static_cast<std::size_t>(current) < conn_lpref.size() && conn_lpref[static_cast<std::size_t>(current)] >= 0) {
+      lp_on = true;
+      lp_layer = conn_lpref[static_cast<std::size_t>(current)];
+      lp_pen = static_cast<std::int64_t>(opt.layer_assign_pen * static_cast<double>(pitch));
+    }
+    bool ok = false;
+    if (gi >= 0 && bus_mode == 0) {
+      guide_set(gi);
+      // First a search inside the guide, cut off at a few expansions per cell (as a bus lane's, doc 05 §38): a guide
+      // that leads somewhere is followed at once, one that does not costs little. Then the usual searches with the
+      // guide as a mild preference.
+      Window w;
+      w.x0 = std::clamp(to_ix(gd_box.x0) - 1, 0, nx - 1);
+      w.y0 = std::clamp(to_iy(gd_box.y0) - 1, 0, ny - 1);
+      w.w = std::clamp(to_ix(gd_box.x1) + 1, 0, nx - 1) - w.x0 + 1;
+      w.h = std::clamp(to_iy(gd_box.y1) + 1, 0, ny - 1) - w.y0 + 1;
+      gd_hard = true;
+      expansion_cap = std::max<long>(50'000, 4 * static_cast<long>(gd_cells.size()) / std::max(1, nl));
+      std::vector<PathNode> gpath;
+      const bool found = !out_of_budget() && search(c, w, gpath);
+      expansion_cap = 0;
+      gd_hard = false;
+      last_miss = Miss::None;
+      if (found && commit(c, gpath)) ok = true;
+      if (std::getenv("TM_DEBUG_GUIDE"))
+        std::fprintf(stderr, "guide conn %d (net %d): cells %zu cap-found %d committed %d%s\n", current, static_cast<int>(c.net), gd_cells.size(), found ? 1 : 0, ok ? 1 : 0, soft ? " soft" : "");
+      gd_pen = static_cast<std::int64_t>(opt.guide_pen * static_cast<double>(pitch));
+    }
+    if (!ok) ok = search_and_commit_inner(c);
+    lp_on = false;
+    if (gd_on) guide_clear();
     corr = nullptr;
     sibling.clear();
     if (!ok && !bypass_nogoods) nogoods[ng] = 1;
@@ -2061,7 +2180,7 @@ struct Router::Impl {
   }
 
   // Are the connection's pads already joined through fixed copper and other routed connections of its net? Intent
-  // obligations (must_route, doc 05 §44) count fixed copper only: other routes joining their ends do not satisfy them.
+  // obligations (must_route, doc 05 §45) count fixed copper only: other routes joining their ends do not satisfy them.
   bool joined(int ci) {
     const auto& c = cs[static_cast<std::size_t>(ci)].c;
     const int ra = pad_root(c.pad_a), rb = end_root(c);
@@ -2504,6 +2623,7 @@ struct Router::Impl {
       const long now = expanded + leg_checks;
       res.expansions += now - charged;
       res.pair_work += now - charged;
+      wc().expansions += now - charged;
       charged = now;
     };
     // Legs of a candidate: start legs arrive along the pair's direction; end legs leave along it (built pad -> X
@@ -2958,6 +3078,570 @@ struct Router::Impl {
     return done;
   }
 
+  // ---------------------------------------------------------------------------------------------------
+  // Buses (doc 05 §38): the connections of a group between the same two components form a bundle and are routed
+  // lane by lane in the order of their pins. The first lane routed leads; every later one is searched inside a
+  // guide around the nearest lane already routed (same layers along its tracks, any layer around its vias and the
+  // lane's own pads), so it changes layer where its neighbour did. A lane that cannot be routed that way is routed
+  // like any other connection, with the guide as a preference only, and counts as a lane if it still came out on
+  // the neighbour's layers with the same vias; otherwise it has left the bus.
+  // ---------------------------------------------------------------------------------------------------
+  std::vector<int> net_bus;  // net -> index in opt.buses, -1 none; empty when there are no buses
+  bool bus_net(NetId n) const { return static_cast<std::size_t>(n) < net_bus.size() && net_bus[static_cast<std::size_t>(n)] >= 0; }
+  struct Bundle {
+    int bus = -1;
+    std::vector<int> conns;  // lane order
+  };
+  std::vector<Bundle> bundles;
+  std::vector<int> conn_bundle, conn_lane;   // per connection; -1 outside every bundle. Empty when there are no bundles
+  // Layer assignment (doc 16 F2; Ozdal and Wong, TCAD 2006, layer-by-layer assignment of crossing nets): the
+  // straight chords between a connection's pads that cross are the escapes that must swap sides, and on one layer
+  // they cannot. Each connection gets the layer that leaves the fewest crossings on its layer (a greedy start and
+  // single flips until none improves, deterministic); tracks off that layer cost lp_pen per lattice step.
+  std::int64_t soft_unit = 0;  // cost of crossing another net's copper: opt.soft_cost_mm, growing with the pass (PathFinder's present-sharing factor)
+  struct PkgBox { geom::Box box; int layer; int footprint; };
+  std::vector<PkgBox> pkg_boxes;
+  double auto_dir_pen = 0;  // opt.layer_dir_pen resolved for this board
+  bool pkg_on = false;
+  std::int64_t pkg_pen = 0;
+  // Footprints with at least 30 SMD pads on one layer: the box of their pads, a pad pitch wider on every side.
+  void package_boxes() {
+    pkg_boxes.clear();
+    pkg_on = false;
+    auto_dir_pen = std::max(0.0, opt.layer_dir_pen);
+    double pen = std::max(0.0, opt.package_pen);
+    std::map<int, std::vector<int>> by;
+    for (std::size_t i = 0; i < b.pads.size(); ++i)
+      if (b.pads[i].footprint >= 0 && b.pads[i].type == model::PadType::Smd) by[b.pads[i].footprint].push_back(static_cast<int>(i));
+    for (const auto& [fp, ids] : by) {
+      if (ids.size() < 30) continue;
+      const model::LayerMask m = b.pads[static_cast<std::size_t>(ids[0])].copper;
+      geom::Box bx;
+      Coord half = 0;
+      bool same = true;
+      for (int i : ids) {
+        const auto& pd = b.pads[static_cast<std::size_t>(i)];
+        same = same && pd.copper == m;
+        bx.add(pd.pos);
+        half = std::max(half, std::max(pd.size_x, pd.size_y));
+      }
+      if (!same || m == 0) continue;
+      // A ball-grid-like array: at least 5 distinct columns and rows, at least 40 % of the grid cells filled (a connector
+      // or a QFP has the pad count but not the filled grid).
+      std::set<Coord> gx, gy;
+      for (int i : ids) {
+        gx.insert(b.pads[static_cast<std::size_t>(i)].pos.x / 10'000);
+        gy.insert(b.pads[static_cast<std::size_t>(i)].pos.y / 10'000);
+      }
+      if (gx.size() < 5 || gy.size() < 5 || 10 * ids.size() < 4 * gx.size() * gy.size()) continue;
+      pkg_boxes.push_back({bx.inflated(half), std::countr_zero(m), fp});
+    }
+    // Automatic settings (doc 16 §10, D98): on a two-layer board with a ball-grid package the layers get preferred
+    // directions and the package interior is dear on its pad layer; srj19/srj20 gap boards, 30 M work: +7 and +4 clean.
+    // A breakout board: at least 70 % of the connections have an end on a ball-grid package (srj19/srj20; on ordinary
+    // two-layer boards the same settings cost 1-3 points of completion: quick 89.2 -> 86.8 %, mid 53.5 -> 51.1 %).
+    bool breakout = false;
+    if (nl == 2 && !pkg_boxes.empty() && !cs.empty()) {
+      std::size_t touching = 0;
+      for (const auto& st : cs) {
+        const int fa = st.c.pad_a >= 0 ? b.pads[static_cast<std::size_t>(st.c.pad_a)].footprint : -1;
+        const int fb = st.c.pad_b >= 0 ? b.pads[static_cast<std::size_t>(st.c.pad_b)].footprint : -1;
+        for (const auto& bx : pkg_boxes)
+          if (bx.footprint == fa || bx.footprint == fb) {
+            ++touching;
+            break;
+          }
+      }
+      breakout = 10 * touching >= 7 * cs.size();
+    }
+    if (breakout) {
+      if (opt.layer_dir_pen < 0) auto_dir_pen = opt.layer_dir_pen == -1.0 ? 0.3 : -opt.layer_dir_pen;
+      if (opt.package_pen < 0) pen = 3.0;
+    }
+    pkg_pen = static_cast<std::int64_t>(pen * static_cast<double>(pitch));
+    pkg_on = !pkg_boxes.empty() && pen > 0;
+  }
+  std::vector<int> conn_lpref;
+  bool lp_on = false;
+  int lp_layer = 0;
+  std::int64_t lp_pen = 0;
+  void layer_assign() {
+    conn_lpref.assign(cs.size(), -1);
+    const int k = std::min(nl, 2);  // two outer layers; inner layers are planes or left to the search
+    if (!(opt.layer_assign || opt.layer_assign_angle) || nl < 2) return;
+    const std::size_t n = cs.size();
+    struct Chord { Point a, e; };
+    std::vector<Chord> ch(n);
+    std::vector<char> use(n, 0);
+    for (std::size_t i = 0; i < n; ++i) {
+      const auto& c = cs[i].c;
+      if (c.pad_b < 0) continue;
+      ch[i] = {b.pads[static_cast<std::size_t>(c.pad_a)].pos, b.pads[static_cast<std::size_t>(c.pad_b)].pos};
+      use[i] = 1;
+    }
+    auto ccw = [](Point a, Point bq, Point c) {
+      return static_cast<long double>(c.y - a.y) * static_cast<long double>(bq.x - a.x) - static_cast<long double>(bq.y - a.y) * static_cast<long double>(c.x - a.x);
+    };
+    if (opt.layer_assign_angle) {  // by direction: mostly horizontal chords prefer the horizontal layer, the others the vertical one
+      for (std::size_t i = 0; i < n; ++i)
+        if (use[i]) conn_lpref[i] = std::llabs(ch[i].e.x - ch[i].a.x) >= std::llabs(ch[i].e.y - ch[i].a.y) ? 0 : nl - 1;
+      return;
+    }
+    std::vector<std::vector<int>> adj(n);
+    for (std::size_t i = 0; i < n; ++i)
+      for (std::size_t j = i + 1; j < n; ++j) {
+        if (!use[i] || !use[j] || cs[i].c.net == cs[j].c.net) continue;
+        const auto &p = ch[i], &q = ch[j];
+        if (ccw(p.a, p.e, q.a) * ccw(p.a, p.e, q.e) < 0 && ccw(q.a, q.e, p.a) * ccw(q.a, q.e, p.e) < 0) {
+          adj[i].push_back(static_cast<int>(j));
+          adj[j].push_back(static_cast<int>(i));
+        }
+      }
+    std::vector<int> lay(n, -1), order;
+    for (std::size_t i = 0; i < n; ++i)
+      if (use[i]) order.push_back(static_cast<int>(i));
+    std::stable_sort(order.begin(), order.end(), [&](int x, int y) { return adj[static_cast<std::size_t>(x)].size() > adj[static_cast<std::size_t>(y)].size(); });
+    auto conflicts = [&](int i, int l) {
+      int c = 0;
+      for (int j : adj[static_cast<std::size_t>(i)]) c += lay[static_cast<std::size_t>(j)] == l;
+      return c;
+    };
+    for (int i : order) {
+      int best = 0, bc = 1 << 30;
+      for (int l = 0; l < k; ++l)
+        if (const int c = conflicts(i, l); c < bc) bc = c, best = l;
+      lay[static_cast<std::size_t>(i)] = best;
+    }
+    for (int round = 0; round < 30; ++round) {
+      bool moved = false;
+      for (int i : order) {
+        int best = lay[static_cast<std::size_t>(i)], bc = conflicts(i, best);
+        for (int l = 0; l < k; ++l)
+          if (const int c = conflicts(i, l); c < bc) bc = c, best = l;
+        if (best != lay[static_cast<std::size_t>(i)]) {
+          lay[static_cast<std::size_t>(i)] = best;
+          moved = true;
+        }
+      }
+      if (!moved) break;
+    }
+    long same = 0, all = 0;
+    for (std::size_t i = 0; i < n; ++i)
+      for (int j : adj[i])
+        if (j > static_cast<int>(i)) {
+          ++all;
+          same += lay[i] == lay[static_cast<std::size_t>(j)];
+        }
+    for (std::size_t i = 0; i < n; ++i) conn_lpref[i] = lay[i] < 0 ? -1 : (lay[i] == 0 ? 0 : nl - 1);
+    if (std::getenv("TM_DEBUG_LAYERS")) std::fprintf(stderr, "layer assignment: %ld crossing pairs, %ld on one layer after the assignment\n", all, same);
+  }
+  // Path guidance (RouterOptions::guides): per connection the guide matching its pads, or -1; cells within
+  // guide_radius of the current connection's guide are set in gd_mask.
+  std::vector<int> conn_guide;
+  std::vector<std::uint8_t> gd_mask;
+  std::vector<std::size_t> gd_cells;
+  bool gd_on = false, gd_hard = false;  // gd_hard: cells off the guide are blocked
+  std::int64_t gd_pen = 0;
+  geom::Box gd_box;
+  void guide_clear() {
+    for (std::size_t i : gd_cells) gd_mask[i] = 0;
+    gd_cells.clear();
+    gd_on = gd_hard = false;
+    gd_box = geom::Box{};
+  }
+  void guide_mark(Point a, Point e, Coord r, model::LayerMask mask) {
+    geom::Box sb;
+    sb.add(a);
+    sb.add(e);
+    sb = sb.inflated(r);
+    gd_box.add(Point{sb.x0, sb.y0});
+    gd_box.add(Point{sb.x1, sb.y1});
+    const int x0 = std::clamp(to_ix(sb.x0), 0, nx - 1), x1 = std::clamp(to_ix(sb.x1), 0, nx - 1);
+    const int y0 = std::clamp(to_iy(sb.y0), 0, ny - 1), y1 = std::clamp(to_iy(sb.y1), 0, ny - 1);
+    for (int gy = y0; gy <= y1; ++gy)
+      for (int gx = x0; gx <= x1; ++gx) {
+        if (geom::point_seg_dist(at(gx, gy), a, e) > static_cast<long double>(r)) continue;
+        for (int l = 0; l < nl; ++l) {
+          if (!(mask & model::layer_bit(l))) continue;
+          const std::size_t i = lat_index(l, gx, gy);
+          if (gd_mask[i]) continue;
+          gd_mask[i] = 1;
+          gd_cells.push_back(i);
+        }
+      }
+  }
+  void guide_set(int gi) {
+    guide_clear();
+    if (gd_mask.empty()) gd_mask.assign(static_cast<std::size_t>(nl) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nx), 0);
+    const auto& g = opt.guides[static_cast<std::size_t>(gi)];
+    const Coord r = static_cast<Coord>(opt.guide_radius * static_cast<double>(pitch));
+    const model::LayerMask all = nl >= 64 ? ~model::LayerMask{0} : (model::LayerMask{1} << nl) - 1;
+    for (std::size_t k = 0; k < g.segs.size(); ++k) guide_mark(g.segs[k][0], g.segs[k][1], r, model::layer_bit(std::clamp(g.seg_layer[k], 0, nl - 1)));
+    for (Point v : g.vias) guide_mark(v, v, r, all);
+    // The pads themselves: a guide that starts a pitch off the pad centre still reaches it.
+    guide_mark(g.a, g.a, 2 * r, all);
+    guide_mark(g.b, g.b, 2 * r, all);
+    gd_pen = static_cast<std::int64_t>(opt.guide_pen * static_cast<double>(pitch));
+    gd_on = true;
+  }
+  void guide_match() {
+    conn_guide.assign(cs.size(), -1);
+    if (opt.guides.empty()) return;
+    const Coord tol = 150'000;
+    auto near = [&](Point u, Point v) { return std::llabs(u.x - v.x) <= tol && std::llabs(u.y - v.y) <= tol; };
+    for (std::size_t i = 0; i < cs.size(); ++i) {
+      const auto& c = cs[i].c;
+      if (c.pad_b < 0) continue;
+      const Point pa = b.pads[static_cast<std::size_t>(c.pad_a)].pos, pb = b.pads[static_cast<std::size_t>(c.pad_b)].pos;
+      for (std::size_t g = 0; g < opt.guides.size(); ++g) {
+        const auto& gp = opt.guides[g];
+        if ((near(pa, gp.a) && near(pb, gp.b)) || (near(pa, gp.b) && near(pb, gp.a))) {
+          conn_guide[i] = static_cast<int>(g);
+          break;
+        }
+      }
+    }
+    if (std::getenv("TM_DEBUG_GUIDE")) {
+      long m = 0;
+      for (int g : conn_guide) m += g >= 0;
+      std::fprintf(stderr, "guides: %zu given, %ld of %zu connections matched\n", opt.guides.size(), m, cs.size());
+    }
+  }
+  std::vector<std::uint8_t> bus_guide;       // per lattice cell (lat_index): inside the current guide
+  std::vector<std::size_t> bus_guide_cells;  // the cells set, to clear them again
+  int bus_mode = 0;                          // 0 no guide; 1 cells off the guide cost bus_pen per step; 2 they are blocked
+  std::int64_t bus_pen = 0;
+  bool tune_bus = false;                     // tune_net is tuning a bus member
+  ViaHeights bus_vh;                         // what a via adds to a member's length in KiCad's skew check
+
+  // Finds the bundles and makes each one's connections consecutive, lane by lane, at the place the router's order
+  // gave the first of them. Bundles go to the front only with opt.bus_first: on a dense board the lanes out of a
+  // ball grid are the hardest connections, and trying them all first spends the budget before the easy ones are
+  // routed (doc 05 §38). A bundle needs two connections of different nets of one group joining the same two
+  // components; its lanes are ordered along the pad row at the component with the lower index (the wider extent
+  // of x and y), so neighbouring lanes are neighbouring pins.
+  void order_buses(std::vector<Connection>& out) {
+    net_bus.assign(b.nets.size(), -1);
+    for (std::size_t g = 0; g < opt.buses.size(); ++g)
+      for (NetId n : opt.buses[g].nets)
+        if (n > 0 && static_cast<std::size_t>(n) < net_bus.size() && net_bus[static_cast<std::size_t>(n)] < 0) net_bus[static_cast<std::size_t>(n)] = static_cast<int>(g);
+    std::map<std::array<int, 3>, std::vector<std::size_t>> by;  // (bus, component, component) -> connections
+    for (std::size_t i = 0; i < out.size(); ++i) {
+      auto& c = out[i];
+      if (!bus_net(c.net) || c.pad_b < 0) continue;
+      int fa = b.pads[static_cast<std::size_t>(c.pad_a)].footprint, fb = b.pads[static_cast<std::size_t>(c.pad_b)].footprint;
+      if (fa < 0 || fb < 0 || fa == fb) continue;
+      if (fa > fb) {  // every lane of a bundle runs the same way
+        std::swap(c.pad_a, c.pad_b);
+        std::swap(fa, fb);
+      }
+      by[{net_bus[static_cast<std::size_t>(c.net)], fa, fb}].push_back(i);
+    }
+    std::vector<int> bundle_of(out.size(), -1), lane_of(out.size(), -1);
+    std::vector<std::vector<std::size_t>> members;  // per bundle, lane order
+    for (auto& [key, list] : by) {
+      std::set<NetId> nets;
+      for (std::size_t i : list) nets.insert(out[i].net);
+      if (nets.size() < 2) continue;
+      geom::Box box;
+      for (std::size_t i : list) box.add(b.pads[static_cast<std::size_t>(out[i].pad_a)].pos);
+      const bool along_x = box.x1 - box.x0 >= box.y1 - box.y0;
+      auto key_of = [&](std::size_t i) {
+        const Point pa = b.pads[static_cast<std::size_t>(out[i].pad_a)].pos, pb = b.pads[static_cast<std::size_t>(out[i].pad_b)].pos;
+        return std::array<Coord, 4>{along_x ? pa.x : pa.y, along_x ? pa.y : pa.x, along_x ? pb.x : pb.y, static_cast<Coord>(i)};
+      };
+      std::sort(list.begin(), list.end(), [&](std::size_t x, std::size_t y) { return key_of(x) < key_of(y); });
+      for (std::size_t k = 0; k < list.size(); ++k) {
+        bundle_of[list[k]] = static_cast<int>(bundles.size());
+        lane_of[list[k]] = static_cast<int>(k);
+      }
+      members.push_back(list);
+      bundles.push_back({key[0], {}});
+    }
+    if (bundles.empty()) return;
+    std::vector<std::size_t> order;
+    std::vector<char> placed(bundles.size(), 0);
+    for (std::size_t i = 0; i < out.size(); ++i) {
+      if (bundle_of[i] < 0) {
+        order.push_back(i);
+      } else if (!placed[static_cast<std::size_t>(bundle_of[i])]) {
+        placed[static_cast<std::size_t>(bundle_of[i])] = 1;
+        const auto& m = members[static_cast<std::size_t>(bundle_of[i])];
+        order.insert(order.end(), m.begin(), m.end());
+      }
+    }
+    if (opt.bus_first) std::stable_partition(order.begin(), order.end(), [&](std::size_t i) { return bundle_of[i] >= 0; });
+    // --first-nets keep their place in front.
+    if (!first_net_ids.empty()) std::stable_partition(order.begin(), order.end(), [&](std::size_t i) { return first_net_ids.count(out[i].net) > 0; });
+    std::vector<Connection> sorted;
+    conn_bundle.assign(out.size(), -1);
+    conn_lane.assign(out.size(), -1);
+    for (std::size_t k = 0; k < order.size(); ++k) {
+      sorted.push_back(out[order[k]]);
+      conn_bundle[k] = bundle_of[order[k]];
+      conn_lane[k] = lane_of[order[k]];
+    }
+    out = std::move(sorted);
+    for (auto& bd : bundles) bd.conns.clear();
+    std::vector<std::pair<int, int>> lanes;  // (lane, connection) per bundle
+    for (std::size_t bi = 0; bi < bundles.size(); ++bi) {
+      lanes.clear();
+      for (std::size_t k = 0; k < out.size(); ++k)
+        if (conn_bundle[k] == static_cast<int>(bi)) lanes.emplace_back(conn_lane[k], static_cast<int>(k));
+      std::sort(lanes.begin(), lanes.end());
+      for (const auto& [l, k] : lanes) bundles[bi].conns.push_back(k);
+    }
+    bus_pen = pitch / 4;
+    bus_vh = via_heights(b, rules);
+    if (opt.sink)
+      for (const auto& bd : bundles) {
+        std::string nets;
+        for (int k : bd.conns) nets += (nets.empty() ? "" : ",") + std::to_string(out[static_cast<std::size_t>(k)].net);
+        emit("{\"type\":\"bus\",\"name\":\"" + json_text(opt.buses[static_cast<std::size_t>(bd.bus)].name) + "\",\"nets\":[" + nets + "]}");
+      }
+  }
+  // A name as a JSON string body.
+  static std::string json_text(const std::string& in) {
+    std::string out;
+    for (char ch : in) {
+      if (ch == '"' || ch == '\\') out += '\\';
+      if (static_cast<unsigned char>(ch) >= 0x20) out += ch;
+    }
+    return out;
+  }
+
+  // The lane a connection follows: the nearest lane of its bundle that is routed as a lane (the lower one of two
+  // equally near), or -1 when there is none and the connection leads.
+  int bus_reference(int ci) const {
+    const auto& bd = bundles[static_cast<std::size_t>(conn_bundle[static_cast<std::size_t>(ci)])];
+    const int lane = conn_lane[static_cast<std::size_t>(ci)];
+    int best = -1, best_d = 0;
+    for (int k = 0; k < static_cast<int>(bd.conns.size()); ++k) {
+      const auto& o = cs[static_cast<std::size_t>(bd.conns[static_cast<std::size_t>(k)])];
+      if (k == lane || !o.routed || !o.bus_lane || o.items.empty()) continue;
+      if (best < 0 || std::abs(k - lane) < best_d) best = bd.conns[static_cast<std::size_t>(k)], best_d = std::abs(k - lane);
+    }
+    return best;
+  }
+  // Layers of a connection's tracks in the order they were laid, and its vias.
+  std::vector<int> bus_layers(int ci, int& vias) const {
+    std::vector<int> seq;
+    vias = 0;
+    for (int item : cs[static_cast<std::size_t>(ci)].items) {
+      const auto& it = obs->copper().items[static_cast<std::size_t>(item)];
+      if (it.kind == drc::ItemKind::Via) {
+        ++vias;
+      } else if (it.kind == drc::ItemKind::Track) {
+        const int l = b.tracks[static_cast<std::size_t>(it.index)].layer;
+        if (seq.empty() || seq.back() != l) seq.push_back(l);
+      }
+    }
+    return seq;
+  }
+  // The two connections have the same layers in order (either way round: a search may run from either end) and as
+  // many vias.
+  bool bus_same_layers(int ci, int ref) const {
+    int v = 0, rv = 0;
+    const auto seq = bus_layers(ci, v);
+    const auto rseq = bus_layers(ref, rv);
+    return v == rv && (seq == rseq || std::equal(seq.begin(), seq.end(), rseq.rbegin(), rseq.rend()));
+  }
+  void bus_clear_guide() {
+    for (std::size_t i : bus_guide_cells) bus_guide[i] = 0;
+    bus_guide_cells.clear();
+    bus_mode = 0;
+  }
+  // Marks the lattice cells within `r` of segment a-e on the layers of `mask`; grows `box`.
+  void bus_mark(Point a, Point e, Coord r, model::LayerMask mask, geom::Box& box) {
+    geom::Box sb;
+    sb.add(a);
+    sb.add(e);
+    sb = sb.inflated(r);
+    box.add(Point{sb.x0, sb.y0});
+    box.add(Point{sb.x1, sb.y1});
+    const int x0 = std::clamp(to_ix(sb.x0), 0, nx - 1), x1 = std::clamp(to_ix(sb.x1), 0, nx - 1);
+    const int y0 = std::clamp(to_iy(sb.y0), 0, ny - 1), y1 = std::clamp(to_iy(sb.y1), 0, ny - 1);
+    for (int gy = y0; gy <= y1; ++gy)
+      for (int gx = x0; gx <= x1; ++gx) {
+        if (geom::point_seg_dist(at(gx, gy), a, e) > static_cast<long double>(r)) continue;
+        for (int l = 0; l < nl; ++l) {
+          if (!(mask & model::layer_bit(l))) continue;
+          const std::size_t i = lat_index(l, gx, gy);
+          if (bus_guide[i]) continue;
+          bus_guide[i] = 1;
+          bus_guide_cells.push_back(i);
+        }
+      }
+  }
+  // Builds the guide of connection `ci` around lane `ref`; returns the box the guide covers.
+  geom::Box bus_set_guide(int ci, int ref) {
+    bus_clear_guide();
+    if (bus_guide.empty()) bus_guide.assign(static_cast<std::size_t>(nl) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nx), 0);
+    const auto& c = cs[static_cast<std::size_t>(ci)].c;
+    const auto& rc = cs[static_cast<std::size_t>(ref)].c;
+    auto pos = [&](int pad) { return b.pads[static_cast<std::size_t>(pad)].pos; };
+    auto dist = [](Point u, Point v) { return static_cast<Coord>(std::hypot(static_cast<double>(u.x - v.x), static_cast<double>(u.y - v.y))); };
+    const Coord da = dist(pos(c.pad_a), pos(rc.pad_a)), db = dist(pos(c.pad_b), pos(rc.pad_b));
+    // Room for the lane beside its neighbour: the pads' own distance (the lanes run that far apart where nothing
+    // squeezes them), two more lanes and a via.
+    const Coord room = 2 * (class_width(c.net) + std::max(netclass(c.net).clearance, rules.minimums.clearance)) + class_via_diameter(c.net) + pitch;
+    const Coord r = std::min<Coord>(std::max(da, db), 5'000'000) + room;
+    const model::LayerMask all = nl >= 64 ? ~model::LayerMask{0} : (model::LayerMask{1} << nl) - 1;
+    geom::Box box;
+    for (int item : cs[static_cast<std::size_t>(ref)].items) {
+      const auto& it = obs->copper().items[static_cast<std::size_t>(item)];
+      if (it.kind == drc::ItemKind::Via) {
+        bus_mark(it.pos, it.pos, r, all, box);
+      } else if (it.kind == drc::ItemKind::Track) {
+        const auto& t = b.tracks[static_cast<std::size_t>(it.index)];
+        bus_mark(t.a, t.b, r, model::layer_bit(t.layer), box);
+      }
+    }
+    bus_mark(pos(c.pad_a), pos(c.pad_a), da + room, all, box);
+    bus_mark(pos(c.pad_b), pos(c.pad_b), db + room, all, box);
+    return box;
+  }
+  // Routes lane `ci` inside the guide of its reference lane. False when it leads (no reference) or no path inside the
+  // guide passes the exact check; the guide then stays as a preference (bus_mode 1) for the searches that follow.
+  bool route_bus_lane(int ci) {
+    const int ref = bus_reference(ci);
+    if (ref < 0) return false;
+    const geom::Box box = bus_set_guide(ci, ref);
+    const auto& c = cs[static_cast<std::size_t>(ci)].c;
+    Window w;
+    w.x0 = std::clamp(to_ix(box.x0) - 1, 0, nx - 1);
+    w.y0 = std::clamp(to_iy(box.y0) - 1, 0, ny - 1);
+    w.w = std::clamp(to_ix(box.x1) + 1, 0, nx - 1) - w.x0 + 1;
+    w.h = std::clamp(to_iy(box.y1) + 1, 0, ny - 1) - w.y0 + 1;
+    soft = false;
+    bus_mode = 2;
+    collect_siblings(c);
+    std::vector<PathNode> path;
+    bool done = false;
+    // A lane beside its neighbour is found quickly or not at all: the search is cut off at a few expansions per
+    // cell of the guide, so a guide with no way through costs little. A path the exact check rejects teaches the
+    // search its blocked cells; the next attempt goes round them.
+    for (int attempt = 0; attempt < 3 && !done && !out_of_budget(); ++attempt) {
+      expansion_cap = std::max<long>(50'000, 4 * static_cast<long>(bus_guide_cells.size()) / std::max(1, nl));
+      const bool found = search(c, w, path);
+      expansion_cap = 0;
+      if (!found) break;
+      done = commit(c, path);
+    }
+    sibling.clear();
+    last_miss = Miss::None;  // an exhausted guide says nothing about the pin being boxed in
+    bus_mode = 1;
+    // Neighbouring lanes are about as long as each other, on the same layers. A lane that had to wind through the
+    // guide or hop over something to stay in it (an obstacle the neighbour passed on the other side) is taken back:
+    // the usual search may pass the obstacle on the lane's own side, and the lanes after it then follow that.
+    if (done) {
+      const auto& rc = cs[static_cast<std::size_t>(ref)].c;
+      auto pos = [&](int pad) { return b.pads[static_cast<std::size_t>(pad)].pos; };
+      auto dist = [](Point u, Point v) { return std::hypot(static_cast<double>(u.x - v.x), static_cast<double>(u.y - v.y)); };
+      // Detour: length beyond the shortest octilinear line between the pads.
+      auto detour = [&](int k) {
+        const auto& kc = cs[static_cast<std::size_t>(k)].c;
+        const double dx = std::fabs(static_cast<double>(pos(kc.pad_a).x - pos(kc.pad_b).x)), dy = std::fabs(static_cast<double>(pos(kc.pad_a).y - pos(kc.pad_b).y));
+        return net_length({k}) - (std::max(dx, dy) + (std::numbers::sqrt2 - 1) * std::min(dx, dy));
+      };
+      const double room = (dist(pos(c.pad_a), pos(rc.pad_a)) + dist(pos(c.pad_b), pos(rc.pad_b))) / 2 + 500'000 + net_length({ref}) / 50;
+      if (std::getenv("TM_DEBUG_BUS"))
+        std::fprintf(stderr, "bus lane conn %d: detour %.3f mm inside the guide of conn %d (detour %.3f mm, room %.3f)\n", ci, detour(ci) / 1e6, ref, detour(ref) / 1e6, room / 1e6);
+      if (!bus_same_layers(ci, ref) || detour(ci) > detour(ref) + room) {
+        lift_items(ci);
+        done = false;
+      }
+    }
+    return done;
+  }
+  // After the attempts on lane `ci`: drops the guide and, if the connection is routed, decides whether it is a lane
+  // (it leads, or has its reference lane's layers in order, either way round, and as many vias).
+  void bus_note(int ci, bool ok) {
+    bus_clear_guide();
+    auto& st = cs[static_cast<std::size_t>(ci)];
+    if (!ok) return;
+    const int ref = bus_reference(ci);
+    const char* state = "leader";
+    st.bus_lane = true;
+    if (ref >= 0) {
+      st.bus_lane = bus_same_layers(ci, ref);
+      state = st.bus_lane ? "followed" : "left";
+    }
+    if (opt.sink)
+      emit("{\"type\":\"bus_lane\",\"bus\":\"" + json_text(opt.buses[static_cast<std::size_t>(bundles[static_cast<std::size_t>(conn_bundle[static_cast<std::size_t>(ci)])].bus)].name) +
+           "\",\"conn\":" + std::to_string(ci) + ",\"net\":" + std::to_string(st.c.net) + ",\"state\":\"" + state + "\"}");
+    if (std::getenv("TM_DEBUG_BUS"))
+      std::fprintf(stderr, "bus lane %s conn %d: %s, %.3f mm, %zu items\n", b.nets[static_cast<std::size_t>(st.c.net)].name.c_str(), ci, state,
+                   net_length({ci}) / 1e6, st.items.size());
+  }
+  // A net's routed length as KiCad's skew check sums it: tracks, and the stackup height of each via between the
+  // layers it joins (route/bus.hpp; `tracemaker buses` reports the same).
+  double bus_length(NetId net, const std::vector<int>& list, double* via_part = nullptr) const {
+    std::vector<model::Track> tr;
+    std::vector<model::Via> vi;
+    for (int ci : list)
+      for (int item : cs[static_cast<std::size_t>(ci)].items) {
+        const auto& it = obs->copper().items[static_cast<std::size_t>(item)];
+        if (it.kind == drc::ItemKind::Track) tr.push_back(b.tracks[static_cast<std::size_t>(it.index)]);
+        else if (it.kind == drc::ItemKind::Via) vi.push_back(b.vias[static_cast<std::size_t>(it.index)]);
+      }
+    const double v = net_via_length(b, bus_vh, net, tr, {}, vi);
+    if (via_part) *via_part = v;
+    return net_length(list) + v;
+  }
+  // Length matching of the groups with a skew limit: members with every connection routed are measured (tracks
+  // and via heights, as KiCad's skew check does), and each one shorter than the longest by more than half the limit
+  // gets meanders up to between half the limit below the longest and the longest. Returns the number of groups
+  // within their limit afterwards.
+  int tune_bus_skew() {
+    int within = 0;
+    std::set<NetId> open;  // nets with a connection still unrouted: their length is not the net's
+    for (const auto& st : cs)
+      if (!st.routed) open.insert(st.c.net);
+    for (const auto& g : opt.buses) {
+      if (g.skew <= 0) continue;
+      auto lengths = [&](double& lo, double& hi) {
+        const auto by = routed_conns_by_net();
+        int n = 0;
+        for (NetId net : g.nets) {
+          const auto it = by.find(net);
+          if (open.count(net) || it == by.end()) continue;
+          const double len = bus_length(net, it->second);
+          lo = n ? std::min(lo, len) : len;
+          hi = n ? std::max(hi, len) : len;
+          ++n;
+        }
+        return n;
+      };
+      double lo = 0, hi = 0;
+      if (lengths(lo, hi) < 2) continue;
+      const double longest = hi;
+      const auto by = routed_conns_by_net();
+      if (std::getenv("TM_DEBUG_BUS"))
+        for (NetId net : g.nets)
+          if (const auto it = by.find(net); it != by.end())
+            std::fprintf(stderr, "bus %s: %s %.3f mm before tuning%s\n", g.name.c_str(), b.nets[static_cast<std::size_t>(net)].name.c_str(),
+                         bus_length(net, it->second) / 1e6, open.count(net) ? " (incomplete)" : "");
+      tune_bus = true;
+      for (NetId net : g.nets) {
+        const auto it = by.find(net);
+        if (open.count(net) || it == by.end()) continue;
+        double via_part = 0;
+        if (longest - bus_length(net, it->second, &via_part) <= static_cast<double>(g.skew) / 2) continue;
+        // tune_net counts tracks; meanders add no via, so the net's via length comes off both bounds.
+        tune_net(net, it->second, static_cast<Coord>(longest - static_cast<double>(g.skew) / 2 - via_part), static_cast<Coord>(longest - via_part));
+      }
+      tune_bus = false;
+      lengths(lo, hi);
+      if (hi - lo <= static_cast<double>(g.skew)) ++within;
+      if (opt.sink)
+        emit("{\"type\":\"bus_skew\",\"bus\":\"" + json_text(g.name) + "\",\"skew\":" + std::to_string(static_cast<Coord>(hi - lo)) + ",\"limit\":" +
+             std::to_string(g.skew) + "}");
+      if (std::getenv("TM_DEBUG_BUS")) std::fprintf(stderr, "bus %s: skew %.3f mm (limit %.3f)\n", g.name.c_str(), (hi - lo) / 1e6, nm_to_mm(g.skew));
+    }
+    return within;
+  }
+
   void optimize_vias() {
     via_cost_mult = 10.0;
     bypass_nogoods = true;
@@ -2980,7 +3664,7 @@ struct Router::Impl {
     std::vector<std::pair<int, int>> order;  // (-vias, connection)
     for (std::size_t i = 0; i < cs.size(); ++i) {
       const auto& st = cs[i];
-      if (!st.routed || st.implicit || st.coupled || st.items.empty()) continue;
+      if (!st.routed || st.implicit || st.coupled || st.bus_lane || st.items.empty()) continue;
       int v = 0;
       cost_of(st.items, v);
       if (v > 0) order.emplace_back(-v, static_cast<int>(i));
@@ -3061,7 +3745,7 @@ struct Router::Impl {
     // Via positions at the start, in a fixed order (connection index, then item order): deterministic.
     std::vector<std::pair<int, Point>> targets;
     for (std::size_t ci = 0; ci < cs.size(); ++ci) {
-      if (!cs[ci].routed || cs[ci].implicit || cs[ci].coupled) continue;
+      if (!cs[ci].routed || cs[ci].implicit || cs[ci].coupled || cs[ci].bus_lane) continue;
       for (int item : cs[ci].items) {
         const auto& it = obs->copper().items[static_cast<std::size_t>(item)];
         if (it.kind == drc::ItemKind::Via) targets.emplace_back(static_cast<int>(ci), it.pos);
@@ -3085,7 +3769,8 @@ struct Router::Impl {
       for (int id : ids) {
         const int o = obs->copper().items[static_cast<std::size_t>(id)].owner;
         if (o >= 0 && std::find(group.begin(), group.end(), o) == group.end() && group.size() < 8 && cs[static_cast<std::size_t>(o)].routed &&
-            !cs[static_cast<std::size_t>(o)].implicit && !cs[static_cast<std::size_t>(o)].coupled &&
+            !cs[static_cast<std::size_t>(o)].implicit && !cs[static_cast<std::size_t>(o)].coupled && !cs[static_cast<std::size_t>(o)].bus_lane &&
+            !(bus_net(cs[static_cast<std::size_t>(o)].c.net) && !bus_net(cs[static_cast<std::size_t>(owner)].c.net)) &&
             !(first_net_ids.count(cs[static_cast<std::size_t>(o)].c.net) && !first_net_ids.count(cs[static_cast<std::size_t>(owner)].c.net)) &&
             !anchored(o))
           group.push_back(o);
@@ -3106,6 +3791,7 @@ struct Router::Impl {
           remove_routed(item);
         }
         st.items.clear();
+        st.routed = false;  // lifted copper must not join clusters while another member is rebuilt
       }
       // Route the via's own connection last: its neighbours first get the space the via was avoiding.
       std::vector<std::size_t> order(group.size());
@@ -3119,6 +3805,7 @@ struct Router::Impl {
           ok = false;
           break;
         }
+        cs[static_cast<std::size_t>(group[g])].routed = true;
       }
       double after = 0;
       if (ok)
@@ -3137,6 +3824,7 @@ struct Router::Impl {
         st.items.clear();
         st.deps = saved_deps[g];
         std::tie(st.at_a, st.at_b) = saved_at[g];
+        st.routed = true;
         for (const auto& o : saved[g]) {
           const int id = o.kind == drc::ItemKind::Via ? obs->add_via(o.index, group[g]) : obs->add_track(o.index, group[g]);
           near_mark(id, +1);
@@ -3149,6 +3837,97 @@ struct Router::Impl {
     via_cost_mult = 1.0;
     bypass_nogoods = false;
     return improved;
+  }
+
+  // Regional rebuild of open connections (doc 16 F4). For each unrouted connection: lift the routed connections whose
+  // copper lies within `lns_open_radius` of its first pad, route the open one first and the lifted ones after it,
+  // in seeded orders, strictly (no crossing). The first order that routes all of them is kept; otherwise every
+  // lifted connection is restored exactly, so completion never drops (transaction, rule 4). Open connections of
+  // a dense package are usually blocked by their neighbours' escapes, which a restart redoes with the same order.
+  int lns_open(int trials) {
+    bypass_nogoods = true;
+    strict_pass = false;
+    soft = false;
+    std::vector<int> open;
+    for (std::size_t ci = 0; ci < cs.size(); ++ci)
+      if (!cs[ci].routed && !cs[ci].implicit && !cs[ci].coupled && !cs[ci].bus_lane && cs[ci].c.pad_b >= 0) open.push_back(static_cast<int>(ci));
+    int fixed = 0;
+    for (int x : open) {
+      if (out_of_budget()) break;
+      if (cs[static_cast<std::size_t>(x)].routed) continue;
+      const Point p0 = b.pads[static_cast<std::size_t>(cs[static_cast<std::size_t>(x)].c.pad_a)].pos;
+      std::vector<int> ids;
+      obs->routed_items_in(geom::Shape::point(p0, static_cast<Coord>(opt.lns_open_radius_mm * 1e6)).box, ids);
+      std::vector<int> group;
+      for (int id : ids) {
+        const int o = obs->copper().items[static_cast<std::size_t>(id)].owner;
+        if (o < 0 || o == x || std::find(group.begin(), group.end(), o) != group.end()) continue;
+        const auto& st = cs[static_cast<std::size_t>(o)];
+        if (!st.routed || st.implicit || st.coupled || st.bus_lane || anchored(o)) continue;
+        if (first_net_ids.count(st.c.net) && !first_net_ids.count(cs[static_cast<std::size_t>(x)].c.net)) continue;
+        if (bus_net(st.c.net) && !bus_net(cs[static_cast<std::size_t>(x)].c.net)) continue;
+        group.push_back(o);
+      }
+      std::sort(group.begin(), group.end());
+      if (group.empty() || group.size() > 24) continue;
+      std::vector<std::vector<OldItem>> saved;
+      std::vector<std::vector<int>> saved_deps;
+      std::vector<std::pair<int, int>> saved_at;
+      for (int g : group) {
+        auto& st = cs[static_cast<std::size_t>(g)];
+        saved_deps.push_back(st.deps);
+        saved_at.emplace_back(st.at_a, st.at_b);
+        saved.push_back(lift_items(g));
+        st.routed = false;
+      }
+      bool done = false;
+      for (int trial = 0; trial < trials && !done && !out_of_budget(); ++trial) {
+        std::vector<int> order(group.begin(), group.end());
+        const RngStream rr(opt.seed, 0x1A57u, static_cast<std::uint64_t>(x) * 4096 + static_cast<std::uint64_t>(trial));
+        std::vector<std::pair<double, int>> key;
+        for (std::size_t k = 0; k < order.size(); ++k) key.emplace_back(rr.uniform(k), order[k]);
+        std::sort(key.begin(), key.end());
+        std::vector<int> seq{x};
+        for (const auto& kv : key) seq.push_back(kv.second);
+        bool ok = true;
+        std::size_t placed = 0;
+        for (int ci : seq) {
+          current = ci;
+          if (!search_and_commit(cs[static_cast<std::size_t>(ci)].c, false)) {
+            ok = false;
+            break;
+          }
+          cs[static_cast<std::size_t>(ci)].routed = true;
+          ++placed;
+        }
+        if (ok) {
+          done = true;
+          break;
+        }
+        for (std::size_t k = 0; k < placed; ++k) {  // undo this order, including its physical connectivity
+          lift_items(seq[k]);
+          cs[static_cast<std::size_t>(seq[k])].routed = false;
+        }
+      }
+      if (done) {
+        auto& st = cs[static_cast<std::size_t>(x)];
+        st.routed = true;
+        st.dead = false;
+        ++res.routed;
+        release_escapes(x);
+        ++fixed;
+      } else {
+        for (std::size_t k = 0; k < group.size(); ++k) {
+          auto& st = cs[static_cast<std::size_t>(group[k])];
+          restore_items(group[k], saved[k]);
+          st.deps = std::move(saved_deps[k]);
+          std::tie(st.at_a, st.at_b) = saved_at[k];
+          st.routed = true;
+        }
+      }
+    }
+    bypass_nogoods = false;
+    return fixed;
   }
 
   // Length tuning (design doc 05 §9 phase 3): nets with a custom `length` constraint that are routed too short get
@@ -3181,7 +3960,10 @@ struct Router::Impl {
       if (static_cast<double>(*mn) <= len) return true;
       const Coord w = class_width(net), clr = std::max(netclass(net).clearance, rules.minimums.clearance);
       const Coord p = w + clr + 20'000;  // spacing between the meander's parallel runs (centre to centre)
-      for (int round = 0; round < 50 && deficit > 1'000; ++round) {
+      // Bus members (tune_bus): the lanes beside a member leave its longest track no room, so every track is tried,
+      // longest first, and the last meander is cut to the length still missing (the fixed heights step by 0.5 mm).
+      std::vector<int> tried;
+      for (int round = 0; round < (tune_bus ? 400 : 50) && deficit > 1'000; ++round) {
         // Longest track of the net first.
         int best_ci = -1, best_item = -1;
         double best_l = 0;
@@ -3190,6 +3972,7 @@ struct Router::Impl {
           for (int item : cs[static_cast<std::size_t>(ci)].items) {
             const auto& it = obs->copper().items[static_cast<std::size_t>(item)];
             if (it.kind != drc::ItemKind::Track) continue;
+            if (!tried.empty() && std::find(tried.begin(), tried.end(), item) != tried.end()) continue;
             const double l = seg_len(b.tracks[static_cast<std::size_t>(it.index)]);
             if (l > best_l && l > static_cast<double>(3 * p)) { best_l = l; best_ci = ci; best_item = item; }
           }
@@ -3198,7 +3981,10 @@ struct Router::Impl {
         const model::Track t = b.tracks[static_cast<std::size_t>(obs->copper().items[static_cast<std::size_t>(best_item)].index)];
         const double ux = static_cast<double>(t.b.x - t.a.x) / best_l, uy = static_cast<double>(t.b.y - t.a.y) / best_l;
         bool placed = false;
-        for (double h_mm : {1.5, 1.0, 0.6, 0.4, 0.25}) {
+        std::array<double, 6> heights{1.5, 1.0, 0.6, 0.4, 0.25, 0.0};
+        if (tune_bus && deficit >= 100'000 && deficit <= 3e6) heights[5] = deficit / 2e6;
+        for (double h_mm : heights) {
+          if (h_mm <= 0) continue;
           const double h = h_mm * 1e6;
           int k = static_cast<int>(std::floor((best_l - static_cast<double>(p)) / (2.0 * static_cast<double>(p))));
           k = std::min(k, static_cast<int>(std::ceil(deficit / (2 * h))));
@@ -3244,7 +4030,12 @@ struct Router::Impl {
           }
           if (placed) break;
         }
+        if (!placed && tune_bus) {
+          tried.push_back(best_item);
+          continue;
+        }
         if (!placed) break;
+        tried.clear();
       }
       return len >= static_cast<double>(*mn) && (!mx || len <= static_cast<double>(*mx));
   }
@@ -3412,9 +4203,11 @@ struct Router::Impl {
       fin.via = [&](NetId n) { return via_diameter(n); };
       fin.keep = keep;
       fin.track_free = [&](int layer, Point p, NetId n) {
+        ++wc().fixed_checks;
         return layer_ok(n, layer) && code_ok(obs->fixed_code(p, layer, class_width(n) / 2, 0, n), n) && rule_state(p, layer, class_width(n) / 2, 0, n) != 2;
       };
       fin.via_free = [&](Point p, NetId n) {
+        ++wc().fixed_checks;
         return vias_ok(n) && code_ok(obs->fixed_via_code(p, via_diameter(n), via_drill(n), 0, n), n) &&
                !obs->via_disallowed(p, via_diameter(n), n, 0, nl - 1, model::ViaType::Through);
       };
@@ -3450,6 +4243,7 @@ struct Router::Impl {
       if (c.via) {  // a dog-bone is only worth reserving where that net's via fits among the fixed copper
         const int gx = to_ix(c.b.x), gy = to_iy(c.b.y);
         if (gx < 0 || gy < 0 || gx >= nx || gy >= ny) continue;
+        ++wc().fixed_checks;
         const std::int32_t code = obs->fixed_via_code(at(gx, gy), via_diameter(c.net), via_drill(c.net), 0, cache_for(c.net).rep);
         if (!code_ok(code, c.net) || obs->via_disallowed(at(gx, gy), via_diameter(c.net), c.net, 0, nl - 1, model::ViaType::Through)) continue;
       }
@@ -3532,6 +4326,8 @@ struct Router::Impl {
   RouteResult run() {
     t0 = std::chrono::steady_clock::now();
     rip_cap = opt.max_rips_per_connection;
+    budget_scale = (opt.polish_fraction > 0 && opt.polish_fraction < 1) ? 1.0 - opt.polish_fraction : 1.0;
+    soft_unit = static_cast<std::int64_t>(opt.soft_cost_mm * 1e6);
     const bool tdbg = std::getenv("TM_DEBUG_TIMING") != nullptr;
     setup();
     if (tdbg) std::fprintf(stderr, "[%.2f s] setup done: lattice %d x %d x %d, pitch %.3f mm\n", elapsed(), nx, ny, nl, nm_to_mm(pitch));
@@ -3615,6 +4411,9 @@ struct Router::Impl {
       cs.push_back(std::move(st));
     }
     for (std::size_t i = 0; i < cs.size(); ++i) pending.push_back(static_cast<int>(i));
+    guide_match();
+    layer_assign();
+    package_boxes();
     if (opt.escape_plan || opt.escape_flow) {
       plan_escape_reservations();
       if (tdbg) std::fprintf(stderr, "[%.2f s] escape plan: %d corridors\n", elapsed(), res.escape_corridors);
@@ -3640,16 +4439,39 @@ struct Router::Impl {
     int best_routed = -1;
     std::vector<model::Track> best_tracks;
     std::vector<model::Via> best_vias;
+    std::vector<std::vector<OldItem>> best_items;  // per connection, for restoring the best state into the live board
+    std::vector<std::vector<int>> best_deps;
+    std::vector<std::pair<int, int>> best_at;
+    std::vector<std::array<bool, 3>> best_flags;  // implicit, coupled, bus_lane
     auto snapshot = [&]() {
       best_routed = res.routed;
       best_tracks.clear();
       best_vias.clear();
+      best_items.assign(cs.size(), {});
+      if (opt.polish_fraction > 0) {
+        best_deps.resize(cs.size());
+        best_at.resize(cs.size());
+        best_flags.resize(cs.size());
+        for (std::size_t ci = 0; ci < cs.size(); ++ci) {
+          best_deps[ci] = cs[ci].deps;
+          best_at[ci] = {cs[ci].at_a, cs[ci].at_b};
+          best_flags[ci] = {cs[ci].implicit, cs[ci].coupled, cs[ci].bus_lane};
+        }
+      }
+      for (std::size_t ci = 0; ci < cs.size(); ++ci)
+        for (int item : cs[ci].items) {
+          const auto& it = obs->copper().items[static_cast<std::size_t>(item)];
+          best_items[ci].push_back({it.kind, it.index});
+        }
       for (const auto& st : cs)
         for (int item : st.items) {
           const auto& it = obs->copper().items[static_cast<std::size_t>(item)];
           if (it.kind == drc::ItemKind::Via) best_vias.push_back(b.vias[static_cast<std::size_t>(it.index)]);
           else best_tracks.push_back(b.tracks[static_cast<std::size_t>(it.index)]);
         }
+      res.bus_lanes = res.bus_left = 0;
+      for (std::size_t i = 0; i < conn_bundle.size(); ++i)
+        if (conn_bundle[i] >= 0 && cs[i].routed && !cs[i].implicit) ++(cs[i].bus_lane ? res.bus_lanes : res.bus_left);
     };
 
     std::vector<std::uint8_t> best_unrouted;
@@ -3670,6 +4492,7 @@ struct Router::Impl {
     // at 43 of 120 s with every remaining attempt a nogood).
     for (int restart = 0; restart <= opt.max_restarts + 40; ++restart) {
     if (restart > 0) {
+      phase = WorkPhase::Setup;  // ripping everything, escape reservations and coupled pairs again
       if (out_of_budget() || best_routed == res.connections) break;
       for (std::size_t i = 0; i < cs.size(); ++i) {
         auto& st = cs[i];
@@ -3681,7 +4504,7 @@ struct Router::Impl {
         st.items.clear();
         st.deps.clear();
         st.at_a = st.at_b = kUnattached;
-        st.routed = st.implicit = st.coupled = false;
+        st.routed = st.implicit = st.coupled = st.bus_lane = false;
       }
       res.routed = 0;
       if (opt.escape_plan || opt.escape_flow) plan_escape_reservations();  // everything is unrouted again: corridors back
@@ -3705,6 +4528,22 @@ struct Router::Impl {
       } else {
         std::stable_sort(order.begin(), order.end(), [&](int x, int y) { return cs[static_cast<std::size_t>(x)].fails > cs[static_cast<std::size_t>(y)].fails; });
       }
+      // Each bundle together again, lane by lane, where its hardest connection stands.
+      if (!bundles.empty()) {
+        std::vector<int> grouped;
+        std::vector<char> placed(bundles.size(), 0);
+        for (int c : order) {
+          const int bi = conn_bundle[static_cast<std::size_t>(c)];
+          if (bi < 0) {
+            grouped.push_back(c);
+          } else if (!placed[static_cast<std::size_t>(bi)]) {
+            placed[static_cast<std::size_t>(bi)] = 1;
+            grouped.insert(grouped.end(), bundles[static_cast<std::size_t>(bi)].conns.begin(), bundles[static_cast<std::size_t>(bi)].conns.end());
+          }
+        }
+        order = std::move(grouped);
+        if (opt.bus_first) std::stable_partition(order.begin(), order.end(), [&](int c) { return conn_bundle[static_cast<std::size_t>(c)] >= 0; });
+      }
       // --first-nets go first again: a restart rips everything, including them.
       if (!first_net_ids.empty())
         std::stable_partition(order.begin(), order.end(), [&](int c) { return first_net_ids.count(cs[static_cast<std::size_t>(c)].c.net) > 0; });
@@ -3716,7 +4555,9 @@ struct Router::Impl {
     }
     for (int pass = 0; pass < opt.max_passes && !pending.empty() && !out_of_budget(); ++pass) {
       res.passes = pass + 1;
-      strict_pass = pass == 0;
+      strict_pass = pass == 0 && opt.strict_first;
+      soft_unit = static_cast<std::int64_t>(opt.soft_cost_mm * 1e6 * (1.0 + opt.soft_growth * std::min(pass, 20)));
+      phase = strict_pass ? WorkPhase::FirstPass : WorkPhase::Negotiation;
       std::vector<int> failed;
       const int routed_before = res.routed;
       while (!pending.empty() && !out_of_budget()) {
@@ -3747,7 +4588,11 @@ struct Router::Impl {
             }
           }
         }
-        bool ok = search_and_commit(st.c, false);
+        // A bus lane first tries to run along the neighbour lane routed before it; failing that, the usual searches
+        // below run with the neighbour's guide as a preference (doc 05 §38).
+        const bool lane = !conn_bundle.empty() && conn_bundle[static_cast<std::size_t>(ci)] >= 0;
+        bool ok = lane && route_bus_lane(ci);
+        if (!ok) ok = search_and_commit(st.c, false);
         std::string reason = why;
         // Escalation for pads boxed in by fixed copper: forced off-lattice escapes, then a neck-down to the
         // board's minimum track width (KiCad's track_width rule; the net-class width is only the default).
@@ -3765,7 +4610,7 @@ struct Router::Impl {
           force_escapes = false;
           if (!ok) reason += "; escapes/neck-down: " + why;
         }
-        if (!ok && opt.rip_up && pass > 0) {
+        if (!ok && opt.rip_up && (pass > 0 || !opt.strict_first)) {
           ok = search_and_commit(st.c, true);  // pass 0: strict; later: negotiate
           reason += "; negotiated: " + why;
           if (!ok && why.starts_with("boxed in")) {
@@ -3795,6 +4640,7 @@ struct Router::Impl {
           }
         }
         cs[static_cast<std::size_t>(ci)].why = reason;
+        if (lane) bus_note(ci, ok);
         if (ok) {
           cs[static_cast<std::size_t>(ci)].routed = true;
           ++res.routed;
@@ -3802,7 +4648,7 @@ struct Router::Impl {
         } else {
           ++cs[static_cast<std::size_t>(ci)].fails;
           if (!st.dead) failed.push_back(ci);
-          // Routing intent (doc 05 §44): an intent connection that failed a pass is relaxed to an ordinary one (tree
+          // Routing intent (doc 05 §45): an intent connection that failed a pass is relaxed to an ordinary one (tree
           // attach and joins through other routes allowed again), so the net still completes; the relaxation is
           // reported, the intent is not silently dropped.
           if (st.c.exact || st.c.must_route) {
@@ -3826,6 +4672,16 @@ struct Router::Impl {
           snapshot_unrouted();
         }
       }
+      if (std::getenv("TM_DEBUG_LNS")) std::fprintf(stderr, "end of pass %d: routed %d of %d, budget %d\n", pass, res.routed, res.connections, out_of_budget() ? 0 : 1);
+      // Regional rebuild of what is still open, from the second pass on and then every second pass (doc 16 F4).
+      if (opt.lns_open_trials > 0 && pass >= 1 && pass % 2 == 1 && res.routed < res.connections && !out_of_budget()) {
+        const WorkPhase keep = phase;
+        phase = WorkPhase::Negotiation;
+        const int f = lns_open(opt.lns_open_trials);
+        phase = keep;
+        res.lns_fixed += f;
+        if (std::getenv("TM_DEBUG_LNS")) std::fprintf(stderr, "pass %d lns_open: %d closed, %d of %d routed\n", pass, f, res.routed, res.connections);
+      }
       // Next pass: hardest (most failed) first.
       std::stable_sort(failed.begin(), failed.end(), [&](int x, int y) { return cs[static_cast<std::size_t>(x)].fails > cs[static_cast<std::size_t>(y)].fails; });
       for (int f : failed) pending.push_back(f);
@@ -3836,6 +4692,40 @@ struct Router::Impl {
       snapshot_unrouted();
     }
     }  // restarts
+    // Polish (doc 16): the reserved share of the budget goes to the best state found, whose open connections are
+    // rebuilt one by one with their neighbours (lns_open). The live board is first put back to that state.
+    if (opt.polish_fraction > 0 && best_routed >= 0 && best_routed < res.connections && !best_items.empty()) {
+      budget_scale = 1.0;
+      stopped_by = nullptr;  // the earlier scaled limit ended negotiation, not the whole run
+      phase = WorkPhase::Negotiation;
+      for (std::size_t ci = 0; ci < cs.size(); ++ci) {
+        lift_items(static_cast<int>(ci));
+        cs[ci].routed = cs[ci].implicit = cs[ci].coupled = cs[ci].bus_lane = false;
+        cs[ci].deps.clear();
+        cs[ci].at_a = cs[ci].at_b = kUnattached;
+      }
+      for (std::size_t ci = 0; ci < cs.size(); ++ci)
+        if (!best_items[ci].empty() || (!best_unrouted.empty() && !best_unrouted[ci])) {
+          restore_items(static_cast<int>(ci), best_items[ci]);
+          cs[ci].routed = best_unrouted.empty() || !best_unrouted[ci];
+          cs[ci].deps = best_deps[ci];
+          std::tie(cs[ci].at_a, cs[ci].at_b) = best_at[ci];
+          cs[ci].implicit = best_flags[ci][0];
+          cs[ci].coupled = best_flags[ci][1];
+          cs[ci].bus_lane = best_flags[ci][2];
+        }
+      res.routed = 0;
+      for (const auto& st : cs) res.routed += st.routed ? 1 : 0;
+      for (int round = 0; round < 4 && res.routed < res.connections && !out_of_budget(); ++round) {
+        const int f = lns_open(opt.polish_trials);
+        if (std::getenv("TM_DEBUG_LNS")) std::fprintf(stderr, "polish round %d: %d closed, %d of %d routed\n", round, f, res.routed, res.connections);
+        if (res.routed > best_routed) {
+          snapshot();
+          snapshot_unrouted();
+        }
+        if (f == 0) break;
+      }
+    }
     if (opt.deadline && best_routed == res.connections && res.connections > 0) {  // first complete variant sets the deadline
       const double d = 2 * elapsed() + 5;
       double cur = opt.deadline->load();
@@ -3845,6 +4735,7 @@ struct Router::Impl {
     // Clean-up only when the live state is a best state (it then stays one: every connection keeps a route).
     // Via-saving re-routes need search budget; smoothing is cheap geometry and always runs (it uses no budget and
     // no randomness, so --work runs stay deterministic).
+    phase = WorkPhase::Cleanup;
     if (opt.optimize && best_routed > 0 && res.routed == best_routed) {
       // Pairs split by negotiation: coupled again where they fit now (each attempt restores the old copper on failure).
       if ((opt.diff_pairs || !opt.pair_nets.empty()) && !out_of_budget()) res.pairs += route_diff_pairs(true);
@@ -3860,6 +4751,7 @@ struct Router::Impl {
         if (n == 0) break;
       }
       res.length_tuned = tune_lengths() + tune_skew();
+      if (!opt.buses.empty()) res.length_tuned += tune_bus_skew();
       if (std::getenv("TM_DEBUG_TUNE")) std::fprintf(stderr, "tuned nets: %d\n", res.length_tuned);
       snapshot();
       snapshot_unrouted();
@@ -3960,6 +4852,24 @@ PortfolioResult route_portfolio(const model::Board& board, const model::DesignRu
       [&](RouterOptions& o) { o.bend_states = false; o.via_cost_mm = base.via_cost_mm * 0.4; o.pitch_scale = 2.0; if (base.fine_variant) o.pitch_scale_small = 0.5; });
   add("fast bends, cheap crossings, escape plan", [&](RouterOptions& o) { o.bend_states = false; o.soft_cost_mm = base.soft_cost_mm * 0.5; o.escape_plan = true; });
   add("fast bends, dear vias", [&](RouterOptions& o) { o.bend_states = false; o.via_cost_mm = base.via_cost_mm * 2.5; });
+  // (package_pen below: tracks inside ball-grid packages cost more, doc 16 F3; +4 boards of 57 at 3 pitches on srj20)
+  // Beyond the designed eight: seeded diversifications (fast bends, jittered order; via cost, crossing cost and
+  // escape planning cycle with the index).
+  for (int k = 0; static_cast<int>(vs.size()) < std::min(variants, 64); ++k) {
+    static const double kVia[3] = {0.4, 1.0, 2.5}, kSoft[3] = {0.5, 1.0, 2.0};
+    add("seeded " + std::to_string(k), [&](RouterOptions& o) {
+      o.bend_states = false;
+      o.order = k % 4 == 3 ? 0 : 2;
+      o.seed = base.seed + 10 + static_cast<std::uint64_t>(k);
+      o.via_cost_mm = base.via_cost_mm * kVia[k % 3];
+      o.soft_cost_mm = base.soft_cost_mm * kSoft[(k / 3) % 3];
+      o.escape_plan = k % 2 == 0;
+      if (k % 2 == 1) o.package_pen = 3.0;
+      static const double kDir[3] = {-0.3, -0.6, -1.01};  // negative: automatic (breakout boards only) at that strength (doc 16 §11)
+      o.layer_dir_pen = kDir[(k / 2) % 3];
+      o.layer_dir_swap = k % 5 == 4;
+    });
+  }
   std::vector<int> chosen;
   if (!pick.empty()) {
     for (int i : pick)
@@ -3996,8 +4906,11 @@ PortfolioResult route_portfolio(const model::Board& board, const model::DesignRu
     for (std::size_t i = 0; i < alive.size(); ++i) alive[i] = i;
     std::vector<RouteResult> last(vs.size());      // each variant's result at its last rung
     std::vector<std::uint8_t> ran(vs.size(), 0);
+    std::vector<double> spent(vs.size(), 0.0);     // wall time per variant, summed over its rungs
+    std::vector<WorkProfile> work(vs.size());      // each variant's work, summed over the rungs it ran (a rung starts afresh)
     auto better_r = [&](const RouteResult& a, std::size_t ia, const RouteResult& c, std::size_t ic) {
       if (a.routed != c.routed) return a.routed > c.routed;
+      if (a.bus_left != c.bus_left) return a.bus_left < c.bus_left;
       if (a.vias.size() != c.vias.size()) return a.vias.size() < c.vias.size();
       const double la = length(a), lc = length(c);
       if (la != lc) return la < lc;
@@ -4026,6 +4939,8 @@ PortfolioResult route_portfolio(const model::Board& board, const model::DesignRu
       for (auto& t : pool) t.join();
       for (std::size_t k = 0; k < alive.size(); ++k) {
         if (!have_best || better_r(out[k], alive[k], best_res, best_i)) best_res = out[k], best_i = alive[k], have_best = true;
+        spent[alive[k]] += out[k].seconds;
+        for (int p = 0; p < kWorkPhases; ++p) work[alive[k]].phase[static_cast<std::size_t>(p)] += out[k].work.phase[static_cast<std::size_t>(p)];
         last[alive[k]] = std::move(out[k]);
         ran[alive[k]] = 1;
       }
@@ -4041,6 +4956,8 @@ PortfolioResult route_portfolio(const model::Board& board, const model::DesignRu
     for (std::size_t i = 0; i < vs.size(); ++i) {
       pr.variants.push_back(vs[i].name);
       pr.routed.push_back(ran[i] ? last[i].routed : 0);
+      pr.seconds.push_back(spent[i]);  // the job log and summary read one entry per variant
+      pr.work.push_back(work[i]);
     }
     pr.best_variant = static_cast<int>(best_i);
     pr.best = std::move(best_res);
@@ -4087,6 +5004,7 @@ PortfolioResult route_portfolio(const model::Board& board, const model::DesignRu
     const auto& a = rs[i];
     const auto& c = rs[j];
     if (a.routed != c.routed) return a.routed > c.routed;
+    if (a.bus_left != c.bus_left) return a.bus_left < c.bus_left;  // buses: fewer connections off their lanes (0 without buses)
     if (a.vias.size() != c.vias.size()) return a.vias.size() < c.vias.size();
     const double la = length(a), lc = length(c);
     if (la != lc) return la < lc;
@@ -4098,6 +5016,7 @@ PortfolioResult route_portfolio(const model::Board& board, const model::DesignRu
     pr.variants.push_back(vs[i].name);
     pr.routed.push_back(rs[i].routed);
     pr.seconds.push_back(rs[i].seconds);
+    pr.work.push_back(rs[i].work);
     if (i > 0 && better(i, best)) best = i;
   }
   pr.best_variant = static_cast<int>(best);
@@ -4108,6 +5027,35 @@ PortfolioResult route_portfolio(const model::Board& board, const model::DesignRu
 }
 
 int portfolio_size() { return 8; }
+
+WorkCounts& WorkCounts::operator+=(const WorkCounts& o) {
+  expansions += o.expansions;
+  flood_cells += o.flood_cells;
+  searches += o.searches;
+  cell_checks += o.cell_checks;
+  fixed_checks += o.fixed_checks;
+  field_cells += o.field_cells;
+  fields += o.fields;
+  commits += o.commits;
+  rips += o.rips;
+  return *this;
+}
+
+WorkCounts WorkProfile::total() const {
+  WorkCounts t;
+  for (const auto& p : phase) t += p;
+  return t;
+}
+
+const char* work_phase_name(WorkPhase p) {
+  switch (p) {
+    case WorkPhase::Setup: return "setup";
+    case WorkPhase::FirstPass: return "first_pass";
+    case WorkPhase::Negotiation: return "negotiation";
+    case WorkPhase::Cleanup: return "cleanup";
+  }
+  return "?";
+}
 
 Router::Router(const model::Board& board, const model::DesignRules& rules, RouterOptions opt) : in_(board), rules_(rules), opt_(opt) {}
 

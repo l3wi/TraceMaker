@@ -1,5 +1,14 @@
 cmake_minimum_required(VERSION 3.28)
 
+# Apple linkers rescan archives themselves; do not emit repeated transitive static libraries.
+# Traditional linkers retain the repetition they need under this capability-based policy.
+if(POLICY CMP0156)
+  cmake_policy(SET CMP0156 NEW)
+endif()
+if(POLICY CMP0179)
+  cmake_policy(SET CMP0179 NEW)
+endif()
+
 # Compilers. The presets do not pin them, so another machine can choose its own:
 #   C++:        -DCMAKE_CXX_COMPILER=..., else $CXX, else the newest of /usr/bin/g++-15, -14, -13, else CMake's default.
 #   CUDA host:  -DCMAKE_CUDA_HOST_COMPILER=..., else $TM_CUDA_HOST_CXX, else /usr/bin/g++-13 or g++-12.
@@ -40,7 +49,7 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 60 70 CACHE STRING "Tesla P100 (sm_60) and V100 (sm_70)")
 endif()
 
-project(TraceMaker VERSION 0.8.0 DESCRIPTION "Placement-aware PCB autorouter for KiCad" LANGUAGES CXX)
+project(TraceMaker VERSION 0.9.0 DESCRIPTION "Placement-aware PCB autorouter for KiCad" LANGUAGES CXX)
 
 if(APPLE)
   option(TM_ENABLE_CUDA "Build CUDA kernels (CPU reference paths are always built)" OFF)

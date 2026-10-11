@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // tracemaker: command-line front end. Subcommands grow with the roadmap (route, place, bench, serve, replay).
 #include <CLI/CLI.hpp>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <cstdio>
 #include <filesystem>
@@ -12,12 +14,16 @@
 #include "app/defects.hpp"
 #include "app/inspect.hpp"
 #include "app/route_job.hpp"
+#include "app/tui.hpp"
 #include "core/rng.hpp"
 #include "crules/engine.hpp"
 #include "crules/intent.hpp"
 #include "drc/drc.hpp"
+#include "drc/refill.hpp"
 #include "io/kicad/project_reader.hpp"
+#include "io/srj/srj.hpp"
 #include "route/router.hpp"
+#include "passes/style.hpp"
 #include "route/diff_pair.hpp"
 #include "route/escape.hpp"
 #include "route/escape_flow.hpp"
@@ -51,6 +57,20 @@ int cmd_gpu_info() {
                   static_cast<double>(d.free_bytes) / kMiB, static_cast<double>(d.total_bytes) / kMiB, d.uuid.c_str());
     }
   }
+  return 0;
+}
+
+// Style metric of every track, arc and via of a board (doc 05 §39.2), whoever routed it.
+int cmd_style(const std::string& path, const std::string& json_path, bool connections) {
+  const auto lb = tmk::io::read_board_file(path);
+  const auto& b = lb.board;
+  const auto rep = tmk::passes::measure_style(b, b.tracks, b.arcs, b.vias);
+  const auto j = tmk::passes::style_json(b, rep, connections);
+  std::printf("%zu connections, %d segments, %.2f mm, %d vias\n", rep.connections.size(), rep.segments, tmk::nm_to_mm(rep.length), rep.vias);
+  std::printf("bends %d (%.2f per connection), acute angles %d, stair-steps %d, short segments %d, off-angle segments %d, arcs %d\n", rep.bends,
+              rep.bends_per_connection(), rep.acute, rep.stair_steps, rep.short_segments, rep.off_angle, rep.arcs);
+  std::printf("detour ratio %.3f, long detours %d\n", rep.detour_ratio(), rep.long_detours);
+  if (!json_path.empty()) std::ofstream(json_path) << j.dump(1) << "\n";
   return 0;
 }
 
@@ -118,13 +138,21 @@ int cmd_perturb(const std::string& in, const std::string& out, std::uint64_t see
   return 0;
 }
 
-int cmd_drc(const std::string& path, const std::string& json_out, tmk::Coord epsilon, bool linear_zones, const std::string& project) {
+int cmd_drc(const std::string& path, const std::string& json_out, tmk::Coord epsilon, bool linear_zones, bool refill,
+            const std::string& project) {
   const auto lb = tmk::io::read_board_file(path);
   const auto rules = tmk::io::read_design_rules(path, project);
   tmk::drc::DrcOptions opt;
   opt.epsilon = epsilon;
   opt.linear_zone_tests = linear_zones;
-  const auto rep = tmk::drc::run_drc(lb.board, rules, opt);
+  // As kicad-cli's --refill-zones: judge the fills the current copper would get, not the stored ones (doc 05 §36).
+  tmk::drc::RefillResult refilled;
+  if (refill) {
+    refilled = tmk::drc::refill_zones(lb.board, rules);
+    std::printf("zones refilled           %d (%d islands removed)\n", refilled.zones, refilled.islands_removed);
+    for (const auto& w : refilled.warnings) std::printf("warning: %s\n", w.c_str());
+  }
+  const auto rep = tmk::drc::run_drc(refill ? refilled.board : lb.board, rules, opt);
   for (const auto& [type, n] : rep.counts()) std::printf("%-24s %d\n", type.c_str(), n);
   for (const auto& w : rep.warnings) std::printf("warning: %s\n", w.c_str());
   if (!json_out.empty()) tmk::drc::write_drc_json(rep, json_out);
@@ -166,7 +194,7 @@ int cmd_rules(const std::string& path, const std::string& mode_s, const std::str
     std::printf("generated custom rules written to %s\n", dru_out.c_str());
   }
   if (!intent_out.empty()) {
-    // A draft for review (doc 05 §44): the board file name only, so the manifest does not carry a local path.
+    // A draft for review (doc 05 §45): the board file name only, so the manifest does not carry a local path.
     auto in = cr::draft_intent(lb.board, cat, det);
     in.board = std::filesystem::path(path).filename().string();
     in.comment = "Draft from component rules: review every entry (skills/tracemaker-board-prep) before routing with --intent";
@@ -273,6 +301,35 @@ int cmd_pairs(const std::string& path, const std::vector<std::string>& extra, co
   }
   if (!json_path.empty()) std::ofstream(json_path) << nlohmann::json{{"board", path}, {"pairs", j}}.dump(1) << "\n";
   return 0;
+}
+
+// Buses of a routed board (doc 05 §38): per group the members routed, their vias, layers and lengths, and the skew
+// against the limit. Groups as in `route`: --bus NAME=PATTERN, --buses for detection, --bus-skew-mm.
+int cmd_buses(const std::string& path, const std::vector<std::string>& specs, bool detect, double skew_mm, const std::string& json_path) {
+  const auto lb = tmk::io::read_board_file(path);
+  const auto rules = tmk::io::read_design_rules(path);
+  std::vector<std::string> notes;
+  const auto groups = tmk::app::resolve_buses(lb.board, rules, specs, detect, skew_mm, &notes);
+  for (const auto& n : notes) std::printf("%s\n", n.c_str());
+  const auto joined = tmk::route::nets_joined(lb.board, rules);
+  nlohmann::json j = nlohmann::json::array();
+  bool ok = true;
+  for (const auto& g : groups) {
+    std::string line;
+    j.push_back(tmk::app::bus_report(lb.board, rules, joined, g, &line));
+    std::printf("%s\n", line.c_str());
+    std::printf("  %-28s %7s %9s %7s %5s  %s\n", "net", "routed", "len_mm", "via_mm", "vias", "layers");
+    for (const auto& m : j.back()["members"]) {
+      std::string layers;
+      for (const auto& l : m["layers"]) layers += (layers.empty() ? "" : " ") + l.get<std::string>();
+      std::printf("  %-28s %7s %9.3f %7.3f %5d  %s%s\n", m["net"].get<std::string>().c_str(), m["routed"].get<bool>() ? "yes" : "no", m["length_mm"].get<double>(),
+                  m["via_length_mm"].get<double>(), m["vias"].get<int>(), layers.c_str(), m["routed"].get<bool>() && !m["followed"].get<bool>() ? "  (left the bus)" : "");
+    }
+    if (j.back()["within_skew"].is_boolean() && !j.back()["within_skew"].get<bool>()) ok = false;
+  }
+  if (groups.empty()) std::printf("no buses\n");
+  if (!json_path.empty()) std::ofstream(json_path) << nlohmann::json{{"board", path}, {"buses", j}}.dump(1) << "\n";
+  return ok ? 0 : 4;  // 4: a group with a skew limit is over it or not completely routed
 }
 
 int cmd_escape(const std::string& path, const std::string& json_path, bool flow, bool soft_zones, double vias_off_pads_below_mm,
@@ -399,6 +456,195 @@ int cmd_debug_seg(const std::string& path, const std::vector<double>& v, int lay
   return 0;
 }
 
+// The options of a command as the options screen lists them, read from the command-line definitions.
+std::vector<tmk::app::tui::Field> tui_fields(CLI::App& cmd) {
+  std::vector<tmk::app::tui::Field> out;
+  for (CLI::Option* o : cmd.get_options()) {
+    if (o == cmd.get_help_ptr() || o->check_lname("config")) continue;  // the screen is the options file's editor
+    tmk::app::tui::Field f;
+    f.help = o->get_description();
+    f.hidden = o->get_group().empty();
+    const auto& longs = o->get_lnames();
+    const auto& shorts = o->get_snames();
+    if (o->get_expected_max() == 0) {  // a flag: one row, every spelling a state
+      for (const auto& n : longs) f.spellings.push_back("--" + n);
+      if (f.spellings.empty())
+        for (const auto& n : shorts) f.spellings.push_back("-" + n);
+      for (const auto& sp : f.spellings) f.label += (f.label.empty() ? "" : " / ") + sp;
+    } else if (longs.empty() && shorts.empty()) {
+      f.label = o->get_name();
+      f.save = false;
+    } else {
+      f.arg = longs.empty() ? "-" + shorts.front() : "--" + longs.front();
+      f.label = (shorts.empty() || longs.empty() ? "" : "-" + shorts.front() + ", ") + f.arg;
+      f.key = longs.empty() ? std::string() : longs.front();
+      o->capture_default_str();
+      f.def = o->get_default_str();
+      if (f.def == "[]" || f.def == "\"\"") f.def.clear();
+    }
+    if (f.label == "board" || f.arg == "--output") f.save = false;  // they belong to one run, not to a set of options
+    if (!f.label.empty()) out.push_back(std::move(f));
+  }
+  return out;
+}
+
+// What the command-line parser says about `args` (subcommand first), without touching this process: the variables
+// the options are bound to keep their defaults for the run that may follow. Empty if the arguments parse.
+std::string cli_check(CLI::App& app, const std::vector<std::string>& args) {
+  int fd[2];
+  if (::pipe(fd) != 0) return {};
+  std::fflush(nullptr);
+  const pid_t pid = ::fork();
+  if (pid < 0) {
+    ::close(fd[0]), ::close(fd[1]);
+    return {};
+  }
+  if (pid == 0) {
+    ::close(fd[0]);
+    std::string msg;
+    try {
+      std::vector<std::string> rev(args.rbegin(), args.rend());
+      app.clear();
+      app.parse(rev);
+    } catch (const CLI::ParseError& e) {
+      msg = e.what();
+    } catch (const std::exception& e) {
+      msg = e.what();
+    }
+    if (!msg.empty() && ::write(fd[1], msg.data(), msg.size()) < 0) ::_exit(1);
+    ::_exit(0);
+  }
+  ::close(fd[1]);
+  std::string msg;
+  char buf[512];
+  for (ssize_t n; (n = ::read(fd[0], buf, sizeof buf)) > 0;) msg.append(buf, static_cast<std::size_t>(n));
+  ::close(fd[0]);
+  int st = 0;
+  ::waitpid(pid, &st, 0);
+  for (char& c : msg)
+    if (c == '\n') c = ' ';
+  return msg;
+}
+
+
+// `tracemaker tui`: the options screen for `route`. Returns the exit code; `next` holds the arguments of the run the
+// user asked for, if any.
+int cmd_tui(CLI::App& app, CLI::App& route, const std::string& board, const std::string& out, const std::string& config,
+            const std::string& keys, bool scripted, std::vector<std::string>& next) {
+  namespace tui = tmk::app::tui;
+  tui::Model m("tracemaker route", tui_fields(route), [&](const std::vector<std::string>& args) {
+    std::vector<std::string> all{"route"};
+    all.insert(all.end(), args.begin(), args.end());
+    return cli_check(app, all);
+  });
+  // Three places keep options, the higher over the lower: the user's (global), the board's folder (project) and a file
+  // named with --config. Reading them here only fills the screen; `route` takes a file only when it is named, so a
+  // run never depends on a file it did not announce (the screen shows the whole command that stands for the choices).
+  namespace fs = std::filesystem;
+  const char* xdg = std::getenv("XDG_CONFIG_HOME");
+  const char* home = std::getenv("HOME");
+  std::string global_path;
+  if (xdg && *xdg)
+    global_path = (fs::path(xdg) / "tracemaker" / "route.conf").string();
+  else if (home && *home)
+    global_path = (fs::path(home) / ".config" / "tracemaker" / "route.conf").string();
+  const fs::path board_dir = board.empty() ? fs::path() : fs::path(board).parent_path();
+  const std::string project_path = (board_dir.empty() ? fs::path("tracemaker.conf") : board_dir / "tracemaker.conf").string();
+  std::string first_problem;
+  auto load = [&](tui::Scope sc, const std::string& path) {
+    std::ifstream f(path);
+    if (!f) return false;
+    const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    for (const std::string& p : m.load_config(text, sc)) {
+      std::fprintf(stderr, "warning: %s: %s\n", path.c_str(), p.c_str());
+      if (first_problem.empty()) first_problem = path + ": " + p;
+    }
+    return true;
+  };
+  if (!global_path.empty()) m.enable_scope(tui::Scope::global, global_path, load(tui::Scope::global, global_path));
+  m.enable_scope(tui::Scope::project, project_path, load(tui::Scope::project, project_path));
+  if (!config.empty()) {
+    m.enable_scope(tui::Scope::file, config, load(tui::Scope::file, config));
+    m.set_target(tui::Scope::file);
+  } else {
+    m.disable_scope(tui::Scope::file);
+    m.set_target(tui::Scope::project);
+  }
+  if (!first_problem.empty()) m.set_status("cannot use a line of " + first_problem);
+  if (!board.empty()) m.set("board", board);
+  if (!out.empty()) m.set("--output", out);
+  const tui::Action a = scripted ? tui::run_keys(m, keys) : tui::run_terminal(m);
+  if (scripted && !m.status().empty()) std::fprintf(stderr, "%s\n", m.status().c_str());
+  if (a == tui::Action::print) {
+    std::printf("%s\n", m.command_line().c_str());
+  } else if (a == tui::Action::run) {
+    std::fprintf(stderr, "%s\n", m.command_line().c_str());
+    next = m.args();
+    next.insert(next.begin(), "route");
+  }
+  return 0;
+}
+
+// Simple Route JSON problem -> KiCad board, project and (if needed) custom rules next to each other (doc 08 §9).
+int cmd_srj_import(const std::string& in, const std::string& out, double clearance_mm, double hole_to_hole_mm, const std::string& json_out, double margin_mm = 0, bool unpointed = false) {
+  namespace fs = std::filesystem;
+  const auto problem = tmk::io::read_srj_file(in);
+  tmk::io::SrjImportOptions opt;
+  if (clearance_mm >= 0) opt.clearance = tmk::mm_to_nm(clearance_mm);
+  if (hole_to_hole_mm >= 0) opt.hole_to_hole = tmk::mm_to_nm(hole_to_hole_mm);
+  opt.outline_margin = tmk::mm_to_nm(margin_mm);
+  opt.unpointed_keepout = unpointed;
+  const auto files = tmk::io::srj_to_kicad(problem, opt);
+  auto write = [](const fs::path& p, const std::string& text) {
+    std::ofstream f(p, std::ios::binary);
+    f << text;
+    if (!f) throw std::runtime_error("cannot write " + p.string());
+  };
+  write(out, files.pcb);
+  write(fs::path(out).replace_extension(".kicad_pro"), files.pro);
+  // A rule file left by an earlier import must not judge this board.
+  const fs::path dru = fs::path(out).replace_extension(".kicad_dru");
+  if (!files.dru.empty()) write(dru, files.dru);
+  else fs::remove(dru);
+  std::printf("%s: %d layers, %d nets, %d pads, %d connections; clearance %.3f mm, track %.3f mm, via %.3f/%.3f mm\n", out.c_str(),
+              problem.layer_count, files.nets, files.pads, files.srj_pairs, tmk::nm_to_mm(files.clearance), tmk::nm_to_mm(files.track_width),
+              tmk::nm_to_mm(files.via_diameter), tmk::nm_to_mm(files.via_drill));
+  for (const auto& w : files.warnings) std::printf("  warning: %s\n", w.c_str());
+  if (!json_out.empty()) {
+    nlohmann::json j = {{"layers", problem.layer_count}, {"nets", files.nets}, {"pads", files.pads}, {"terminal_pads", files.terminal_pads},
+                        {"srj_connections", problem.connections.size()}, {"srj_pairs", files.srj_pairs}, {"board_pairs", files.board_pairs},
+                        {"clearance_mm", tmk::nm_to_mm(files.clearance)}, {"hole_to_hole_mm", tmk::nm_to_mm(files.hole_to_hole)}, {"track_width_mm", tmk::nm_to_mm(files.track_width)},
+                        {"via_diameter_mm", tmk::nm_to_mm(files.via_diameter)}, {"via_drill_mm", tmk::nm_to_mm(files.via_drill)},
+                        {"allow_blind_buried_vias", problem.rules.blind_buried_vias}, {"allow_via_in_pad", problem.rules.via_in_pad},
+                        {"custom_rules", !files.dru.empty()}, {"warnings", files.warnings}};
+    std::ofstream(json_out) << j.dump(1) << "\n";
+  }
+  return 0;
+}
+
+// Routed board -> the problem's SRJ with `traces` (doc 08 §9). Exit code 3 when a connection has no copper path,
+// like `route` with unrouted connections.
+int cmd_srj_export(const std::string& board, const std::string& problem, const std::string& out, const std::string& json_out) {
+  std::ifstream f(problem, std::ios::binary);
+  if (!f) throw std::runtime_error("cannot open " + problem);
+  const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  const auto lb = tmk::io::read_board_file(board);
+  const auto res = tmk::io::srj_export(text, lb.board);
+  std::ofstream o(out, std::ios::binary);
+  o << res.json;
+  if (!o) throw std::runtime_error("cannot write " + out);
+  std::printf("%s: %d/%d connections routed, %d traces (%d of copper on no connection path), %d vias\n", out.c_str(), res.routed, res.connections,
+              res.traces + res.extra_traces, res.extra_traces, res.vias);
+  for (const auto& n : res.unrouted) std::printf("  unrouted: %s\n", n.c_str());
+  for (const auto& w : res.warnings) std::printf("  warning: %s\n", w.c_str());
+  if (!json_out.empty()) {
+    nlohmann::json j = {{"connections", res.connections}, {"routed", res.routed}, {"unrouted", res.unrouted}, {"traces", res.traces},
+                        {"extra_traces", res.extra_traces}, {"vias", res.vias}, {"warnings", res.warnings}};
+    std::ofstream(json_out) << j.dump(1) << "\n";
+  }
+  return res.routed == res.connections ? 0 : 3;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -424,7 +670,7 @@ int main(int argc, char** argv) {
       ->check(CLI::IsMember({"report", "soft", "on"}));
   crules_cmd->add_option("--dru", cr_dru, "Write the generated custom rules (sidecar .kicad_dru) to this file");
   crules_cmd->add_option("--roles-from", cr_roles_from, "Detect and bind roles on this version of the board (e.g. the placement input), measure on the given one");
-  crules_cmd->add_option("--intent-draft", cr_intent, "Write a routing intent manifest drafted from the detections (doc 05 §44) for review");
+  crules_cmd->add_option("--intent-draft", cr_intent, "Write a routing intent manifest drafted from the detections (doc 05 §45) for review");
   crules_cmd->add_option("--catalogue", cr_cat, "Catalogue JSON to use instead of the built-in one (scripts/crules_catalogue.py output)");
   crules_cmd->add_option("--rules-override", cr_override,
                          "User override file (JSON, doc 15 §6.3): disable rules, assert/deny categories, set parameters")
@@ -453,6 +699,8 @@ int main(int argc, char** argv) {
   drc->add_option("--epsilon-um", drc_eps_um, "Tolerance below the required clearance, micrometres");
   bool drc_linear_zones = false;
   drc->add_flag("--linear-zones", drc_linear_zones, "Reference path: test items against every edge of a zone fill")->group("");
+  bool drc_refill = false;
+  drc->add_flag("--refill-zones", drc_refill, "Refill zones for the current copper before checking (not written)");
 
   auto* pert = app.add_subcommand("selftest-perturb", "Add random tracks/vias and footprint moves (DRC parity fuzzing)");
   pert->group("");
@@ -479,7 +727,6 @@ int main(int argc, char** argv) {
   brk->add_option("--manifest", bk_manifest, "Write the injected defects as JSON");
 
   auto* route = app.add_subcommand("route", "Route all unrouted connections of a board");
-
   tmk::app::RouteJob r_job;
   tmk::app::add_route_options(*route, r_job, true);
 
@@ -501,6 +748,44 @@ int main(int argc, char** argv) {
   pairs_cmd->add_option("board", pr_board)->required()->check(CLI::ExistingFile);
   pairs_cmd->add_option("--pair", pr_extra, "Also measure this pair (NET_A,NET_B), e.g. USB nets named DP/DM");
   pairs_cmd->add_option("--json", pr_json, "Write the measurements as JSON");
+  auto* buses_cmd = app.add_subcommand("buses", "Buses of a routed board: members routed, vias and layers per member, lengths and skew (exit 4 when a limit is missed)");
+  std::string bu_board, bu_json;
+  std::vector<std::string> bu_specs;
+  bool bu_detect = false;
+  double bu_skew = 0;
+  buses_cmd->add_option("board", bu_board)->required()->check(CLI::ExistingFile);
+  buses_cmd->add_option("--bus", bu_specs, "A bus as NAME=PATTERN (repeatable), as in route");
+  buses_cmd->add_flag("--buses", bu_detect, "Also find buses in the net names, as in route");
+  buses_cmd->add_option("--bus-skew-mm", bu_skew, "Skew limit of the --bus groups (0 = only the board's custom skew rules)");
+  buses_cmd->add_option("--json", bu_json, "Write the measurements as JSON");
+  auto* style_cmd = app.add_subcommand("style", "Style metric of a routed board: bends, acute angles, stair-steps, detours (doc 05 §39)");
+  std::string sty_board, sty_json;
+  bool sty_conn = false;
+  style_cmd->add_option("board", sty_board)->required()->check(CLI::ExistingFile);
+  style_cmd->add_option("--json", sty_json, "Write the metric as JSON");
+  style_cmd->add_flag("--connections", sty_conn, "With --json: also one row per connection");
+  auto* srj_in = app.add_subcommand("srj-import", "Convert a Simple Route JSON problem (tscircuit) to a KiCad board with its project and rules");
+  std::string si_in, si_out, si_json;
+  double si_clearance = -1, si_hole = -1;
+  srj_in->add_option("problem", si_in, "Simple Route JSON file")->required()->check(CLI::ExistingFile);
+  srj_in->add_option("-o,--output", si_out, "Output .kicad_pcb (the .kicad_pro, and a .kicad_dru if needed, are written next to it)")->required();
+  srj_in->add_option("--clearance-mm", si_clearance,
+                     "Copper clearance (default: the problem's defaultObstacleMargin, else tscircuit's fallback of 0.15 mm)")
+      ->check(CLI::NonNegativeNumber);
+  srj_in->add_option("--hole-to-hole-mm", si_hole,
+                     "Drill edge to drill edge clearance (default: the problem's via-hole / drill clearance fields, else no rule)")
+      ->check(CLI::NonNegativeNumber);
+  double si_margin = 0;
+  bool si_unpointed = false;
+  srj_in->add_flag("--unpointed-keepout", si_unpointed, "Pads of a net that no connection point lies on become keep-outs (fan-out problems)");
+  srj_in->add_option("--outline-margin-mm", si_margin, "Grow the board outline by this on every side (breakout points on the bounds)")->check(CLI::NonNegativeNumber);
+  srj_in->add_option("--json", si_json, "Write the conversion summary (counts, rules used, warnings) as JSON");
+  auto* srj_out = app.add_subcommand("srj-export", "Write a routed board's copper as the `traces` of its Simple Route JSON problem");
+  std::string so_board, so_problem, so_out, so_json;
+  srj_out->add_option("board", so_board, "Routed .kicad_pcb made by srj-import")->required()->check(CLI::ExistingFile);
+  srj_out->add_option("--problem", so_problem, "The Simple Route JSON problem the board was imported from")->required()->check(CLI::ExistingFile);
+  srj_out->add_option("-o,--output", so_out, "Output Simple Route JSON (the problem plus traces)")->required();
+  srj_out->add_option("--json", so_json, "Write the export summary (routed and unrouted connections) as JSON");
   auto* dseg = app.add_subcommand("debug-seg", "Explain the router's verdict on one segment");
   dseg->group("");
   std::string ds_board, ds_net;
@@ -525,7 +810,49 @@ int main(int argc, char** argv) {
   dbg->add_option("--width", d_width);
   dbg->add_flag("--via", d_via, "Also print where a via of the pad's net is legal");
 
+  auto* tui = app.add_subcommand("tui", "Choose the route options on a terminal screen, then run, print or save them");
+  std::string t_board, t_out, t_config, t_keys;
+  tui->add_option("board", t_board, "Board file to route");
+  tui->add_option("-o,--output", t_out, "Output .kicad_pcb");
+  tui->add_option("--config", t_config, "Options file to start from (if it exists) and to save to");
+  auto* t_keys_opt = tui->add_option("--keys", t_keys, "Test: take these keys instead of opening the terminal, then print the command")->group("");
+
   CLI11_PARSE(app, argc, argv);
+  std::vector<std::string> parsed_args(argv + 1, argv + argc);
+  if (*tui) {
+    // The screen ends in a `route` run, a printed command or nothing. A run goes through the parser again, exactly
+    // as if the user had typed the command.
+    std::vector<std::string> next;
+    try {
+      const int rc = cmd_tui(app, *route, t_board, t_out, t_config, t_keys, t_keys_opt->count() > 0, next);
+      if (next.empty()) return rc;
+      parsed_args = next;
+      std::reverse(next.begin(), next.end());
+      app.clear();
+      app.parse(next);
+    } catch (const CLI::ParseError& e) {
+      return app.exit(e);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "error: %s\n", e.what());
+      return 1;
+    }
+  }
+  if (*route && !r_job.config.empty()) {
+    // Named options files use the shared CLI/Python contract; command-line values win.
+    try {
+      std::vector<std::string> all = tmk::app::route_config_args(*route, r_job.config);
+      all.insert(all.begin(), parsed_args.begin(), parsed_args.end());
+      std::reverse(all.begin(), all.end());
+      r_job = tmk::app::RouteJob{};
+      app.clear();
+      app.parse(all);
+    } catch (const CLI::ParseError& e) {
+      return app.exit(e);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "error: %s\n", e.what());
+      return 1;
+    }
+  }
   try {
     if (*version) {
       std::printf("tracemaker %s\n", std::string(tmk::version()).c_str());
@@ -543,11 +870,15 @@ int main(int argc, char** argv) {
     }
     if (*crules_cmd) return cmd_rules(cr_path, cr_mode, cr_json, cr_dru, cr_roles_from, cr_cat, cr_override, cr_project, cr_intent);
     if (*selftest) return cmd_selftest_edit(st_in, st_out);
+    if (*srj_in) return cmd_srj_import(si_in, si_out, si_clearance, si_hole, si_json, si_margin, si_unpointed);
+    if (*srj_out) return cmd_srj_export(so_board, so_problem, so_out, so_json);
     if (*dseg) return cmd_debug_seg(ds_board, ds_pts, ds_layer, ds_width, ds_net);
     if (*esc) return cmd_escape(esc_board, esc_json, esc_flow, esc_soft, esc_vop ? esc_vop_below : 0.0, esc_project);
     if (*pairs_cmd) return cmd_pairs(pr_board, pr_extra, pr_json);
+    if (*buses_cmd) return cmd_buses(bu_board, bu_specs, bu_detect, bu_skew, bu_json);
+    if (*style_cmd) return cmd_style(sty_board, sty_json, sty_conn);
     if (*dbg) return cmd_debug_pad(d_board, d_ref, d_num, d_pitch, d_radius, d_width, d_via);
-    if (*drc) return cmd_drc(drc_path, drc_json, static_cast<tmk::Coord>(drc_eps_um * 1000.0), drc_linear_zones, drc_project);
+    if (*drc) return cmd_drc(drc_path, drc_json, static_cast<tmk::Coord>(drc_eps_um * 1000.0), drc_linear_zones, drc_refill, drc_project);
     if (*pert) return cmd_perturb(pin, pout, pseed, ptracks, pvias, pmoves);
     if (*brk) {
       const int n = tmk::app::inject_defects(bk_in, bk_out, bk_manifest, bk_kind, bk_seed, bk_count);

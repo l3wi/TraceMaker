@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
-// Which copper layers may carry new tracks, and what a track costs on each (doc 05 §29/§41).
+// Which copper layers may carry new tracks, and what a track costs on each (doc 05 §29/§42).
 #include <cstdint>
 #include <string>
 #include <vector>

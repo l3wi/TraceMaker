@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Plane ties (doc 05 §43, D98).
+"""Plane ties (doc 05 §44, D105).
 
   plane_tie.py <tracemaker> <workdir>
 

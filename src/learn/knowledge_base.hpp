@@ -4,7 +4,7 @@
 //
 //  * per board-feature bucket: variant outcomes for reporting and offline analysis;
 //  * per board (exact content hash): connections left unrouted on earlier runs.
-// History never changes connection order or the configured portfolio (D99).
+// History never changes connection order or the configured portfolio (D106).
 //
 // SQLite file, default ~/.local/share/tracemaker/kb.sqlite. Every call is best-effort: a missing or locked
 // database never stops routing.

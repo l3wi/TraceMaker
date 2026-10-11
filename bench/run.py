@@ -9,6 +9,7 @@ repository, judged by KiCad DRC on Freerouting's side).
   bench/run.py --tier A --limit 60 --time 60 --jobs 12 [--name run-id]
   bench/run.py --set quick --work 1000000 --refill --route-args="--variants 1 --soft-zones --keep-vias-off-pads --diff-pairs"
   bench/run.py --set modern-planes --human --refill --name human-modern
+  bench/run.py --set srj19 --work 1000000 --route-args "--variants 1 --no-gpu"   # tscircuit BGA breakouts (doc 10 §7)
 
 --work routes with a deterministic work budget and no knowledge base. --refill
 judges and saves a fresh analysis copy as boards/<name>.refilled.kicad_pcb,
@@ -24,13 +25,14 @@ import datetime
 import hashlib
 import json
 import os
-import threading
 import pathlib
 import random
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from collections import Counter
 
@@ -44,6 +46,7 @@ FR_RESULTS = ROOT / "bench/data/freerouting/scripts/benchmark/results/benchmarks
 TM = pathlib.Path(os.environ.get("TM_BINARY", ROOT / "build/release/src/app/tracemaker"))
 EXTRA = os.environ.get("TM_ROUTE_ARGS", "").split()  # extra route options for experiments, e.g. "--via-cost-mm 3"
 THREADS = 1
+PLACE_THREADS = 1
 WORK = 0         # --work N: deterministic work budget per board (0: wall-clock --time only)
 REFILL = False   # --refill: KiCad refills zones before judging
 HUMAN = False    # --human: judge the prepared routed original without running the router
@@ -152,7 +155,7 @@ def place_board(name: str, src: pathlib.Path, outdir: pathlib.Path, res: dict) -
     t0 = time.time()
     try:
         p = subprocess.run([str(PLACE), str(src), "-o", str(placed), "--mode", PLACE_MODE, "--route-check", str(PLACE_WORK),
-                            "--threads", str(THREADS), "--json", str(js)]
+                            "--threads", str(PLACE_THREADS), "--json", str(js)]
                            + (["--component-rules", PLACE_CRULES] if PLACE_CRULES else []) + PLACE_ARGS
                            + (["--loop-time", str(int(PLACE_TIMEOUT * 0.6))] if PLACE_MODE == "routable" else []), capture_output=True, text=True, timeout=PLACE_TIMEOUT)
         res["place_exit"] = p.returncode
@@ -191,6 +194,55 @@ def dead_pins(board: pathlib.Path, out_json: pathlib.Path) -> int | None:
         return int(json.loads(out_json.read_text())["dead"])
     except (subprocess.TimeoutExpired, OSError, ValueError, KeyError):
         return None
+
+
+STYLE_COUNTS = ("connections", "segments", "vias", "bends", "acute_angles", "stair_steps", "short_segments", "off_angle_segments",
+                "long_detours", "length_mm", "detour_length_mm", "detour_octile_mm")
+
+
+def style_of(board: pathlib.Path, out_json: pathlib.Path) -> dict | None:
+    """Style metric of every track of a board (`tracemaker style`, doc 05 §39), e.g. a fixture's reference routing."""
+    try:
+        subprocess.run([str(TM), "style", str(board), "--json", str(out_json)], capture_output=True, timeout=300)
+        return json.loads(out_json.read_text())
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+
+
+def style_total(styles: list[dict]) -> dict | None:
+    """Sums the per-board style metrics; the two ratios are recomputed from the sums."""
+    if not styles:
+        return None
+    t = {k: round(sum(s.get(k, 0) for s in styles), 6) for k in STYLE_COUNTS}
+    t["boards"] = len(styles)
+    t["bends_per_connection"] = round(t["bends"] / t["connections"], 4) if t["connections"] else 0.0
+    t["detour_ratio"] = round(t["detour_length_mm"] / t["detour_octile_mm"], 4) if t["detour_octile_mm"] else 1.0
+    return t
+
+
+def run_measured(cmd: list[str], timeout: float) -> tuple[int, str, str, float]:
+    """Runs cmd and returns (exit code, stdout, stderr, CPU seconds). CPU time is the child's own user + system time
+    from os.wait4, so other boards routing at the same time do not count. Raises subprocess.TimeoutExpired."""
+    with tempfile.TemporaryFile("w+") as fo, tempfile.TemporaryFile("w+") as fe:
+        p = subprocess.Popen(cmd, stdout=fo, stderr=fe, text=True)
+        killed = threading.Event()
+
+        def kill() -> None:
+            killed.set()
+            p.kill()
+
+        timer = threading.Timer(timeout, kill)
+        timer.start()
+        try:
+            _, status, usage = os.wait4(p.pid, 0)
+        finally:
+            timer.cancel()
+        p.returncode = os.waitstatus_to_exitcode(status)  # reaped here: Popen must not wait again
+        if killed.is_set():
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        fo.seek(0)
+        fe.seek(0)
+        return p.returncode, fo.read(), fe.read(), usage.ru_utime + usage.ru_stime
 
 
 def run_board(name: str, outdir: pathlib.Path, time_limit: float) -> dict:
@@ -232,11 +284,14 @@ def run_board(name: str, outdir: pathlib.Path, time_limit: float) -> dict:
                     subprocess.run([str(TM), "rules", str(src), "--intent-draft", str(man)], check=True, capture_output=True)
                 intent = ["--intent", str(man)]
                 res["intent"] = str(man)
-            p = subprocess.run([str(TM), "route", str(src), "-o", str(out), "--time", str(time_limit), "--threads", str(THREADS), "--json", str(out) + ".route.json"] + budget + intent + EXTRA,
-                               capture_output=True, text=True, timeout=time_limit * 3 + 60)
-            res["exit"] = p.returncode
-            if p.returncode not in (0, 3):
-                res["error"] = (p.stderr or p.stdout)[-500:]
+            code, stdout, stderr, cpu = run_measured(
+                [str(TM), "route", str(src), "-o", str(out), "--time", str(time_limit), "--threads", str(THREADS),
+                 "--json", str(out) + ".route.json"] + budget + intent + EXTRA,
+                time_limit * 3 + 60)
+            res["exit"] = code
+            res["cpu_s"] = round(cpu, 2)
+            if code not in (0, 3):
+                res["error"] = (stderr or stdout)[-500:]
         except subprocess.TimeoutExpired:
             res["exit"] = -1
             res["error"] = "timeout"
@@ -245,6 +300,15 @@ def run_board(name: str, outdir: pathlib.Path, time_limit: float) -> dict:
     if rj.exists() and not HUMAN:
         r = json.loads(rj.read_text())
         res.update({k: r[k] for k in ("routed", "connections", "tracks", "vias", "seconds")})
+        # Preserve whole-job and winning-variant timing/work, style and post-route pass reports.
+        res.update({k: r[k] for k in ("variant_seconds", "variants", "expansions", "work", "work_all_variants",
+                                     "stop", "style", "widen", "stitch") if k in r})
+    # Prepared fixtures keep the byte-original human; legacy PCBench names it processed.kicad_pcb.
+    ref = SRC_FIX / name / "routed.kicad_pcb"
+    if not ref.exists():
+        ref = SRC_FIX / name / "processed.kicad_pcb"
+    if ref.exists() and "style" in res:
+        res["style_ref"] = style_of(ref, outdir / "boards" / f"{name}.style_ref.json")
     before = drc(src, planes=planes)
     saved = out.with_name(f"{name}.refilled.kicad_pcb") if REFILL else None
     after = drc(out, planes=planes, saved=saved) if out.exists() else None
@@ -278,15 +342,17 @@ def main() -> int:
     ap.add_argument("--limit", type=int, default=50)
     ap.add_argument("--time", type=float, help="wall-clock limit per board (default 60 s; 3600 s as a safety stop with --work)")
     ap.add_argument("--work", type=int, default=0, help="deterministic work budget per board (no knowledge base)")
-    ap.add_argument("--refill", action="store_true", help="KiCad refills zones before judging input and output")
+    ap.add_argument("--refill", action="store_true", help="KiCad refills and saves private analysis copies before judging input and output")
     ap.add_argument("--human", action="store_true", help="judge fixtures' routed.kicad_pcb human originals without routing")
     ap.add_argument("--route-args", help="extra route options, space-separated; adds to TM_ROUTE_ARGS (write --route-args=--opt for one option)")
-    ap.add_argument("--set", help="board set in bench/sets/<SET>.txt (quick, mid, planes, modern-planes); also names the set in the summary")
+    ap.add_argument("--set", help="board set in bench/sets/<SET>.txt (quick, mid, planes, modern-planes, srj19, srj20); also names the set in the summary")
     ap.add_argument("--jobs", type=int, default=12)
     ap.add_argument("--seed", type=int, default=1, help="board sampling seed")
     ap.add_argument("--name")
     ap.add_argument("--boards", nargs="*", help="explicit board folder names")
-    ap.add_argument("--threads", type=int, default=1, help="router portfolio size per board")
+    ap.add_argument("--threads", type=int, help="router threads per board (default with --work: the cores per job, at most 8, "
+                    "since the output does not depend on it, but 1 with --halving in the route options, where it does; "
+                    "without --work it is also the portfolio size, default 1)")
     ap.add_argument("--place", choices=["auto", "routable", "eco", "refine", "full"], help="let TraceMaker move components first")
     ap.add_argument("--place-timeout", type=int, default=900)
     ap.add_argument("--place-work", type=int, default=3_000_000)
@@ -296,28 +362,37 @@ def main() -> int:
     ap.add_argument("--board-list", help="file with one board name per line (# comments)")
     ap.add_argument("--full", action="store_true", help="also route the set's `#slow` boards (the largest; run before committing, doc 10 §4)")
     ap.add_argument("--set-name", help="name of the board set for the summary (default: the tier)")
-    ap.add_argument("--intents", help="route with DIR/<board>.intent.json routing intent manifests (doc 05 §44); missing ones are drafted from the input")
+    ap.add_argument("--intents", help="route with DIR/<board>.intent.json routing intent manifests (doc 05 §45); missing ones are drafted from the input")
     a = ap.parse_args()
-    global THREADS, SRC_FIX, PLACE_ARGS, WORK, REFILL, EXTRA, INTENTS, HUMAN
+    global THREADS, PLACE_THREADS, SRC_FIX, PLACE_ARGS, WORK, REFILL, EXTRA, INTENTS, HUMAN
     PLACE_ARGS = (a.place_args or "").split()
-    THREADS = a.threads
+    # With --work every board runs the whole portfolio whatever the thread count (D47); one thread runs its eight
+    # variants one after another. Placement keeps one thread unless asked: its annealing runs follow --threads.
+    # Successive halving splits the budget by the thread count, so there the default must not follow the machine.
+    EXTRA = EXTRA + (a.route_args or "").split()
+    THREADS = a.threads or (max(1, min(8, (os.cpu_count() or 1) // a.jobs)) if a.work and "--halving" not in EXTRA else 1)
+    PLACE_THREADS = a.threads or 1
+    a.threads = THREADS
     WORK, REFILL, HUMAN = a.work, a.refill, a.human
     if HUMAN and (a.place or a.intents):
         ap.error("--human cannot be combined with --place or --intents")
-    EXTRA = EXTRA + (a.route_args or "").split()
     if a.intents:
         INTENTS = pathlib.Path(a.intents).resolve()
         INTENTS.mkdir(parents=True, exist_ok=True)
     if a.time is None:
         a.time = 3600.0 if a.work else 60.0
-    if a.fixtures:
-        SRC_FIX = pathlib.Path(a.fixtures).resolve()
     if a.set:
         a.board_list = a.board_list or str(ROOT / "bench/sets" / f"{a.set}.txt")
         a.set_name = a.set_name or a.set
+        # Set metadata overrides the conventional directory, never an explicit --fixtures.
+        for line in pathlib.Path(a.board_list).read_text().splitlines():
+            if line.startswith("#fixtures:") and not a.fixtures:
+                a.fixtures = str(ROOT / line.split(":", 1)[1].strip())
         if not a.fixtures:
             SRC_FIX = ROOT / {"quick": "build/pcbench", "mid": "build/pcbench",
                               "modern-planes": "build/modern-planes"}.get(a.set, str(FIX))
+    if a.fixtures:
+        SRC_FIX = pathlib.Path(a.fixtures).resolve()
     if a.board_list:
         if not a.boards:
             a.boards = set_boards(a.board_list, full=a.full)
@@ -385,6 +460,7 @@ def main() -> int:
         "clean_pass": round(clean / n, 4) if n else None,
         "completion": round(sum(r["completion"] for r in judged) / n, 4) if n else None,
         "seconds": round(sum(r.get("seconds", 0) for r in judged), 1),
+        "cpu_seconds": round(sum(r.get("cpu_s", 0) for r in judged), 1),
         "time_limit_s": a.time, "threads": a.threads, "work": a.work, "refill": a.refill, "full": a.full, "route_args": " ".join(EXTRA),
         "intents": str(INTENTS) if INTENTS else None,
         "fr_rc12_clean_pass": round(fr_clean / len(fr_rows), 4) if fr_rows else None,
@@ -401,13 +477,21 @@ def main() -> int:
                 "plane_vias_added", "signal_vias_added", "plane_track_mm_added", "signal_track_mm_added"):
         summary[key] = round(sum(r[key] for r in judged if key in r), 4)
     summary["plane_metrics_boards"] = sum("plane_unconnected_after" in r for r in judged)
+    # Style metric (informational, never a gate): totals over the boards that have it, and over the reference
+    # routings of the same boards.
+    with_style = [r for r in rows if r.get("style")]
+    with_ref = [r for r in with_style if r.get("style_ref")]
+    summary["style"] = style_total([r["style"] for r in with_style])
+    summary["style_ref"] = style_total([r["style_ref"] for r in with_ref])
+    summary["style_same_boards"] = style_total([r["style"] for r in with_ref])
     (outdir / "summary.json").write_text(json.dumps(summary, indent=1))
     label = "Human" if HUMAN else "TraceMaker"
     notes = (["human originals (no routing)"] if HUMAN else [f"{budget} per board"]) + (["zones refilled and saved before judging"] if a.refill else []) + ([f"route options `{' '.join(EXTRA)}`"] if EXTRA and not HUMAN else [])
     lines = [f"# Benchmark {run_id}", "", f"{a.set_name or 'PCBench tier ' + a.tier}, {n} boards, {', '.join(notes)}.", "",
              f"| Metric | {label} | Freerouting 2.5.0-RC12 | Freerouting 2.4.1 |", "|---|--:|--:|--:|",
              f"| Clean pass (KiCad DRC) | {format(summary['clean_pass'], '.1%') if n else 'unknown'} | {summary['fr_rc12_clean_pass'] or 0:.1%} | {summary['fr_241_clean_pass'] or 0:.1%} |",
-             f"| Mean completion | {format(summary['completion'], '.1%') if n else 'unknown'} | | |", "",
+             f"| Mean completion | {format(summary['completion'], '.1%') if n else 'unknown'} | | |",
+             f"| Route CPU time, all boards | {summary['cpu_seconds']:,.0f} s | | |", "",
              f"Both clean: {both}; only {label}: {only_tm}; only Freerouting: {only_fr}.",
              f"Boards with added DRC errors: {summary['boards_with_added_errors']} ({dict(added_types)})."]
     lines += ["", "| Board | Routed / connections | KiCad completion | Plane unconnected | Signal unconnected | Vias | Plane / signal vias added | Plane / signal track mm added |",
@@ -418,6 +502,17 @@ def main() -> int:
                      f"{row.get('plane_unconnected_after', '?')} | {row.get('signal_unconnected_after', '?')} | {row.get('vias', '?')} | "
                      f"{row.get('plane_vias_added', '?')} / {row.get('signal_vias_added', '?')} | "
                      f"{row.get('plane_track_mm_added', '?')} / {row.get('signal_track_mm_added', '?')} |")
+    if summary["style"]:
+        def style_row(label: str, t: dict | None) -> str:
+            if not t:
+                return f"| {label} | – | | | | | | | |"
+            return (f"| {label} | {t['boards']} | {t['bends_per_connection']:.2f} | {t['acute_angles']} | {t['stair_steps']} | {t['short_segments']} | "
+                    f"{t['off_angle_segments']} | {t['detour_ratio']:.3f} | {t['long_detours']} |")
+        lines += ["", "Style of the routed copper (doc 05 §39, informational):", "",
+                  "| Routing | Boards | Bends per connection | Acute angles | Stair-steps | Short segments | Off-angle segments | Detour ratio | Long detours |",
+                  "|---|--:|--:|--:|--:|--:|--:|--:|--:|", style_row(label, summary["style"])]
+        if summary["style_ref"]:
+            lines += [style_row(f"{label}, boards with a reference", summary["style_same_boards"]), style_row("Reference routing", summary["style_ref"])]
     (outdir / "report.md").write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
     return 0

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Automatic inner-plane track bans (doc 05 §41, D96), CLI/shared args contract."""
+"""Automatic inner-plane track bans (doc 05 §42, D103), CLI/shared args contract."""
 import json
 import pathlib
 import subprocess

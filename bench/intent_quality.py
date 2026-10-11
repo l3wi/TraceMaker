@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Routing-intent metrics (doc 05 §44): does the routed copper keep the electrical intent of a manifest?
+"""Routing-intent metrics (doc 05 §45): does the routed copper keep the electrical intent of a manifest?
 
   bench/intent_quality.py RUN [RUN ...] --intents DIR [--fixtures DIR] [--json out.json]
 

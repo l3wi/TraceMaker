@@ -7,6 +7,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "route/bus.hpp"
 #include "route/router.hpp"
 
 namespace CLI { class App; }
@@ -18,6 +19,8 @@ struct RouteJob {
   std::string in;                 // input .kicad_pcb (its project files supply the design rules)
   std::string out;                // output .kicad_pcb; empty = do not write a board
   std::string project;            // explicit .kicad_pro; its stem also selects .kicad_dru
+  std::string config;             // --config: explicit TUI options file; typed options win
+  std::string guide;              // --guide: preferred paths in Simple Route JSON coordinates
   route::RouterOptions opt;       // `sink` is set here when viewing or recording
   bool use_gpu = true;
   int threads = 8;                // worker threads for the portfolio variants
@@ -40,12 +43,33 @@ struct RouteJob {
   bool reroute = false;
   std::vector<std::string> reroute_nets;
   std::string rules_override;     // --rules-override: user override file (JSON, doc 15 §6.3); empty = none
-  std::string intent;             // --intent: routing intent manifest (JSON, doc 05 §44); empty = none
+  std::string intent;             // --intent: routing intent manifest (JSON, doc 05 §45); empty = none
+  // With soft zones: refill the zones after routing and route what the refill left unconnected (doc 05 §36).
+  bool refill_repair = true;
   // --no-tracks-on / --layer-cost (doc 05 §29): copper layer names, and "LAYER=FACTOR" entries. Resolved against
   // the board into opt.no_track_layers / opt.layer_cost_pm; an unknown layer or a bad factor throws.
   std::vector<std::string> no_tracks_on;
   std::vector<std::string> layer_costs;
-  bool protect_planes = false;  // --protect-planes (doc 05 §41): detect inner planes, union with no_tracks_on
+  bool protect_planes = false;  // --protect-planes (doc 05 §42): detect inner planes, union with no_tracks_on
+  // Buses (doc 05 §38): "NAME=PATTERN" groups (--bus), automatic detection (--buses) and the skew limit of the
+  // command-line groups in mm (--bus-skew-mm; 0 = none). A custom skew rule of the board wins over the option.
+  std::vector<std::string> buses;
+  bool detect_buses = false;
+  double bus_skew_mm = 0;
+  // After-route passes (doc 05 §39), all off by default. Each changes the new copper only through the router's
+  // exact check and is kept only if no net has more unconnected items with it than without (rule 4).
+  // --widen-power: new tracks narrower than their net class width go back up to it where there is room; nets with
+  // a target (--widen-net "PATTERN=WIDTH_MM", or a width the component rules computed) are widened towards it.
+  bool widen_power = false;
+  std::vector<std::string> widen_nets;
+  // --stitch-vias: "planes" (vias of a plane's net on a grid where its fills overlap on two or more layers),
+  // "return" (a plane via near each via of the signals that need a reference plane: component rules of kind
+  // reference_plane, and --stitch-return "PATTERN=PLANE_NET"), or "all". Empty = off.
+  std::string stitch_vias;
+  double stitch_pitch_mm = 0;      // 0 = the catalogue's stitch_via_within_mm
+  double stitch_distance_mm = 0;   // 0 = the rule's stitch_via_mm, else the catalogue value
+  std::vector<std::string> stitch_returns;
+  long pass_work = 2'000'000;      // work budget of each pass, in exact checks (rule 5)
   // Progress lines (the CLI's stdout text, one line per call, no trailing newline). Empty = silent.
   std::function<void(const std::string&)> log;
 };
@@ -55,7 +79,9 @@ struct RouteJobResult {
   nlohmann::json items;           // new copper in the --emit-items layout (layer and net by name, nm)
   nlohmann::json summary;         // the --json layout
   std::string viewer_url;         // empty when not viewing
-  int exit_code() const { return result.routed == result.connections ? 0 : 3; }
+  int unconnected_after_refill = -1;  // with soft zones: what KiCad's refill would leave unconnected
+  // 0 when the final refill has no unconnected items with soft zones, otherwise when every planned connection routed.
+  int exit_code() const { return unconnected_after_refill >= 0 ? (unconnected_after_refill == 0 ? 0 : 3) : result.routed == result.connections ? 0 : 3; }
 };
 
 // Reads the board and its rules, routes (a portfolio when more than one variant runs), writes the requested outputs.
@@ -65,6 +91,18 @@ RouteJobResult run_route_job(RouteJob job);
 // Register the single CLI option contract, or parse CLI-spelled options over an existing job.
 void add_route_options(CLI::App& app, RouteJob& job, bool require_paths = false);
 RouteJob parse_route_args(RouteJob job, const std::vector<std::string>& args);
+// Expand a named TUI options file, excluding options already supplied to the parser.
+std::vector<std::string> route_config_args(CLI::App& app, const std::string& path);
+// Buses (doc 05 §38): the groups `specs` ("NAME=PATTERN") name on the board, then, with `detect`, the groups found in
+// the net names that share no net with an earlier group. Each group gets the skew limit of the board's custom
+// rules, else, for groups from `specs`, `skew_mm` (0 = none). `notes` receives warnings. Throws on a bad spec.
+std::vector<route::BusGroup> resolve_buses(const model::Board& b, const model::DesignRules& rules, const std::vector<std::string>& specs,
+                                           bool detect, double skew_mm, std::vector<std::string>* notes = nullptr);
+// A group measured on the copper of `b` (`joined`: route::nets_joined of the same board), as the JSON object of the
+// route summary's `buses` array and of `tracemaker buses --json`; `line`, if given, gets the one-line text form.
+// Lengths are KiCad's: tracks plus the stackup height of the vias (`rules` says whether the project counts it).
+nlohmann::json bus_report(const model::Board& b, const model::DesignRules& rules, const std::vector<std::uint8_t>& joined, const route::BusGroup& g,
+                          std::string* line = nullptr);
 
 // The GPU device used for cost-to-go fields: the first listed device, or -1 (none, or `use_gpu` false).
 int default_gpu_device(bool use_gpu);
