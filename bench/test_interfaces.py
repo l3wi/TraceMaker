@@ -153,12 +153,16 @@ class InterfaceTests(unittest.TestCase):
         for p in d['pads']:
             p['ref'] = 'J1' if p['ref'] == 'U2' else 'U1'
             p['function'] = 'DP' if p['net'].endswith('DP') else 'DM'
+            if p['ref'] == 'J1':
+                p['function'] = ('D+' if p['net'].endswith('DP') else 'D-')+'_'+p['num']
         for index, net in enumerate(d['nets']):
             for ref, x in [('U5', 4000000), ('TP1', 6000000)]:
                 d['pads'].append(dict(d['pads'][0], ref=ref, net=net, num=str(index+1),
                                       x=x, y=index*1000000))
             # Two equivalent Type-C contacts, not two separate destinations.
-            d['pads'].append(dict(d['pads'][2*index+1], num='B'+str(index+6), x=10020000))
+            duplicate = dict(d['pads'][2*index+1], num='B'+str(index+6), x=10020000)
+            duplicate['function'] = ('D+' if net.endswith('DP') else 'D-')+'_'+duplicate['num']
+            d['pads'].append(duplicate)
         parts = {'U1':('USB3300', 'QFN32'), 'J1':('USB_C', 'USB_C_Receptacle'),
                  'U5':('TPD4E001', 'SOT23'), 'TP1':('TestPoint', 'TestPoint')}
         md = metadata(d, parts)
@@ -174,6 +178,11 @@ class InterfaceTests(unittest.TestCase):
         reviewed = evidence.review(manifest, d, md, ['kicad_pcb'])
         self.assertEqual(reviewed['interfaces'][0]['confidence'], 'confirmed')
         self.assertEqual(reviewed['status'], 'reviewed')
+        for p in d['pads']:
+            if p['ref'] == 'J1':
+                p['function'] = 'Pin_'+p['num']
+        unqualified = iface.draft(d, 'usb-taps', pad_metadata=metadata(d, parts))
+        self.assertGreater(len(unqualified['interfaces'][0]['lanes'][0]['endpoints']), 4)
 
     def test_i2c_pullups_excluded_but_unknown_shunts_not_discarded(self):
         d = board(['I2C_SCL', 'I2C_SDA'])

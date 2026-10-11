@@ -605,7 +605,7 @@ coverage field as missing, rather than failing report generation.
 The `sc/integrate` 1936fe0 path/return module registry was exercised against the 11 default non-slow
 `modern-planes` boards: `dp-modern-200M-T` versus `human-modern-planes`, `--profile toradex-2015
 --jobs 2`. Both runs had an empty benchmark error map. Draft inputs took 89.1 s; reviewed inputs
-took 89.7 s. Manifest hashes matched across both arms and the regenerated review files (22 bindings).
+took 90.2 s. Manifest hashes matched across both arms and the regenerated review files (22 bindings).
 
 | Arm | Draft pass / fail / N/A | Reviewed pass / fail / N/A | N/A fraction, draft → reviewed |
 |---|---:|---:|---:|

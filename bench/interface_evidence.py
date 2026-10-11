@@ -97,8 +97,8 @@ def choose(ps, metadata, series_ends):
             if len(candidates) == 1:
                 selected.append(candidates[0][0])
             elif all(r == 'connector' for _, r in candidates):
-                functions = {bindings[endpoint_key(endpoint(p))]['function'] for p, _ in candidates}
-                if len(functions) != 1 or not next(iter(functions)):
+                functions = {_function(bindings[endpoint_key(endpoint(p))]) for p, _ in candidates}
+                if len(functions) != 1 or next(iter(functions)) in ('', 'PIN', 'PAD', 'NC'):
                     break
                 ordered = sorted((p for p, _ in candidates), key=lambda p: endpoint_key(endpoint(p)))
                 selected.append(ordered[0]); taps += ordered[1:]
