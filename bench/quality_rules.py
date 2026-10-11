@@ -126,7 +126,7 @@ def load_interfaces(directory, board):
             raise ValueError(f'{path}: duplicate interface id {iface["id"]}')
         ids.add(iface['id'])
         for lane in iface['lanes']:
-            if lane['role'] != 'single' and not lane.get('n'):
+            if lane['role'] not in ('single', 'clock') and not lane.get('n'):
                 raise ValueError(f'{path}: {iface["id"]}.{lane["id"]} differential lane lacks n')
     return manifest
 
