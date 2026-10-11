@@ -946,8 +946,8 @@ struct Router::Impl {
     const int footprint_a = skip_pad >= 0 ? b.pads[static_cast<std::size_t>(skip_pad)].footprint : -1;
     const int footprint_b = other_pad >= 0 ? b.pads[static_cast<std::size_t>(other_pad)].footprint : -1;
     const Coord margin = std::max(netclass(net).clearance, rules.minimums.clearance) + hw;
-    const geom::Box exclude_a = footprint_a >= 0 ? tree_pad_boxes[static_cast<std::size_t>(footprint_a)].inflated(margin) : geom::Box{};
-    const geom::Box exclude_b = footprint_b >= 0 ? tree_pad_boxes[static_cast<std::size_t>(footprint_b)].inflated(margin) : geom::Box{};
+    const bool local_tie = footprint_a >= 0 && footprint_a == footprint_b;
+    const geom::Box exclude = local_tie ? tree_pad_boxes[static_cast<std::size_t>(footprint_a)].inflated(margin) : geom::Box{};
     std::vector<int> ids;
     obs->grid().query(wbox, [&](int id) { ids.push_back(id); });
     std::sort(ids.begin(), ids.end());  // copper order, whatever the grid's
@@ -972,9 +972,8 @@ struct Router::Impl {
         auto try_point = [&](int gx, int gy) {
           if (gx < w.x0 || gy < w.y0 || gx >= w.x0 + w.w || gy >= w.y0 + w.h) return;
           const Point p = at(gx, gy);
-          // Copper between the endpoint's pins is no substitute for the planned terminal: it can seal a neighbour.
-          if ((p.x >= exclude_a.x0 && p.x <= exclude_a.x1 && p.y >= exclude_a.y0 && p.y <= exclude_a.y1) ||
-              (p.x >= exclude_b.x0 && p.x <= exclude_b.x1 && p.y >= exclude_b.y0 && p.y <= exclude_b.y1)) return;
+          // An intra-package tie must leave from its planned pins, not copper among their fine-pitch neighbours.
+          if (p.x >= exclude.x0 && p.x <= exclude.x1 && p.y >= exclude.y0 && p.y <= exclude.y1) return;
           if (!tried.insert(cell_key(0, gx, gy)).second) return;
           if (!geom::closer_than(geom::Shape::point(at(gx, gy), 0), s, 1)) return;  // not on this copper
           const std::int64_t ci = static_cast<std::int64_t>(gy - w.y0) * w.w + (gx - w.x0);
