@@ -168,6 +168,10 @@ class ReturnTests(unittest.TestCase):
         d['pads'].reverse(); d['tracks'].reverse(); d['vias'].reverse()
         self.assertEqual(self.domain(), self.domain(d=d, fills=dict(reversed(list(self.fills.items())))))
         self.assertEqual(returns.inferred_references(d, ['S']), returns.inferred_references(self.d, ['S']))
+        profile={'rules':[rule('reference_uncovered_mm',5)]}
+        ctx=dict(fills=self.fills,broad={'In1.Cu'},complete={'S':True},board_path='unused')
+        self.assertEqual(returns.measure_rules(d,interface(),profile,ctx),
+                         returns.measure_rules(self.d,interface(),profile,ctx))
 
     def test_ground_via_return_lead_adjacent_vs_five_mm(self):
         manifest = {'connections': [{'from': 'C1.1', 'to': 'U1.1'}]}
