@@ -1,0 +1,979 @@
+{
+  "schema": 1,
+  "id": "toradex-2015",
+  "title": "Toradex Layout Design Guide v1.0, 14 April 2015",
+  "note": "Explicit opt-in old carrier-board guidance, not current protocol compliance. Impedance omitted: stackup and a validated solver are required. No invented numeric via minima or unspecified spacing. Modes, external lengths and aggressor roles are never inferred from copper.",
+  "rules": [
+    {
+      "id": "pcie.intra",
+      "interface": "pcie",
+      "measure": "intra_skew_mm",
+      "comparator": "<",
+      "limit": 0.15,
+      "strength": "must",
+      "source": {
+        "section": "7.1",
+        "page": 33,
+        "table": 5
+      },
+      "treatment": "rule",
+      "note": "Planar-mm proxy; source picoseconds use approximate propagation conversion, not delay certification."
+    },
+    {
+      "id": "pcie.pair_gap",
+      "interface": "pcie",
+      "measure": "pair_gap_mm",
+      "comparator": ">",
+      "limit": 0.5,
+      "strength": "must",
+      "source": {
+        "section": "7.1",
+        "page": 33,
+        "table": 5
+      },
+      "treatment": "rule"
+    },
+    {
+      "id": "sata.intra",
+      "interface": "sata",
+      "measure": "intra_skew_mm",
+      "comparator": "<",
+      "limit": 0.15,
+      "strength": "must",
+      "source": {
+        "section": "7.2",
+        "page": 33,
+        "table": 6
+      },
+      "treatment": "rule",
+      "note": "Planar-mm proxy; source picoseconds use approximate propagation conversion, not delay certification."
+    },
+    {
+      "id": "sata.length",
+      "interface": "sata",
+      "measure": "max_length_mm",
+      "comparator": "<",
+      "limit": 150,
+      "strength": "must",
+      "source": {
+        "section": "7.2",
+        "page": 33,
+        "table": 6
+      },
+      "treatment": "rule"
+    },
+    {
+      "id": "sata.pair_gap",
+      "interface": "sata",
+      "measure": "pair_gap_mm",
+      "comparator": ">",
+      "limit": 0.5,
+      "strength": "must",
+      "source": {
+        "section": "7.2",
+        "page": 33,
+        "table": 6
+      },
+      "treatment": "rule"
+    },
+    {
+      "id": "ethernet_mdi.intra",
+      "interface": "ethernet_mdi",
+      "measure": "intra_skew_mm",
+      "comparator": "<",
+      "limit": 0.25,
+      "strength": "must",
+      "source": {
+        "section": "7.3",
+        "page": "34\u201335",
+        "table": 7
+      },
+      "treatment": "rule",
+      "note": "Planar-mm proxy; source picoseconds use approximate propagation conversion, not delay certification."
+    },
+    {
+      "id": "ethernet_mdi.pair_gap",
+      "interface": "ethernet_mdi",
+      "measure": "pair_gap_mm",
+      "comparator": ">",
+      "limit": 0.45,
+      "strength": "must",
+      "source": {
+        "section": "7.3",
+        "page": "34\u201335",
+        "table": 7
+      },
+      "treatment": "rule"
+    },
+    {
+      "id": "usb2.intra",
+      "interface": "usb2",
+      "measure": "intra_skew_mm",
+      "comparator": "<",
+      "limit": 1.1,
+      "strength": "must",
+      "source": {
+        "section": "7.4.1.1",
+        "page": 36,
+        "table": 8
+      },
+      "treatment": "rule",
+      "note": "Planar-mm proxy; source picoseconds use approximate propagation conversion, not delay certification."
+    },
+    {
+      "id": "usb2.length",
+      "interface": "usb2",
+      "measure": "max_length_mm",
+      "comparator": "<",
+      "limit": 200,
+      "strength": "must",
+      "source": {
+        "section": "7.4.1.1",
+        "page": 36,
+        "table": 8
+      },
+      "treatment": "rule"
+    },
+    {
+      "id": "usb3.intra",
+      "interface": "usb3",
+      "measure": "intra_skew_mm",
+      "comparator": "<",
+      "limit": 0.15,
+      "strength": "must",
+      "source": {
+        "section": "7.4.1.2",
+        "page": 36,
+        "table": 9
+      },
+      "treatment": "rule",
+      "note": "Planar-mm proxy; source picoseconds use approximate propagation conversion, not delay certification."
+    },
+    {
+      "id": "usb3.length",
+      "interface": "usb3",
+      "measure": "max_length_mm",
+      "comparator": "<",
+      "limit": 200,
+      "strength": "must",
+      "source": {
+        "section": "7.4.1.2",
+        "page": 36,
+        "table": 9
+      },
+      "treatment": "rule"
+    },
+    {
+      "id": "usb3.pair_gap",
+      "interface": "usb3",
+      "measure": "pair_gap_mm",
+      "comparator": "<",
+      "limit": 0.5,
+      "strength": "must",
+      "source": {
+        "section": "7.4.1.2",
+        "page": 36,
+        "table": 9
+      },
+      "treatment": "report",
+      "note": "Printed minimum <500 \u00b5m is contradictory. Preserve source comparator pending clarification."
+    },
+    {
+      "id": "lvds_lcd.intra",
+      "interface": "lvds_lcd",
+      "measure": "intra_skew_mm",
+      "comparator": "<",
+      "limit": 0.15,
+      "strength": "must",
+      "source": {
+        "section": "7.6",
+        "page": 37,
+        "table": 11
+      },
+      "treatment": "rule",
+      "note": "Planar-mm proxy; source picoseconds use approximate propagation conversion, not delay certification."
+    },
+    {
+      "id": "lvds_lcd.length",
+      "interface": "lvds_lcd",
+      "measure": "max_length_mm",
+      "comparator": "<",
+      "limit": 500,
+      "strength": "must",
+      "source": {
+        "section": "7.6",
+        "page": 37,
+        "table": 11
+      },
+      "treatment": "rule",
+      "note": "Includes external display cable; unknown external length blocks pass."
+    },
+    {
+      "id": "hdmi.intra",
+      "interface": "hdmi",
+      "measure": "intra_skew_mm",
+      "comparator": "<",
+      "limit": 0.75,
+      "strength": "must",
+      "source": {
+        "section": "7.7",
+        "page": 38,
+        "table": 12
+      },
+      "treatment": "rule",
+      "note": "Planar-mm proxy; source picoseconds use approximate propagation conversion, not delay certification."
+    },
+    {
+      "id": "hdmi.length",
+      "interface": "hdmi",
+      "measure": "max_length_mm",
+      "comparator": "<",
+      "limit": 250,
+      "strength": "must",
+      "source": {
+        "section": "7.7",
+        "page": 38,
+        "table": 12
+      },
+      "treatment": "rule"
+    },
+    {
+      "id": "hdmi.pair_gap",
+      "interface": "hdmi",
+      "measure": "pair_gap_mm",
+      "comparator": ">",
+      "limit": 0.5,
+      "strength": "must",
+      "source": {
+        "section": "7.7",
+        "page": 38,
+        "table": 12
+      },
+      "treatment": "rule"
+    },
+    {
+      "id": "mipi_dsi.intra",
+      "interface": "mipi_dsi",
+      "measure": "intra_skew_mm",
+      "comparator": "<",
+      "limit": 0.15,
+      "strength": "must",
+      "source": {
+        "section": "7.12",
+        "page": 40,
+        "table": 17
+      },
+      "treatment": "rule",
+      "note": "Planar-mm proxy; source picoseconds use approximate propagation conversion, not delay certification."
+    },
+    {
+      "id": "mipi_dsi.length",
+      "interface": "mipi_dsi",
+      "measure": "max_length_mm",
+      "comparator": "<=",
+      "limit": 200,
+      "strength": "must",
+      "source": {
+        "section": "7.12",
+        "page": 40,
+        "table": 17
+      },
+      "treatment": "rule"
+    },
+    {
+      "id": "mipi_csi.intra",
+      "interface": "mipi_csi",
+      "measure": "intra_skew_mm",
+      "comparator": "<",
+      "limit": 0.15,
+      "strength": "must",
+      "source": {
+        "section": "7.13",
+        "page": 40,
+        "table": 18
+      },
+      "treatment": "rule",
+      "note": "Planar-mm proxy; source picoseconds use approximate propagation conversion, not delay certification."
+    },
+    {
+      "id": "mipi_csi.length",
+      "interface": "mipi_csi",
+      "measure": "max_length_mm",
+      "comparator": "<=",
+      "limit": 200,
+      "strength": "must",
+      "source": {
+        "section": "7.13",
+        "page": 40,
+        "table": 18
+      },
+      "treatment": "rule"
+    },
+    {
+      "id": "pcie.group",
+      "interface": "pcie",
+      "measure": "group_skew_mm",
+      "comparator": "<",
+      "limit": 240,
+      "strength": "must",
+      "source": {
+        "section": "7.1",
+        "page": 33,
+        "table": 5
+      },
+      "treatment": "rule",
+      "group": "clock",
+      "note": "Planar-mm proxy, not delay certification."
+    },
+    {
+      "id": "sata.group",
+      "interface": "sata",
+      "measure": "group_skew_mm",
+      "comparator": "<",
+      "limit": 120,
+      "strength": "must",
+      "source": {
+        "section": "7.2",
+        "page": 33,
+        "table": 6
+      },
+      "treatment": "rule",
+      "group": "spread",
+      "note": "Planar-mm proxy, not delay certification."
+    },
+    {
+      "id": "ethernet_mdi.group",
+      "interface": "ethernet_mdi",
+      "measure": "group_skew_mm",
+      "comparator": "<",
+      "limit": 50,
+      "strength": "must",
+      "source": {
+        "section": "7.3",
+        "page": "34\u201335",
+        "table": 7
+      },
+      "treatment": "rule",
+      "group": "spread",
+      "note": "Planar-mm proxy, not delay certification."
+    },
+    {
+      "id": "usb3.group",
+      "interface": "usb3",
+      "measure": "group_skew_mm",
+      "comparator": "<",
+      "limit": 240,
+      "strength": "must",
+      "source": {
+        "section": "7.4.1.2",
+        "page": 36,
+        "table": 9
+      },
+      "treatment": "rule",
+      "group": "spread",
+      "note": "Planar-mm proxy, not delay certification."
+    },
+    {
+      "id": "lvds_lcd.group",
+      "interface": "lvds_lcd",
+      "measure": "group_skew_mm",
+      "comparator": "<",
+      "limit": 0.5,
+      "strength": "must",
+      "source": {
+        "section": "7.6",
+        "page": 37,
+        "table": 11
+      },
+      "treatment": "rule",
+      "group": "clock",
+      "note": "Planar-mm proxy, not delay certification. Lower-resolution relaxation requires explicit approval."
+    },
+    {
+      "id": "hdmi.group",
+      "interface": "hdmi",
+      "measure": "group_skew_mm",
+      "comparator": "<",
+      "limit": 22,
+      "strength": "must",
+      "source": {
+        "section": "7.7",
+        "page": 38,
+        "table": 12
+      },
+      "treatment": "rule",
+      "group": "clock",
+      "note": "Planar-mm proxy, not delay certification."
+    },
+    {
+      "id": "mipi_dsi.group",
+      "interface": "mipi_dsi",
+      "measure": "group_skew_mm",
+      "comparator": "<",
+      "limit": 1.5,
+      "strength": "must",
+      "source": {
+        "section": "7.12",
+        "page": 40,
+        "table": 17
+      },
+      "treatment": "rule",
+      "group": "clock",
+      "note": "Planar-mm proxy, not delay certification."
+    },
+    {
+      "id": "mipi_csi.group",
+      "interface": "mipi_csi",
+      "measure": "group_skew_mm",
+      "comparator": "<",
+      "limit": 1.5,
+      "strength": "must",
+      "source": {
+        "section": "7.13",
+        "page": 40,
+        "table": 18
+      },
+      "treatment": "rule",
+      "group": "clock",
+      "note": "Planar-mm proxy, not delay certification."
+    },
+    {
+      "id": "pcie.length.device_down",
+      "interface": "pcie",
+      "measure": "max_length_mm",
+      "comparator": "<",
+      "limit": 300,
+      "strength": "must",
+      "source": {
+        "section": "7.1",
+        "page": 33,
+        "table": 5
+      },
+      "treatment": "rule",
+      "mode": "device_down"
+    },
+    {
+      "id": "pcie.length.slot",
+      "interface": "pcie",
+      "measure": "max_length_mm",
+      "comparator": "<",
+      "limit": 200,
+      "strength": "must",
+      "source": {
+        "section": "7.1",
+        "page": 33,
+        "table": 5
+      },
+      "treatment": "rule",
+      "mode": "slot"
+    },
+    {
+      "id": "pcie.vias.tx",
+      "interface": "pcie",
+      "measure": "vias_per_leg",
+      "comparator": "<=",
+      "limit": 2,
+      "strength": "must",
+      "source": {
+        "section": "7.1",
+        "page": 33,
+        "table": 5
+      },
+      "treatment": "rule",
+      "role": "tx",
+      "band": 0
+    },
+    {
+      "id": "pcie.vias.rx.device_down",
+      "interface": "pcie",
+      "measure": "vias_per_leg",
+      "comparator": "<=",
+      "limit": 4,
+      "strength": "must",
+      "source": {
+        "section": "7.1",
+        "page": 33,
+        "table": 5
+      },
+      "treatment": "rule",
+      "mode": "device_down",
+      "role": "rx",
+      "band": 0
+    },
+    {
+      "id": "pcie.vias.rx.slot",
+      "interface": "pcie",
+      "measure": "vias_per_leg",
+      "comparator": "<=",
+      "limit": 2,
+      "strength": "must",
+      "source": {
+        "section": "7.1",
+        "page": 33,
+        "table": 5
+      },
+      "treatment": "rule",
+      "mode": "slot",
+      "role": "rx",
+      "band": 0
+    },
+    {
+      "id": "usb3.vias.tx",
+      "interface": "usb3",
+      "measure": "vias_per_leg",
+      "comparator": "<=",
+      "limit": 2,
+      "strength": "must",
+      "source": {
+        "section": "7.4.1.2",
+        "page": 36,
+        "table": 9
+      },
+      "treatment": "rule",
+      "role": "tx",
+      "band": 0
+    },
+    {
+      "id": "usb3.vias.rx.device_down",
+      "interface": "usb3",
+      "measure": "vias_per_leg",
+      "comparator": "<=",
+      "limit": 4,
+      "strength": "must",
+      "source": {
+        "section": "7.4.1.2",
+        "page": 36,
+        "table": 9
+      },
+      "treatment": "rule",
+      "mode": "device_down",
+      "role": "rx",
+      "band": 0
+    },
+    {
+      "id": "usb3.vias.rx.connector",
+      "interface": "usb3",
+      "measure": "vias_per_leg",
+      "comparator": "<=",
+      "limit": 2,
+      "strength": "must",
+      "source": {
+        "section": "7.4.1.2",
+        "page": 36,
+        "table": 9
+      },
+      "treatment": "rule",
+      "mode": "connector",
+      "role": "rx",
+      "band": 0
+    },
+    {
+      "id": "sata.vias",
+      "interface": "sata",
+      "measure": "vias_per_leg",
+      "comparator": "<=",
+      "limit": 2,
+      "strength": "must",
+      "source": {
+        "section": "7.2",
+        "page": 33,
+        "table": 6
+      },
+      "treatment": "rule",
+      "band": 0
+    },
+    {
+      "id": "ethernet_mdi.vias",
+      "interface": "ethernet_mdi",
+      "measure": "vias_per_leg",
+      "comparator": "<=",
+      "limit": 2,
+      "strength": "must",
+      "source": {
+        "section": "7.3",
+        "page": "34\u201335",
+        "table": 7
+      },
+      "treatment": "rule",
+      "band": 0
+    },
+    {
+      "id": "ethernet_mdi.length",
+      "interface": "ethernet_mdi",
+      "measure": "max_length_mm",
+      "comparator": "<",
+      "limit": 100,
+      "strength": "should",
+      "source": {
+        "section": "7.3",
+        "page": "34\u201335",
+        "table": 7
+      },
+      "treatment": "report",
+      "note": "Approximate module-to-magnetics length; keep as short as possible."
+    },
+    {
+      "id": "ethernet_mdi.other_gap.high_speed",
+      "interface": "ethernet_mdi",
+      "measure": "other_gap_mm",
+      "comparator": ">",
+      "limit": 7.5,
+      "strength": "must",
+      "source": {
+        "section": "7.3",
+        "page": "34\u201335",
+        "table": 7
+      },
+      "treatment": "report",
+      "aggressor_class": "high_speed",
+      "note": "Requires frozen aggressor speed classification."
+    },
+    {
+      "id": "ethernet_mdi.other_gap.low_speed",
+      "interface": "ethernet_mdi",
+      "measure": "other_gap_mm",
+      "comparator": ">",
+      "limit": 2.5,
+      "strength": "must",
+      "source": {
+        "section": "7.3",
+        "page": "34\u201335",
+        "table": 7
+      },
+      "treatment": "report",
+      "aggressor_class": "low_speed",
+      "note": "Requires frozen aggressor speed classification."
+    },
+    {
+      "id": "ethernet_mdi.isolation",
+      "interface": "ethernet_mdi",
+      "measure": "isolation_gap_mm",
+      "comparator": ">=",
+      "limit": 2,
+      "strength": "must",
+      "source": {
+        "section": "7.3",
+        "page": 35,
+        "table": 7
+      },
+      "treatment": "rule",
+      "note": "Cable-side isolated domain only. Text/table >=2 mm conflicts with figure 47 >2 mm; text comparator selected explicitly."
+    },
+    {
+      "id": "lvds_lcd.pair_gap",
+      "interface": "lvds_lcd",
+      "measure": "pair_gap_ratio",
+      "comparator": ">",
+      "limit": 2,
+      "strength": "must",
+      "source": {
+        "section": "7.6",
+        "page": 37,
+        "table": 11
+      },
+      "treatment": "rule",
+      "note": "Other-pair edge gap divided by own pair edge gap; NOT trace width."
+    },
+    {
+      "id": "rgb_lcd.group",
+      "interface": "rgb_lcd",
+      "measure": "group_skew_mm",
+      "comparator": "<",
+      "limit": 15,
+      "strength": "must",
+      "source": {
+        "section": "7.5",
+        "page": 37,
+        "table": 10
+      },
+      "treatment": "report",
+      "group": "clock",
+      "note": "Conditional resolution/frame-rate limit; source permits relaxation. Planar proxy."
+    },
+    {
+      "id": "parallel_camera.group",
+      "interface": "parallel_camera",
+      "measure": "group_skew_mm",
+      "comparator": "<",
+      "limit": 15,
+      "strength": "must",
+      "source": {
+        "section": "7.9",
+        "page": 39,
+        "table": 14
+      },
+      "treatment": "report",
+      "group": "clock",
+      "note": "Conditional resolution/frame-rate limit; source permits relaxation. Planar proxy."
+    },
+    {
+      "id": "rgb_lcd.length.display",
+      "interface": "rgb_lcd",
+      "measure": "max_length_mm",
+      "comparator": "<",
+      "limit": 100,
+      "strength": "must",
+      "source": {
+        "section": "7.5",
+        "page": 37,
+        "table": 10
+      },
+      "treatment": "report",
+      "mode": "display",
+      "note": "Includes flex. Lower-resolution exception; unknown flex length blocks pass."
+    },
+    {
+      "id": "rgb_lcd.length.converter",
+      "interface": "rgb_lcd",
+      "measure": "max_length_mm",
+      "comparator": "<",
+      "limit": 50,
+      "strength": "must",
+      "source": {
+        "section": "7.5",
+        "page": 37,
+        "table": 10
+      },
+      "treatment": "report",
+      "mode": "converter",
+      "note": "Carrier converter path; lower-resolution exception."
+    },
+    {
+      "id": "parallel_camera.length",
+      "interface": "parallel_camera",
+      "measure": "max_length_mm",
+      "comparator": "<",
+      "limit": 50,
+      "strength": "must",
+      "source": {
+        "section": "7.9",
+        "page": 39,
+        "table": 14
+      },
+      "treatment": "report",
+      "note": "Conditional EMC/resolution limit, not pure timing."
+    },
+    {
+      "id": "sdio.group.mmc_52mhz",
+      "interface": "sdio",
+      "measure": "group_skew_mm",
+      "comparator": "<",
+      "limit": 15,
+      "strength": "must",
+      "source": {
+        "section": "7.10",
+        "page": 39,
+        "table": 15
+      },
+      "treatment": "rule",
+      "mode": "mmc_52mhz",
+      "group": "clock",
+      "note": "Source approximate time-to-mm proxy; mode must be declared."
+    },
+    {
+      "id": "sdio.group.sdr104",
+      "interface": "sdio",
+      "measure": "group_skew_mm",
+      "comparator": "<",
+      "limit": 3,
+      "strength": "must",
+      "source": {
+        "section": "7.10",
+        "page": 39,
+        "table": 15
+      },
+      "treatment": "rule",
+      "mode": "sdr104",
+      "group": "clock",
+      "note": "Source approximate time-to-mm proxy; mode must be declared."
+    },
+    {
+      "id": "sdio.length",
+      "interface": "sdio",
+      "measure": "max_length_mm",
+      "comparator": "<",
+      "limit": 100,
+      "strength": "must",
+      "source": {
+        "section": "7.10",
+        "page": 39,
+        "table": 15
+      },
+      "treatment": "rule"
+    },
+    {
+      "id": "i2c.length.standard",
+      "interface": "i2c",
+      "measure": "max_length_mm",
+      "comparator": "<",
+      "limit": 450,
+      "strength": "must",
+      "source": {
+        "section": "7.11",
+        "page": 40,
+        "table": 16
+      },
+      "treatment": "report",
+      "mode": "standard",
+      "note": "Capacitance-limited length proxy; branched-bus length convention and device load required. Never differential-route I2C."
+    },
+    {
+      "id": "i2c.length.fast",
+      "interface": "i2c",
+      "measure": "max_length_mm",
+      "comparator": "<",
+      "limit": 200,
+      "strength": "must",
+      "source": {
+        "section": "7.11",
+        "page": 40,
+        "table": 16
+      },
+      "treatment": "report",
+      "mode": "fast",
+      "note": "Capacitance-limited length proxy; branched-bus length convention and device load required. Never differential-route I2C."
+    },
+    {
+      "id": "vga.length.section_b",
+      "interface": "vga",
+      "measure": "max_length_mm",
+      "comparator": "<",
+      "limit": 200,
+      "strength": "should",
+      "source": {
+        "section": "7.8",
+        "page": 38,
+        "table": 13
+      },
+      "treatment": "report",
+      "mode": "section_b",
+      "note": "Section boundary at series filter inductor must be declared."
+    },
+    {
+      "id": "vga.length.section_c",
+      "interface": "vga",
+      "measure": "max_length_mm",
+      "comparator": "<",
+      "limit": 15,
+      "strength": "must",
+      "source": {
+        "section": "7.8",
+        "page": 38,
+        "table": 13
+      },
+      "treatment": "rule",
+      "mode": "section_c",
+      "note": "Section boundary at series filter inductor must be declared."
+    },
+    {
+      "id": "vga.other_gap.colours",
+      "interface": "vga",
+      "measure": "other_gap_mm",
+      "comparator": ">",
+      "limit": 0.35,
+      "strength": "must",
+      "source": {
+        "section": "7.8",
+        "page": 38,
+        "table": 13
+      },
+      "treatment": "report",
+      "aggressor_class": "colours",
+      "note": "Requires declared analogue colour and aggressor domains."
+    },
+    {
+      "id": "vga.other_gap.low_speed",
+      "interface": "vga",
+      "measure": "other_gap_mm",
+      "comparator": ">",
+      "limit": 0.5,
+      "strength": "must",
+      "source": {
+        "section": "7.8",
+        "page": 38,
+        "table": 13
+      },
+      "treatment": "report",
+      "aggressor_class": "low_speed",
+      "note": "Requires declared analogue colour and aggressor domains."
+    },
+    {
+      "id": "vga.other_gap.clock_or_high_current",
+      "interface": "vga",
+      "measure": "other_gap_mm",
+      "comparator": ">",
+      "limit": 1.25,
+      "strength": "must",
+      "source": {
+        "section": "7.8",
+        "page": 38,
+        "table": 13
+      },
+      "treatment": "report",
+      "aggressor_class": "clock_or_high_current",
+      "note": "Requires declared analogue colour and aggressor domains."
+    },
+    {
+      "id": "vga.other_gap.high_switching_current",
+      "interface": "vga",
+      "measure": "other_gap_mm",
+      "comparator": ">",
+      "limit": 6,
+      "strength": "must",
+      "source": {
+        "section": "7.8",
+        "page": 38,
+        "table": 13
+      },
+      "treatment": "report",
+      "aggressor_class": "high_switching_current",
+      "note": "Requires declared analogue colour and aggressor domains."
+    },
+    {
+      "id": "general.self_spacing",
+      "interface": "*",
+      "measure": "self_spacing_ratio",
+      "comparator": ">=",
+      "limit": 4,
+      "strength": "must",
+      "source": {
+        "section": "6.2",
+        "page": 17,
+        "table": null
+      },
+      "treatment": "rule",
+      "note": "Prose inclusive 4W; figure uses >4W. Nonlocal same-net meander legs only."
+    },
+    {
+      "id": "general.bend_segment",
+      "interface": "*",
+      "measure": "bend_segment_ratio",
+      "comparator": ">=",
+      "limit": 1.5,
+      "strength": "must",
+      "source": {
+        "section": "6.2",
+        "page": 17,
+        "table": null
+      },
+      "treatment": "rule",
+      "note": "Prose inclusive 1.5W; figure uses >1.5W. Merge collinear primitives, exclude ordinary pad necks."
+    },
+    {
+      "id": "general.between_legs",
+      "interface": "*",
+      "measure": "between_legs_items",
+      "comparator": "<=",
+      "limit": 0,
+      "strength": "must",
+      "source": {
+        "section": "6.6",
+        "page": 20,
+        "table": null
+      },
+      "treatment": "rule",
+      "band": 0,
+      "note": "No foreign copper/vias between pair legs; unknown corridor alignment is N/A."
+    }
+  ]
+}

@@ -539,3 +539,41 @@ Historical board-level consumers use `bench/board_quality.py` (the former `quali
 `quality.py` accepts run directories only. Measurement regressions run with
 `python3 -m unittest discover -s bench -p 'test_*.py'` in the Shapely environment.
 
+### Frozen interfaces and opt-in guide rules
+
+`bench/interfaces.py --set modern-planes --out build/interfaces/modern-planes` drafts schema-1
+`<board>.interfaces.json` files from the **prepared inputs**, not router outputs. `quick` and `mid` use
+`build/pcbench`; `--board NAME` restricts a set, `--fixtures DIR` selects another prepared input root,
+and `--input INPUT.kicad_pcb --board NAME` explicitly selects an input/human board.
+Hierarchy and token boundaries are retained; P/N, +/−, DP/DN, DP/DM, `.P/.N` and lowercase variants
+are recognized. Ancillary USB-PD/HDMI lines, NCSI, analogue ID/QD pairs, SPI SCLK and generic LVDS
+expansion names are not misclassified as the guide's data interfaces.
+
+Names produce **candidate** obligations. Only independent native connector/IC pad `pinfunction`
+evidence corroborating every lane/leg upgrades the interface to **confirmed**; a footprint outline,
+filename or capacitor alone cannot. Operating mode stays null unless explicitly reviewed. Intended
+reference and isolated-domain nets are not guessed. The draft preserves all pads on each signal net
+as integer-nm physical endpoints, with copper-layer sets and net spelling, independent of reference
+renaming. Recognizable two-pad passive bridges join consistently named lane halves (or an anonymous
+half); their physical endpoints are retained in `series` so measurement can exclude internal series
+pads. More than two possible outer terminals remains ambiguous, not a shortest-path guess.
+
+Add `--interfaces DIR --profile toradex-2015` to `bench/quality.py` to publish absolute guide-rule
+results alongside unchanged human-parity grades. Without `--profile` no rule/coverage section or new
+fields are emitted. The lazily imported `RULE_MODULES` registry supplies `measure_rules` implementations;
+each receives the same frozen manifest/profile, fresh fills, connectivity states and analysis board.
+Duplicate rule/application keys are rejected. The human is measured too; human violations remain visible.
+Per-board provenance hashes the interface manifest. Coverage lists interface confidence and physically
+unbound lanes; a missing manifest or unknown geometry/role/mode is N/A, never a pass.
+
+The bundled profile transcribes section-7 geometric limits plus the general 4W same-net meander
+spacing, 1.5W bend-segment and no-between-leg-item rules. Clock/spread skew groups, TX/RX budgets and
+slot/device-down modes stay distinct. Length/skew in millimetres are planar proxies, **not timing or
+impedance certification**. Approximate lengths, conditional exceptions and other-signal gaps are
+report-only. USB3's printed “minimum <500 µm” comparator is preserved as report-only, not silently
+reversed. LVDS pair spacing is relative to intra-pair gap, not trace width. Cable-inclusive paths,
+VGA filter boundaries and I²C capacitance-limited lengths require reviewed metadata. Impedance is
+omitted until real stackup data and a validated solver exist. Numeric checks use the common 1 µm
+boundary band; integer counts use an exact zero band. These old carrier-board recommendations are
+explicitly opt-in context, not new hard gates or current interface-standard compliance.
+
