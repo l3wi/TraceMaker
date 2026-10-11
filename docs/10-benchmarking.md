@@ -539,3 +539,48 @@ Historical board-level consumers use `bench/board_quality.py` (the former `quali
 `quality.py` accepts run directories only. Measurement regressions run with
 `python3 -m unittest discover -s bench -p 'test_*.py'` in the Shapely environment.
 
+### Frozen endpoint and segment checks (D-SC-PATHS)
+
+`bench/quality_paths.py` measures the required electrical path between physical endpoints from a schema-1
+interface manifest, including declared series parts joining split nets. Each differential lane supplies two
+ordered outer endpoints per leg; series-pad bindings may also appear in the lane's endpoint list when the
+series entry supplies its own physical `endpoints` to exclude. Order must identify the same source-to-sink
+direction for P and N. The manifest is frozen from the common input/human, never fitted to a router arm.
+Extra ESD/test-point pads do not disqualify a unique path. Without explicit intent, the new parity fields use
+only the human's physically unique two-pad candidate endpoints, reused unchanged across arms.
+
+The graph splits straight tracks and exact circular arcs at conductive junctions. Physical duplicate copper
+and vias are merged; sub-nanometre intersection coordinates are snapped to integer nanometres. Pads are
+equipotential contacts and series parts contribute zero planar length. Nonterminal leaves are peeled and
+their copper length is reported separately as `stub_mm`; a stub's vias do not consume the endpoint-path
+via budget. Disconnected endpoints, ambiguous bindings and connected loops produce N/A with reasons, not
+an electrically convenient shortest-path result. Plane transport is not represented. Via barrels, component
+internal lengths, package delays and unknown external cables are not inferred from the planar result.
+
+| Measure | Definition |
+|---|---|
+| `intra_skew_mm` | Absolute difference between P and N endpoint-path lengths |
+| `segment_skew_mm` | Worst absolute difference between the P/N lengths of successive sections bounded by matching ordered via, layer-changing-pad or series transitions; +1 mm before a via and −1 mm afterward is 1 mm, not zero |
+| `group_skew_mm` | Per-lane mean of P/N lengths (single-ended path length when applicable), compared with the one declared clock or the spread over declared data/TX/RX lanes, selected by the profile's `group` |
+| `max_length_mm` | Longest individual leg's endpoint-path planar length |
+| `vias_per_leg` | Unique vias actually traversed on each leg, not total same-net vias; profile `role` and `mode` select budgets |
+| `between_legs_items` | Unique unrelated tracks/arcs, pads, vias and same-layer filled islands intruding into the edge-to-edge corridor along parallel straight path sections; declared series pads and both legs' nets are excluded |
+
+`segment_skew_mm` and `via_layer_mismatch` are additional differential-pair human-parity fields, with
+0.01 mm and exact-count equivalence bands respectively. `via_layer_mismatch` counts ordered via transitions
+with differing drilled layer spans or used entry/exit layers, plus unmatched transitions. Segment skew is
+N/A when transition sequences cannot be matched. The historical whole-net `skew_mm` and via-imbalance
+metrics retain their original meanings and values.
+
+The absolute millimetre checks use the shared 1 µm boundary band; count checks have band zero. Human
+violations remain visible and guide-derived limits are not new hard gates or current protocol certification.
+Unknown interface identity, lane role, group membership or geometry is never a pass. Supported pad shapes
+(rectangle, round rectangle, oval and circle) use the frozen metadata where supplied; otherwise only
+inscribed-disk contact is represented, with potential corridor intrusions from unknown pad shapes marked N/A.
+Curved pair-corridor correspondence is currently N/A rather than a chord-based claim; foreign arcs beside
+straight coupled sections use exact circular distance and copper width. All geometry and sums are ordered
+by physical identity so item reordering cannot change a measurement or modal-gap tie.
+
+Regression cases are in `bench/test_quality_paths.py`, including ±1 µm limits, skew cancellation, ESD
+branches, series coupling, loops, via spans, foreign copper, fill-layer controls and shuffled copper order.
+

@@ -21,7 +21,8 @@ class CounterRng:
 # Practical equivalence bands, not electrical certification limits.
 METRICS = {
     'decoupling': {'effective_mm': (False, 1.0)},
-    'differential_pairs': {'coupled_fraction': (True, 0.001), 'skew_mm': (False, 0.01), 'via_imbalance': (False, 0)},
+    'differential_pairs': {'coupled_fraction': (True, 0.001), 'skew_mm': (False, 0.01), 'via_imbalance': (False, 0),
+                           'segment_skew_mm': (False, 0.01), 'via_layer_mismatch': (False, 0)},
     'return_paths': {'gap_fraction': (False, 0.001), 'no_return_1mm': (False, 0), 'no_return_5_08mm': (False, 0)},
     'power': {'median_width_mm': (True, 0.000001), 'resistance_35um_ohm': (False, 0.000001), 'neck_fraction': (False, 0.001)},
     'thermal': {'via_count': (True, 0)},
