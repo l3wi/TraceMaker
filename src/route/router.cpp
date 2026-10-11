@@ -97,7 +97,6 @@ struct Router::Impl {
   };
   std::vector<ConnState> cs;
   std::set<NetId> first_net_ids;  // --first-nets
-  std::set<NetId> tree_plane_nets;  // planned plane connections: keep their nets' junctions pad-to-pad
   std::unordered_map<std::int64_t, std::uint16_t> history;  // contested lattice cells (PathFinder history cost)
   std::vector<int> init_root;        // copper item -> initial cluster root (fixed copper)
   // With soft zones: routed copper item -> initial clusters of the same-net plane fills it touches, so a via that
@@ -950,7 +949,8 @@ struct Router::Impl {
     for (const int id : ids) {
       const auto& it = items[static_cast<std::size_t>(id)];
       if (it.removed || it.net != net || id == skip_item || !it.box.intersects(wbox)) continue;
-      if (it.kind != drc::ItemKind::Track && it.kind != drc::ItemKind::Arc && it.kind != drc::ItemKind::Via && it.kind != drc::ItemKind::Pad) continue;
+      // Alternate pads can pull a tie around a neighbouring signal pin instead of out from its planned pad.
+      if (it.kind != drc::ItemKind::Track && it.kind != drc::ItemKind::Arc && it.kind != drc::ItemKind::Via) continue;
       if (only && !std::binary_search(only->begin(), only->end(), id)) continue;
       int node;
       if (it.owner >= 0) {
@@ -1123,10 +1123,9 @@ struct Router::Impl {
     // Plane ties (§43): copper already joined to the plane is a goal of a plane connection too.
     tree_start.clear();
     tree_end.clear();
-    const bool tree_attach_net = opt.tree_attach && !tree_plane_nets.contains(net);
     if (tree_ok()) {
       if (c.pad_b < 0) {
-        if (tree_attach_net) {
+        if (opt.tree_attach) {
           const std::vector<int> island = pad_island(w, net, c.pad_a);
           if (island.size() > 1) add_tree_cells(w, net, RootUnion{}, 0, c.pad_a, &island, src, tree_start, nullptr);
         }
@@ -1135,7 +1134,7 @@ struct Router::Impl {
           const int rz = u.find(end_root(c));
           if (u.find(pad_root(c.pad_a)) != rz) add_tree_cells(w, net, u, rz, -1, nullptr, dst, tree_end, &is_target);
         }
-      } else if (tree_attach_net) {
+      } else if (opt.tree_attach) {
         const RootUnion u = net_roots(net, current);
         const int ra = u.find(pad_root(c.pad_a)), rb = u.find(pad_root(c.pad_b));
         if (ra != rb) {
@@ -3428,7 +3427,6 @@ struct Router::Impl {
       ConnState st;
       st.c = c;
       cs.push_back(std::move(st));
-      if (opt.tree_attach && c.zone_b >= 0) tree_plane_nets.insert(c.net);
     }
     for (std::size_t i = 0; i < cs.size(); ++i) pending.push_back(static_cast<int>(i));
     if (opt.escape_plan || opt.escape_flow) {
