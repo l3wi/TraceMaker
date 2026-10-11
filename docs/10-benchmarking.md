@@ -671,11 +671,15 @@ The old `effective_mm` supply metric is unchanged. Neither side is a loop-induct
 
 ### Guide spacing and bend screens (D-SC-SPACING)
 
-`quality_spacing.py` adds independent routing-craft parity fields on each known-connected signal net:
+`quality_spacing.py` adds two report fields on each known-connected signal net:
 `self_spacing_violations` counts close-approach sites below 4W (Toradex 2015 §6.2 p17, R36), and
-`short_bend_segments` counts straight bend segments below 1.5W (R37). Both are lower-is-better integer counts
-with zero parity tolerance. Supply/ground exclusions reuse `quality_craft.is_power`/`is_ground`; no interface
-manifest is needed for these two fields. Historical acute-junction values and thresholds are unchanged.
+`short_bend_segments` counts straight bend segments below 1.5W (R37). They are published per net in the JSON
+but are **not graded against the human**: both counts grow with the amount of length tuning, so a route that
+never meanders would "win" while losing on skew (measured: human CSI lanes on gmsl-deserializer carry 80–140
+sites each from tuning humps, the untuned router 225 in total). The guide's actual requirement is applied as
+absolute rules on manifest lanes (`self_spacing_ratio >= 4`, `bend_segment_ratio >= 1.5`), judged identically
+on the human and router. Supply/ground exclusions reuse `quality_craft.is_power`/`is_ground`. Historical
+acute-junction values and thresholds are unchanged.
 
 A **run** is a maximal equal-width straight centreline formed by coalescing degree-two collinear pieces,
 or one circular arc with analytic endpoint tangents and exact circular path length.
