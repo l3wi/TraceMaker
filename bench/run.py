@@ -7,12 +7,12 @@ Freerouting's own published per-board results (scripts/benchmark/results/benchma
 repository, judged by KiCad DRC on Freerouting's side).
 
   bench/run.py --tier A --limit 60 --time 60 --jobs 12 [--name run-id]
-  bench/run.py --set quick --work 1000000 --name run-id          # deterministic regression tier (doc 10 §4)
-  bench/run.py --fixtures build/demos --set planes --work 3000000 --refill --route-args=--soft-zones
+  bench/run.py --set quick --work 1000000 --refill --route-args="--variants 1 --soft-zones --keep-vias-off-pads --diff-pairs"
+  bench/run.py --set modern-planes --human --refill --name human-modern
 
---work routes with a deterministic work budget and no knowledge base, so the same binary gives the same boards;
-bench/compare_runs.py compares two runs. --refill makes KiCad refill zones before judging both input and output
-(needed whenever zone fills may be stale, e.g. with --soft-zones).
+--work routes with a deterministic work budget and no knowledge base. --refill
+judges and saves a fresh analysis copy as boards/<name>.refilled.kicad_pcb,
+leaving the raw router output unchanged. --human uses the prepared human original.
 
 Writes bench/results/<run-id>/{boards.jsonl, summary.json, report.md}; summary.json is shown on the progress site.
 """
@@ -35,6 +35,7 @@ import time
 from collections import Counter
 
 from plane_metrics import copper_totals, plane_nets, unconnected_split
+from prepare_inputs import copy_rules, refill_board, set_boards
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 FIX = ROOT / "bench/data/freerouting/scripts/benchmark/fixtures/PCBench"
@@ -45,6 +46,7 @@ EXTRA = os.environ.get("TM_ROUTE_ARGS", "").split()  # extra route options for e
 THREADS = 1
 WORK = 0         # --work N: deterministic work budget per board (0: wall-clock --time only)
 REFILL = False   # --refill: KiCad refills zones before judging
+HUMAN = False    # --human: judge the prepared routed original without running the router
 INTENTS = None   # --intents DIR: route each board with DIR/<board>.intent.json (drafted from its input when missing)
 DRC_CACHE = ROOT / "build/drc/kicad"
 # Violation types that routing cannot cause; ignored when counting added errors.
@@ -76,30 +78,46 @@ def fr_baseline() -> dict[str, dict]:
     return out
 
 
-def drc(path: pathlib.Path, timeout: int = 600, planes: dict | None = None) -> dict | None:
+def drc(path: pathlib.Path, timeout: int = 600, planes: dict | None = None,
+        saved: pathlib.Path | None = None) -> dict | None:
     DRC_CACHE.mkdir(parents=True, exist_ok=True)
     st = path.stat()
-    key = hashlib.sha1(f"{path.resolve()}:{st.st_mtime_ns}:{st.st_size}:{REFILL}".encode()).hexdigest()[:16]
+    rules = ''.join(hashlib.sha256(path.with_suffix(ext).read_bytes()).hexdigest()
+                    for ext in (".kicad_pro", ".kicad_dru") if path.with_suffix(ext).exists())
+    key = hashlib.sha1(f"saved-refill-v1:{path.resolve()}:{st.st_mtime_ns}:{st.st_size}:{REFILL}:{rules}".encode()).hexdigest()[:16]
     out = DRC_CACHE / f"{key}.json"
-    if not out.exists():
-        # Written to a private name and renamed: parallel runs over the same fixtures (one per experiment arm) judge
-        # the same input board, and a reader must never see a half-written report.
+    filled = DRC_CACHE / f"{key}.refilled.kicad_pcb"
+    if not out.exists() or (REFILL and not filled.exists()):
+        # A private report is validated before atomic rename. Never modify the input
+        # or raw output: KiCad saves only its private analysis copy.
         part = DRC_CACHE / f"{key}.{os.getpid()}.{threading.get_ident()}.part.json"
         try:
-            subprocess.run(["kicad-cli", "pcb", "drc", "--format", "json", "--severity-all", "--all-track-errors"] +
-                           (["--refill-zones"] if REFILL else []) + ["-o", str(part), str(path)],
-                           capture_output=True, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            return None
-        if part.exists():
+            if REFILL:
+                refill_board(path, filled, part, timeout)
+            else:
+                result = subprocess.run(["kicad-cli", "pcb", "drc", "--format", "json", "--severity-all",
+                                         "--all-track-errors", "-o", str(part), str(path)],
+                                        capture_output=True, timeout=timeout)
+                if result.returncode != 0:
+                    return None
+            if not part.exists():
+                return None
+            json.loads(part.read_text())
             os.replace(part, out)
-    if not out.exists():
-        return None
+        except (subprocess.TimeoutExpired, RuntimeError, OSError, ValueError):
+            return None
+        finally:
+            part.unlink(missing_ok=True)
+    if REFILL and saved is not None:
+        copy_rules(path, saved)
+        temporary = saved.with_name(f".{saved.name}.{os.getpid()}.{threading.get_ident()}.part")
+        shutil.copyfile(filled, temporary)
+        os.replace(temporary, saved)
     d = json.loads(out.read_text())
     c = Counter(v["type"] for v in d.get("violations", []) if v.get("severity") == "error")
-    # Router-introduced = violations involving a track, arc or via (PCBench inputs have none). Pad-versus-footprint
-    # graphic violations can appear or disappear in KiCad's report once nets are connected; they are not caused by
-    # the router and are not counted (Freerouting's harness counts router-introduced violations the same way).
+    # Router-introduced = violations involving a track, arc or via. Fixed design
+    # vias can already occur in the input; their baseline errors are subtracted.
+    # Pad/footprint-only violations are retained as diagnostics below.
     def routed_copper(v):
         return any(i.get("description", "").startswith(("Track", "Via", "Arc")) for i in v.get("items", []))
     r = Counter(v["type"] for v in d.get("violations", []) if v.get("severity") == "error" and routed_copper(v))
@@ -179,13 +197,15 @@ def run_board(name: str, outdir: pathlib.Path, time_limit: float) -> dict:
     src0 = SRC_FIX / name / "unrouted.kicad_pcb"
     out = outdir / "boards" / f"{name}.kicad_pcb"
     out.parent.mkdir(parents=True, exist_ok=True)
-    # KiCad judges the output with the input's net classes and custom rules (fixtures from bench/prepare_demos.py
-    # carry them; PCBench boards have none).
-    for ext in (".kicad_pro", ".kicad_dru"):
-        if src0.with_suffix(ext).exists():
-            shutil.copyfile(src0.with_suffix(ext), out.with_suffix(ext))
+    # Route and judge use the fixture's original net classes/custom rules.
+    copy_rules(src0, out)
     res = {"board": name}
-    src = place_board(name, src0, outdir, res) if PLACE_MODE else src0
+    preparation = src0.with_name("preparation.json")
+    if preparation.exists():
+        res["preparation"] = json.loads(preparation.read_text())
+    if HUMAN:
+        res["human"] = True
+    src = place_board(name, src0, outdir, res) if PLACE_MODE and not HUMAN else src0
     try:
         planes = plane_nets(src0)
         res["plane_nets"] = planes
@@ -193,34 +213,43 @@ def run_board(name: str, outdir: pathlib.Path, time_limit: float) -> dict:
         # A malformed outline must not change routing or suppress the KiCad judge.
         planes = None
         res["plane_metrics_error"] = str(error)
-    res["dead_pins"] = dead_pins(src, outdir / "boards" / f"{name}.escape.json")
+    if not HUMAN:
+        res["dead_pins"] = dead_pins(src, outdir / "boards" / f"{name}.escape.json")
     t0 = time.time()
-    try:
-        # --work: deterministic (no knowledge base, which learns across boards of a run); --time stays a safety stop.
-        budget = ["--work", str(WORK), "--no-kb"] if WORK else ["--kb", str(outdir / "kb.sqlite")]
-        intent = []
-        if INTENTS is not None:
-            # Routing intent (doc 05 §44): a reviewed manifest, or the component-rule draft of the input when none exists.
-            man = INTENTS / f"{name}.intent.json"
-            if not man.exists():
-                subprocess.run([str(TM), "rules", str(src), "--intent-draft", str(man)], check=True, capture_output=True)
-            intent = ["--intent", str(man)]
-            res["intent"] = str(man)
-        p = subprocess.run([str(TM), "route", str(src), "-o", str(out), "--time", str(time_limit), "--threads", str(THREADS), "--json", str(out) + ".route.json"] + budget + intent + EXTRA,
-                           capture_output=True, text=True, timeout=time_limit * 3 + 60)
-        res["exit"] = p.returncode
-        if p.returncode not in (0, 3):
-            res["error"] = (p.stderr or p.stdout)[-500:]
-    except subprocess.TimeoutExpired:
-        res["exit"] = -1
-        res["error"] = "timeout"
+    if HUMAN:
+        human = SRC_FIX / name / "routed.kicad_pcb"
+        shutil.copyfile(human, out)
+        copy_rules(human, out)
+        res["exit"] = 0
+    else:
+        try:
+            # --work: deterministic; --time stays a safety stop.
+            budget = ["--work", str(WORK), "--no-kb"] if WORK else ["--kb", str(outdir / "kb.sqlite")]
+            intent = []
+            if INTENTS is not None:
+                man = INTENTS / f"{name}.intent.json"
+                if not man.exists():
+                    subprocess.run([str(TM), "rules", str(src), "--intent-draft", str(man)], check=True, capture_output=True)
+                intent = ["--intent", str(man)]
+                res["intent"] = str(man)
+            p = subprocess.run([str(TM), "route", str(src), "-o", str(out), "--time", str(time_limit), "--threads", str(THREADS), "--json", str(out) + ".route.json"] + budget + intent + EXTRA,
+                               capture_output=True, text=True, timeout=time_limit * 3 + 60)
+            res["exit"] = p.returncode
+            if p.returncode not in (0, 3):
+                res["error"] = (p.stderr or p.stdout)[-500:]
+        except subprocess.TimeoutExpired:
+            res["exit"] = -1
+            res["error"] = "timeout"
     res["wall_s"] = round(time.time() - t0, 2)
     rj = pathlib.Path(str(out) + ".route.json")
-    if rj.exists():
+    if rj.exists() and not HUMAN:
         r = json.loads(rj.read_text())
         res.update({k: r[k] for k in ("routed", "connections", "tracks", "vias", "seconds")})
     before = drc(src, planes=planes)
-    after = drc(out, planes=planes) if out.exists() else None
+    saved = out.with_name(f"{name}.refilled.kicad_pcb") if REFILL else None
+    after = drc(out, planes=planes, saved=saved) if out.exists() else None
+    if saved is not None and saved.exists():
+        res["refilled_board"] = str(saved.relative_to(outdir))
     if before is None or after is None:
         res["judge"] = "failed"
         return res
@@ -250,6 +279,7 @@ def main() -> int:
     ap.add_argument("--time", type=float, help="wall-clock limit per board (default 60 s; 3600 s as a safety stop with --work)")
     ap.add_argument("--work", type=int, default=0, help="deterministic work budget per board (no knowledge base)")
     ap.add_argument("--refill", action="store_true", help="KiCad refills zones before judging input and output")
+    ap.add_argument("--human", action="store_true", help="judge fixtures' routed.kicad_pcb human originals without routing")
     ap.add_argument("--route-args", help="extra route options, space-separated; adds to TM_ROUTE_ARGS (write --route-args=--opt for one option)")
     ap.add_argument("--set", help="board set in bench/sets/<SET>.txt (quick, mid, planes, modern-planes); also names the set in the summary")
     ap.add_argument("--jobs", type=int, default=12)
@@ -264,13 +294,16 @@ def main() -> int:
     ap.add_argument("--fixtures", help="directory with <board>/unrouted.kicad_pcb to use instead of PCBench (with --boards or --board-list)")
     ap.add_argument("--place-args", help="extra tracemaker-place options, space-separated (quote the whole string)")
     ap.add_argument("--board-list", help="file with one board name per line (# comments)")
+    ap.add_argument("--full", action="store_true", help="also route the set's `#slow` boards (the largest; run before committing, doc 10 §4)")
     ap.add_argument("--set-name", help="name of the board set for the summary (default: the tier)")
     ap.add_argument("--intents", help="route with DIR/<board>.intent.json routing intent manifests (doc 05 §44); missing ones are drafted from the input")
     a = ap.parse_args()
-    global THREADS, SRC_FIX, PLACE_ARGS, WORK, REFILL, EXTRA, INTENTS
+    global THREADS, SRC_FIX, PLACE_ARGS, WORK, REFILL, EXTRA, INTENTS, HUMAN
     PLACE_ARGS = (a.place_args or "").split()
     THREADS = a.threads
-    WORK, REFILL = a.work, a.refill
+    WORK, REFILL, HUMAN = a.work, a.refill, a.human
+    if HUMAN and (a.place or a.intents):
+        ap.error("--human cannot be combined with --place or --intents")
     EXTRA = EXTRA + (a.route_args or "").split()
     if a.intents:
         INTENTS = pathlib.Path(a.intents).resolve()
@@ -282,8 +315,12 @@ def main() -> int:
     if a.set:
         a.board_list = a.board_list or str(ROOT / "bench/sets" / f"{a.set}.txt")
         a.set_name = a.set_name or a.set
+        if not a.fixtures:
+            SRC_FIX = ROOT / {"quick": "build/pcbench", "mid": "build/pcbench",
+                              "modern-planes": "build/modern-planes"}.get(a.set, str(FIX))
     if a.board_list:
-        a.boards = [x.strip() for x in pathlib.Path(a.board_list).read_text().splitlines() if x.strip() and not x.startswith("#")]
+        if not a.boards:
+            a.boards = set_boards(a.board_list, full=a.full)
     base = fr_baseline()
     if a.boards:
         names = a.boards
@@ -291,14 +328,19 @@ def main() -> int:
         names = sorted(n for n, v in base.items() if (a.tier == "all" or v.get("tier") == a.tier) and (FIX / n / "unrouted.kicad_pcb").exists())
         random.Random(a.seed).shuffle(names)
         names = sorted(names[: a.limit])
+    missing = [n for n in names if not (SRC_FIX / n / "unrouted.kicad_pcb").is_file()
+               or (HUMAN and not (SRC_FIX / n / "routed.kicad_pcb").is_file())]
+    if missing:
+        ap.error(f"missing prepared fixtures in {SRC_FIX}: {', '.join(missing)}; prepare the set first (see doc 10); check exclusions.json")
     run_id = a.name or datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + f"-tier{a.tier}"
     outdir = ROOT / "bench/results" / run_id
     outdir.mkdir(parents=True, exist_ok=True)
     # Snapshot the engine binary so rebuilding during a run cannot mix versions.
     global TM, PLACE, PLACE_MODE, PLACE_TIMEOUT, PLACE_WORK, PLACE_CRULES
-    snap = outdir / "tracemaker"
-    shutil.copy2(TM, snap)
-    TM = snap
+    if not HUMAN:
+        snap = outdir / "tracemaker"
+        shutil.copy2(TM, snap)
+        TM = snap
     PLACE_MODE, PLACE_TIMEOUT, PLACE_WORK, PLACE_CRULES = a.place, a.place_timeout, a.place_work, a.place_crules
     if PLACE_MODE:
         psnap = outdir / "tracemaker-place"
@@ -337,11 +379,13 @@ def main() -> int:
     summary = {
         "run": run_id, "set": (a.set_name or f"PCBench tier {a.tier}") + (f" + placement ({a.place}" + (f", component rules {a.place_crules}" if a.place_crules else "") + ")" if a.place else ""), "boards": n, "commit": commit,
         "place_mode": a.place,
+        "human": HUMAN,
+        "fixtures": str(SRC_FIX),
         "place_crules": a.place_crules,
         "clean_pass": round(clean / n, 4) if n else None,
         "completion": round(sum(r["completion"] for r in judged) / n, 4) if n else None,
         "seconds": round(sum(r.get("seconds", 0) for r in judged), 1),
-        "time_limit_s": a.time, "threads": a.threads, "work": a.work, "refill": a.refill, "route_args": " ".join(EXTRA),
+        "time_limit_s": a.time, "threads": a.threads, "work": a.work, "refill": a.refill, "full": a.full, "route_args": " ".join(EXTRA),
         "intents": str(INTENTS) if INTENTS else None,
         "fr_rc12_clean_pass": round(fr_clean / len(fr_rows), 4) if fr_rows else None,
         "fr_241_clean_pass": round(sum(r["fr_241"]["clean"] for r in fr241) / len(fr241), 4) if fr241 else None,
@@ -358,12 +402,13 @@ def main() -> int:
         summary[key] = round(sum(r[key] for r in judged if key in r), 4)
     summary["plane_metrics_boards"] = sum("plane_unconnected_after" in r for r in judged)
     (outdir / "summary.json").write_text(json.dumps(summary, indent=1))
-    notes = [f"{budget} per board"] + (["zones refilled before judging"] if a.refill else []) + ([f"route options `{' '.join(EXTRA)}`"] if EXTRA else [])
+    label = "Human" if HUMAN else "TraceMaker"
+    notes = (["human originals (no routing)"] if HUMAN else [f"{budget} per board"]) + (["zones refilled and saved before judging"] if a.refill else []) + ([f"route options `{' '.join(EXTRA)}`"] if EXTRA and not HUMAN else [])
     lines = [f"# Benchmark {run_id}", "", f"{a.set_name or 'PCBench tier ' + a.tier}, {n} boards, {', '.join(notes)}.", "",
-             "| Metric | TraceMaker | Freerouting 2.5.0-RC12 | Freerouting 2.4.1 |", "|---|--:|--:|--:|",
-             f"| Clean pass (KiCad DRC) | {summary['clean_pass']:.1%} | {summary['fr_rc12_clean_pass'] or 0:.1%} | {summary['fr_241_clean_pass'] or 0:.1%} |",
-             f"| Mean completion | {summary['completion']:.1%} | | |", "",
-             f"Both clean: {both}; only TraceMaker: {only_tm}; only Freerouting: {only_fr}.",
+             f"| Metric | {label} | Freerouting 2.5.0-RC12 | Freerouting 2.4.1 |", "|---|--:|--:|--:|",
+             f"| Clean pass (KiCad DRC) | {format(summary['clean_pass'], '.1%') if n else 'unknown'} | {summary['fr_rc12_clean_pass'] or 0:.1%} | {summary['fr_241_clean_pass'] or 0:.1%} |",
+             f"| Mean completion | {format(summary['completion'], '.1%') if n else 'unknown'} | | |", "",
+             f"Both clean: {both}; only {label}: {only_tm}; only Freerouting: {only_fr}.",
              f"Boards with added DRC errors: {summary['boards_with_added_errors']} ({dict(added_types)})."]
     lines += ["", "| Board | Routed / connections | KiCad completion | Plane unconnected | Signal unconnected | Vias | Plane / signal vias added | Plane / signal track mm added |",
               "|---|---:|---:|---:|---:|---:|---:|---:|"]

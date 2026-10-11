@@ -11,7 +11,7 @@ import statistics
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_file_location("q", ROOT / "bench/quality.py")
+spec = importlib.util.spec_from_file_location("q", ROOT / "bench/board_quality.py")
 q = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(q)
 

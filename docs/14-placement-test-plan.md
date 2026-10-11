@@ -102,7 +102,7 @@ All metrics are computed from the written `.kicad_pcb`, never from the placer's 
 | Routability | Unrouted (TraceMaker) | Unrouted connections after `tracemaker route --work W --threads 8`, W fixed per board size, and at 120 s |
 | Routability | Unrouted (Freerouting) | Same with Freerouting 2.5 and 1.9 via `bench/compare.py` (independent router: guards against a placement tuned to TraceMaker) |
 | Routability | Clean pass | Fully routed and no router-introduced KiCad DRC errors |
-| Routability | Route quality | Track length, vias, bends (`bench/quality.py`) of the routed placed board vs the routed human board |
+| Routability | Route quality | Track length, vias, bends (`bench/board_quality.py`) of the routed placed board vs the routed human board |
 | Intent | Decoupling distance | For each capacitor whose nets are one power and one ground net shared with an IC, the distance to the nearest such IC's power pin; report median and maximum, human vs placed |
 | Intent | Connector edge | Connectors (reference prefix J/P/CN or footprint library "Connector") within 2 mm of the edge, human vs placed (must not drop) |
 | Intent | Crystal distance | Crystal/oscillator to the IC pins it connects to (median, maximum) |
@@ -142,7 +142,7 @@ release blocker for that mode, whatever the numbers say.
 
 | Tool | Purpose |
 |---|---|
-| `bench/place_bench.py` | One command for L3: place (all modes) → route with TraceMaker (work budget and 120 s) and optionally Freerouting → KiCad DRC → metrics of §4 → `bench/results/<run>/place_summary.json` and `report.md`; reuses `eval_place.py`, `quality.py`, `compare.py` |
+| `bench/place_bench.py` | One command for L3: place (all modes) → route with TraceMaker (work budget and 120 s) and optionally Freerouting → KiCad DRC → metrics of §4 → `bench/results/<run>/place_summary.json` and `report.md`; reuses `eval_place.py`, `board_quality.py`, `compare.py` |
 | `bench/place_sets/` | Frozen board lists Q, D, H, DAC, S |
 | `bench/make_scratch_set.py` | Builds set S: movable parts piled at the board centre, everything else unchanged |
 | `bench/place_intent.py` | Design-intent metrics (decoupling, connector edge, crystal, orientation) |

@@ -19,7 +19,7 @@ import subprocess
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 V = ROOT / "build/video"
 FIX = ROOT / "bench/data/freerouting/scripts/benchmark/fixtures/PCBench"
-spec = importlib.util.spec_from_file_location("q", ROOT / "bench/quality.py")
+spec = importlib.util.spec_from_file_location("q", ROOT / "bench/board_quality.py")
 q = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(q)
 

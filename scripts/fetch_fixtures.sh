@@ -50,6 +50,11 @@ full_clone() {  # url dir [ref]
 # Sets built from the downloads: the DAC 2020 boards in the PCBench layout (needs freerouting + dac2020), and the
 # from-scratch placement set S (needs PCBench, bench/place_sets/H.txt and a built tracemaker-place).
 derived() {
+  if [[ -d $DATA/freerouting/scripts/benchmark/fixtures/PCBench ]]; then
+    python3 bench/prepare_pcbench.py --set quick --set mid
+  else
+    echo "skipped build/pcbench: fetch freerouting first"
+  fi
   if [[ -d $DATA/dac2020 && -d $DATA/freerouting/scripts/benchmark/fixtures/DAC2020_boards ]]; then
     python3 bench/prepare_dac2020.py > /dev/null && echo "built $DATA/dac2020_prepared"
   else

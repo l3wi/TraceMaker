@@ -7,7 +7,7 @@
 Freerouting runs with its own published benchmark settings (one thread, up to 500 passes, fanout and optimizer on,
 job timeout 30 min), from the Specctra DSN in the fixture; its session is imported into the KiCad board
 (bench/ses_import.py). TraceMaker routes the .kicad_pcb directly. The human-routed original (raw.kicad_pcb) is
-measured as a reference. Every result is judged by kicad-cli DRC and bench/quality.py, and wall time is recorded.
+measured as a reference. Every result is judged by kicad-cli DRC and bench/board_quality.py, and wall time is recorded.
 """
 import argparse
 import json
@@ -88,7 +88,7 @@ def main() -> int:
         runs[f"Freerouting {v}"] = info
 
     import importlib.util
-    spec = importlib.util.spec_from_file_location("quality", ROOT / "bench/quality.py")
+    spec = importlib.util.spec_from_file_location("quality", ROOT / "bench/board_quality.py")
     q = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(q)
     rows = []

@@ -6,18 +6,17 @@ pinned to commits in bench/sets/modern-planes.json.
   bench/prepare_modern.py [--data bench/data/modern] [--out build/modern-planes] [NAME ...]
 
 For each board: a shallow, sparse git fetch of its commit into <data>/<repo>/<commit> (only KiCad project files and
-licence texts: the board, project, custom rules and schematics for review), then <out>/<name>/unrouted.kicad_pcb
-with tracks, arcs and vias removed (zones and fills kept) next to unrouted.kicad_pro / unrouted.kicad_dru copies, so
-the router and KiCad's judge read the board's own net classes and rules. Prints the fixture directory.
+licence texts: the board, project, custom rules and schematics for review), then <out>/<name>/unrouted.kicad_pcb.
+Track/arcs and track-contact vias are removed, no-track vias and zones kept, stale fills discarded and the input
+refilled/saved by KiCad. The human original and both boards' project/custom rules are copied beside them.
 """
 import argparse
 import json
 import pathlib
-import shutil
 import subprocess
 import sys
 
-from prepare_dac2020 import strip_routing
+from prepare_inputs import prepare_board, set_boards
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SOURCES = ROOT / "bench/sets/modern-planes.json"
@@ -51,13 +50,7 @@ def fetch(board: dict, data: pathlib.Path) -> pathlib.Path:
 def prepare(board: dict, src_root: pathlib.Path, out: pathlib.Path) -> pathlib.Path:
     src = src_root / board["pcb"]
     dst = out / board["name"] / "unrouted.kicad_pcb"
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    for ext in (".kicad_pro", ".kicad_dru"):
-        if src.with_suffix(ext).exists():
-            shutil.copyfile(src.with_suffix(ext), dst.with_suffix(ext))
-    dst.write_text(strip_routing(src.read_text()))
-    # The routed original, for human-baseline comparisons (bench/human_baseline.py style).
-    shutil.copyfile(src, dst.with_name("routed.kicad_pcb"))
+    prepare_board(src, dst)
     return dst
 
 
@@ -68,7 +61,7 @@ def main() -> int:
     ap.add_argument("names", nargs="*")
     a = ap.parse_args()
     boards = json.loads(SOURCES.read_text())
-    listed = [x.strip() for x in (ROOT / "bench/sets/modern-planes.txt").read_text().splitlines() if x.strip() and not x.startswith("#")]
+    listed = set_boards(ROOT / "bench/sets/modern-planes.txt")
     if sorted(listed) != sorted(b["name"] for b in boards):
         raise SystemExit("bench/sets/modern-planes.txt and modern-planes.json list different boards")
     if a.names:

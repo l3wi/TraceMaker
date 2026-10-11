@@ -44,7 +44,7 @@ def load(name, path):
     return m
 
 
-q = load("q", ROOT / "bench/quality.py")
+q = load("q", ROOT / "bench/board_quality.py")
 mf = load("mf", ROOT / "report/make_figures.py")
 rp = load("rp", ROOT / "report/render_place.py")
 mv = load("mv", ROOT / "report/make_video.py")

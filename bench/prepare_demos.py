@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Prepare KiCad demo projects (and test boards) as bench/run.py fixtures: <out>/<name>/unrouted.kicad_pcb with
-tracks, arcs and vias removed (zones and their fills kept), next to copies of the project and custom rules, so the
-router and KiCad's judge read the same net classes and rules.
+"""Prepare KiCad demo projects (and test boards) as bench/run.py fixtures.
+Tracks/arcs and track-contact vias are removed; no-track vias and zone definitions
+are kept. Stale fills are discarded and KiCad refills/saves the unrouted input.
 
   bench/prepare_demos.py [--out build/demos] [--set planes | NAME ...]
 
@@ -12,10 +12,9 @@ its own fetcher, bench/prepare_modern.py.
 """
 import argparse
 import pathlib
-import shutil
 import sys
 
-from prepare_dac2020 import strip_routing
+from prepare_inputs import prepare_board, set_boards
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SEARCH = [ROOT / "bench/data/kicad/demos", ROOT / "tests/boards"]
@@ -32,11 +31,7 @@ def find(name: str) -> pathlib.Path:
 def prepare(name: str, out: pathlib.Path) -> pathlib.Path:
     src = find(name)
     dst = out / name / "unrouted.kicad_pcb"
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    for ext in (".kicad_pro", ".kicad_dru"):
-        if src.with_suffix(ext).exists():
-            shutil.copyfile(src.with_suffix(ext), dst.with_suffix(ext))
-    dst.write_text(strip_routing(src.read_text()))
+    prepare_board(src, dst)
     return dst
 
 
@@ -48,7 +43,7 @@ def main() -> int:
     a = ap.parse_args()
     names = list(a.names)
     if a.set:
-        names += [x.strip() for x in (ROOT / "bench/sets" / f"{a.set}.txt").read_text().splitlines() if x.strip() and not x.startswith("#")]
+        names += set_boards(ROOT / "bench/sets" / f"{a.set}.txt")
     if not names:
         ap.error("give --set or board names")
     out = pathlib.Path(a.out).resolve()

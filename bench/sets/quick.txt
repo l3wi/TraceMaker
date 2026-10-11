@@ -1,5 +1,7 @@
 # Quick tier (doc 10 §4): the 30 PCBench tier-A boards that run.py --limit 30 samples with seed 1.
-# Every routing change: --set quick --work 1000000.
+# Prepare: python3 bench/prepare_pcbench.py --set quick
+# Run: bench/run.py --set quick --work 100000000 --refill --route-args="--variants 1 --soft-zones --keep-vias-off-pads --diff-pairs"
+# Human reference: bench/run.py --set quick --human --refill --name human-quick
 655_testboard
 C-BISCUIT_buck-reg-5v
 CubeSAT-Reaction-Wheel_Edison_Motor_Servo

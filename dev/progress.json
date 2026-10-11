@@ -812,8 +812,8 @@
      "done": true
     },
     {
-     "text": "Routing intent completion cost vs --tree-attach (StickHub 89.8 -> 82.8 %, kitspace_threeboard 86.6 -> 79.0 %)",
-     "done": false
+     "text": "Routing intent completion cost vs --tree-attach: a budget artefact. At 100 M quick routes 30/30 clean in every arm (old zone-free inputs); at 200 M mid trails tree attach by 6 of ~1,290 unconnected; decoupling parity ties (paired-board 95% intervals include 0)",
+     "done": true
     },
     {
      "text": "modern-planes tier replaces gndplane (D105): 16 open-hardware KiCad 7-10 plane boards pinned by commit, 0 unconnected in their originals; 20 M router completion plain/tree/intent 77.8/80.1/79.6 %",
@@ -821,6 +821,30 @@
     },
     {
      "text": "Judge completion past KiCad's 499 reported unconnected items (6 modern-planes boards, 2 mid boards)",
+     "done": false
+    },
+    {
+     "text": "Honest four-set inputs and saved refill/human benchmark path (D106): 65 fixtures, fixed zones/no-track vias retained, 4 PCBench copper-coverage warnings without dropping roster boards; standard off-pad/diff-pair protocol and quality work sweeps documented; deterministic missing/zero/duplicate design UUID repair prevents legacy-conversion keepout artifacts",
+     "done": true
+    },
+    {
+     "text": "Human-parity better-board scorecard (D107): independent electrical/DRC/manufacturing/thermal gates, eight separate quality categories, physical PCBench terminal matching, common-connected/service cohorts, macro/pooled grades, paired-board intervals and refill/self noise controls; eight deterministic measurement/cache regressions",
+     "done": true
+    },
+    {
+     "text": "One work budget per set (quick 100 M, mid and modern-planes 200 M), `#slow` boards (1,000+ connections) only with run.py --full, planes set retired (D108)",
+     "done": true
+    },
+    {
+     "text": "Full D106 baseline before committing: human + P/T/R with --full on quick, mid, modern-planes, then bench/quality.py",
+     "done": false
+    },
+    {
+     "text": "Soft-zone pour connectivity: with pours restored, quick boards finish yet KiCad reports 34-40 GND items unconnected after refill (the router's tracks split the pour it counted as joined). A raster estimate + repair prototype (branch wip/router-fixes-premerge) gave quick T/100 M 34 -> 1 unconnected, 18 -> 29/30 clean; superseded by origin/main's exact engine refill (D85), to be verified after the merge",
+     "done": false
+    },
+    {
+     "text": "Router quality gaps vs human (modern-planes, review 2026-10-11): diff-pair coupling (with --diff-pairs 45/84 pairs coupled; fine-pitch pair fan-in fails, survey and draft on wip/router-fixes-premerge), return vias at layer changes (1 mm parity 65 %; compare main's D92 stitching), supply widths 0.625x human (main's --widen-power), off-axis pad entry 32 % vs 21 %",
      "done": false
     }
    ]
