@@ -8,7 +8,9 @@
    new copper), not run back to one of the track's end pads (about 9 mm).
 2. A GND island (two pads tied by an existing track that runs on out of a no-via area) must drop its via into the
    B.Cu plane straight off the track where vias are allowed, not lay new track over the old one from a pad.
-3. PCBench mini-whip with --tree-attach and the clean-up: connections branch off routed copper and the clean-up
+3. The same trunk and terminal placed in one package must use the planned pad, not tree copper among the
+   package's other pins. Inter-package branching (case 1) and fixed-island plane starts (case 2) remain available.
+4. PCBench mini-whip with --tree-attach and the clean-up: connections branch off routed copper and the clean-up
    re-routes connections, so the router's bookkeeping of what each route physically joins must hold. Every
    connection the router reports routed must be connected in TraceMaker's DRC and, when kicad-cli is available,
    in KiCad's. The run is repeated with two threads and must be byte-identical.
@@ -38,6 +40,20 @@ BRANCH = """(kicad_pcb (version 20240108) (generator pcbnew)
   (pad "1" smd circle (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask") (net 1 "BRANCH")))
  (footprint "T:C" (layer "F.Cu") (at 10 8) (property "Reference" "C" (at 0 -1) (layer "F.SilkS"))
   (pad "1" smd circle (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask") (net 1 "BRANCH")))
+ (segment (start 2 5) (end 18 5) (width 0.25) (layer "F.Cu") (net 1))
+ (gr_rect (start 0 0) (end 20 12) (stroke (width 0.05) (type default)) (fill none) (layer "Edge.Cuts"))
+)
+"""
+
+PACKAGE = """(kicad_pcb (version 20240108) (generator pcbnew)
+ (general (thickness 1.6))
+ (layers (0 "F.Cu" signal) (31 "B.Cu" signal) (44 "Edge.Cuts" user))
+ (setup (pad_to_mask_clearance 0))
+ (net 0 "") (net 1 "BRANCH")
+ (footprint "T:PACKAGE" (layer "F.Cu") (at 0 0) (property "Reference" "U1" (at 0 -1) (layer "F.SilkS"))
+  (pad "1" smd circle (at 2 5) (size 1 1) (layers "F.Cu" "F.Mask") (net 1 "BRANCH"))
+  (pad "2" smd circle (at 18 5) (size 1 1) (layers "F.Cu" "F.Mask") (net 1 "BRANCH"))
+  (pad "3" smd circle (at 10 8) (size 1 1) (layers "F.Cu" "F.Mask") (net 1 "BRANCH")))
  (segment (start 2 5) (end 18 5) (width 0.25) (layer "F.Cu") (net 1))
  (gr_rect (start 0 0) (end 20 12) (stroke (width 0.05) (type default)) (fill none) (layer "Edge.Cuts"))
 )
@@ -125,8 +141,22 @@ def main() -> int:
         print("FAIL island: TraceMaker DRC finds unconnected items")
         ok = False
 
+    src = work / "package.kicad_pcb"
+    src.write_text(PACKAGE)
+    out = work / "package_routed.kicad_pcb"
+    summary, items = route(tm, src, out, "--variants", "1", "--threads", "1")
+    length = sum(math.dist(t["start"], t["end"]) for t in items["tracks"]) / 1e6
+    if summary["routed"] != summary["connections"] or not 7.0 < length < 12.0 or items["vias"]:
+        print(f"FAIL package: routed {summary['routed']}/{summary['connections']}, {length:.2f} mm new copper, {len(items['vias'])} vias "
+              "(expected a planned-pad route, not the 3 mm intra-package tree shortcut)")
+        ok = False
+    for name, n in (("TraceMaker", unconnected_tm(tm, out, work)), ("KiCad", unconnected_kicad(out, work))):
+        if n:
+            print(f"FAIL package: {name} DRC finds {n} unconnected items")
+            ok = False
+
     if not WHIP.exists():
-        print("PCBench fixture missing: third part skipped")
+        print("PCBench fixture missing: fourth part skipped")
         return 0 if ok else 1
     outs = []
     for threads in ("1", "2"):
