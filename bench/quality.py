@@ -8,6 +8,7 @@ Requires Shapely >= 2, KiCad CLI, and tracemaker inspect (TM_BINARY override).
 import argparse
 from concurrent.futures import ProcessPoolExecutor
 import hashlib
+import importlib
 import json
 from pathlib import Path
 import statistics
@@ -20,8 +21,23 @@ import quality_compare as qc
 import quality_craft as craft
 import quality_si as si
 import quality_identity as identity
+import quality_rules as qr
+import interfaces as interface_io
 from shapely.geometry import Point
 
+RULE_MODULES = []  # Module names, imported only for an explicitly selected profile.
+
+
+def measure_rules(d, interfaces, profile, ctx):
+    results = {}
+    for module_name in RULE_MODULES:
+        module = importlib.import_module(module_name)
+        for entry in module.measure_rules(d, interfaces, profile, ctx):
+            key = qr.key(entry)
+            if key in results:
+                raise ValueError('duplicate rule application: '+key)
+            results[key] = entry
+    return {key: results[key] for key in sorted(results)}
 
 def effective_paths(d, manifest, fills):
     """Port align.py's lower bound, but require actual contact to the SAME fill island.
@@ -82,7 +98,7 @@ def net_complete(d, bad, censored=False):
             for n in d['nets'] if n and not n.startswith('unconnected')}
 
 
-def measure(d, manifest, board, meta, bad, *, censored=False):
+def measure(d, manifest, board, meta, bad, *, censored=False, interfaces=None, profile=None):
     categories = {c:{} for c in qc.METRICS}
     ff=si.all_fills(board)
     categories['decoupling']=effective_paths(d,manifest,ff)
@@ -139,13 +155,21 @@ def measure(d, manifest, board, meta, bad, *, censored=False):
             categories['efficiency'][n]=dict(connected=complete[n],connections=obligations,
                                              vias_per_connection=sum(v['net']==n for v in d['vias'])/obligations,
                                              mm_per_connection=si.exact_copper_length(d,n)/obligations)
-    return categories, manufacturing, dict(fill_hash=fill_hash,broad_reference_layers=sorted(broad),
-                                           reference_error=reference_error,manifest_obligations=len(manifest.get('connections',[])),
-                                           differential_candidates=len(candidates), thermal_candidates=len(thermals))
+    coverage = dict(fill_hash=fill_hash,broad_reference_layers=sorted(broad),
+                    reference_error=reference_error,manifest_obligations=len(manifest.get('connections',[])),
+                    differential_candidates=len(candidates), thermal_candidates=len(thermals))
+    if profile is not None:
+        coverage['interfaces'] = interface_io.coverage(interfaces, d)
+        coverage['rules'] = measure_rules(d, interfaces, profile,
+                                         dict(fills=ff, complete=complete, board_path=board))
+    return categories, manufacturing, coverage
 
 
 def board_job(job):
-    name,runs,reference,intents,version=job
+    name,runs,reference,intents,version,*rule_options=job
+    interface_dir,profile = rule_options if rule_options else (None,None)
+    interfaces = qr.load_interfaces(interface_dir, name) if profile is not None else None
+    interface_path = Path(interface_dir)/(name+'.interfaces.json') if interfaces is not None else None
     paths=[reference]+runs
     result=dict(board=name,runs={},errors={})
     manifest_path=Path(intents)/(name+'.intent.json') if intents else None
@@ -186,7 +210,8 @@ def board_job(job):
                                                                                      drc_pass=None,completion=None,censored=None,unconnected=len(report.get('unconnected_items',[])),unconnected_nets=sorted({n for u in report.get('unconnected_items',[]) for item in u.get('items',[]) for n in io.bracket_nets(item.get('description',''))}))
             bad_nets = judged['unconnected_nets']
             categories,mfg,coverage=measure(data,manifest,filled,meta,bad_nets,
-                                            censored=len(report.get('unconnected_items',[]))>=499)
+                                            censored=len(report.get('unconnected_items',[]))>=499,
+                                            interfaces=interfaces, profile=profile)
             matched_keys={p['ref']+'.'+p['num'] for p in data['pads'] if p.get('physical_matched')}
             unmatched_human={p['ref']+'.'+p['num'] for p in human_geometry['pads']} - matched_keys
             coverage['terminal_matching']=dict(terminal_coverage,unmatched_human=sorted(unmatched_human))
@@ -202,6 +227,11 @@ def board_job(job):
                                           placement_sha256=hashlib.sha256(json.dumps(sorted((p['net'],p['x'],p['y'],p['w'],p['h'],p['angle'],tuple(p['layers'])) for p in data['pads'])).encode()).hexdigest(),
                                           engine_diagnostic={k:diagnostic.get(k) for k in ('routed','connections','stop','expansions','seconds')},
                                           whole_board=dict(vias=len(data['vias']),track_arc_mm=sum(si.exact_copper_length(data,n) for n in data['nets'])))
+            if profile is not None:
+                arm = result['runs'][str(run)]
+                arm['rules'] = coverage.pop('rules')
+                arm['interfaces_sha256'] = io.digest(interface_path) if interface_path else None
+                arm['provenance']['interfaces_sha256'] = arm['interfaces_sha256']
             if run==reference:
                 original,_,_=measure(data,manifest,source,meta,judged['unconnected_nets'])
                 result['original_human']=original
@@ -316,6 +346,19 @@ def markdown(result):
     lines += ['', '## Limits', '']+[ '- '+s for s in result['limits']]
     if result['errors']:
         lines += ['', '## Unassessable boards', '', '```json', json.dumps(result['errors'],indent=2), '```']
+    if 'rules' in result:
+        lines += ['', qr.markdown(result['rules'], list(result['gates'])[1:]).rstrip(),
+                  '## Interface coverage', '',
+                  '| Board | Run | Interface | Confidence | Lanes | Not bound |',
+                  '|---|---|---|---|---:|---:|']
+        for board in result['boards']:
+            for run, arm in board['runs'].items():
+                cov = arm['coverage']['interfaces']
+                for iface in cov['interfaces']:
+                    missing = sum(l['interface'] == iface['id'] for l in cov['lanes_not_bound'])
+                    lines.append(f"| {board['board']} | {Path(run).name} | {iface['id']} | {iface['confidence']} | {iface['lanes']} | {missing} |")
+                if not cov['interfaces']:
+                    lines.append(f"| {board['board']} | {Path(run).name} | {cov['status'] or 'no detected interfaces'} | N/A | 0 | N/A |")
     return '\n'.join(lines)+'\n'
 
 
@@ -323,8 +366,11 @@ def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('runs',nargs='+');ap.add_argument('--reference',required=True)
     ap.add_argument('--intents');ap.add_argument('--json');ap.add_argument('--md')
+    ap.add_argument('--interfaces', help='frozen input interface manifests')
+    ap.add_argument('--profile', help='opt-in rule profile ID or JSON path; default: no rules')
     ap.add_argument('--jobs',type=int,default=6)
     args=ap.parse_args()
+    profile = qr.load_profile(args.profile) if args.profile else None
     if not 1<=args.jobs<=6:
         ap.error('--jobs must be between 1 and 6')
     started=time.monotonic()
@@ -332,7 +378,7 @@ def main():
     version=subprocess.run([io.KICAD,'version'],check=True,capture_output=True,text=True).stdout.strip()
     # The compared runs schedule the boards (a set without its `#slow` boards, D115); the human run is only their reference.
     names=sorted(set().union(*(set(roster(r)) for r in runs)))
-    jobs=[(name,runs,reference,args.intents,version) for name in names]
+    jobs=[(name,runs,reference,args.intents,version,args.interfaces,profile) for name in names]
     with ProcessPoolExecutor(max_workers=args.jobs) as pool:
         boards=list(pool.map(board_job,jobs))
     refs={b['board']:b['runs'][str(reference)]['categories'] for b in boards if str(reference) in b['runs']}
@@ -366,6 +412,11 @@ def main():
                 seconds=time.monotonic()-started,gates=gates,categories=qc.summarize(refs,arms),
                 noise_floor=qc.noise(refs,{b['board']:b.get('original_human',{}) for b in boards}),
                 boards=boards,errors=errors,limits=limits)
+    if profile is not None:
+        result['profile'] = profile
+        result['rules'] = qr.summarize(
+            {b['board']:b['runs'][str(reference)]['rules'] for b in boards if str(reference) in b['runs']},
+            {r.name:{b['board']:b['runs'][str(r)]['rules'] for b in boards if str(r) in b['runs']} for r in runs})
     text=markdown(result)
     print(text)
     destination=Path(args.json) if args.json else runs[0]/'quality.json'
