@@ -934,7 +934,7 @@ struct Router::Impl {
   // cells a track end may occupy are offered. `node_at`: cell key -> connectivity node of the copper there. `mark`:
   // goal flags to set.
   void add_tree_cells(const Window& w, NetId net, const RootUnion& u, int root, int skip_pad, const std::vector<int>* only, Endpoint& e,
-                      std::unordered_map<std::int64_t, int>& node_at, std::vector<std::uint8_t>* mark) {
+                      std::unordered_map<std::int64_t, int>& node_at, std::vector<std::uint8_t>* mark, int other_pad = -1) {
     const std::size_t cells = static_cast<std::size_t>(w.w) * static_cast<std::size_t>(w.h);
     const Coord hw = track_width(net) / 2;
     std::set<std::int64_t> seen;  // the endpoint's own cells and cells already offered
@@ -942,6 +942,8 @@ struct Router::Impl {
     const Point lo = at(w.x0, w.y0), hi = at(w.x0 + w.w - 1, w.y0 + w.h - 1);
     const geom::Box wbox{lo.x, lo.y, hi.x, hi.y};
     const int skip_item = skip_pad >= 0 ? pad_item[static_cast<std::size_t>(skip_pad)] : -1;
+    const int footprint_a = skip_pad >= 0 ? b.pads[static_cast<std::size_t>(skip_pad)].footprint : -1;
+    const int footprint_b = other_pad >= 0 ? b.pads[static_cast<std::size_t>(other_pad)].footprint : -1;
     std::vector<int> ids;
     obs->grid().query(wbox, [&](int id) { ids.push_back(id); });
     std::sort(ids.begin(), ids.end());  // copper order, whatever the grid's
@@ -949,8 +951,9 @@ struct Router::Impl {
     for (const int id : ids) {
       const auto& it = items[static_cast<std::size_t>(id)];
       if (it.removed || it.net != net || id == skip_item || !it.box.intersects(wbox)) continue;
-      // Alternate pads can pull a tie around a neighbouring signal pin instead of out from its planned pad.
-      if (it.kind != drc::ItemKind::Track && it.kind != drc::ItemKind::Arc && it.kind != drc::ItemKind::Via) continue;
+      if (it.kind != drc::ItemKind::Track && it.kind != drc::ItemKind::Arc && it.kind != drc::ItemKind::Via && it.kind != drc::ItemKind::Pad) continue;
+      // Do not replace a planned terminal by a fine-pitch neighbour on either endpoint's footprint.
+      if (it.kind == drc::ItemKind::Pad && it.footprint >= 0 && (it.footprint == footprint_a || it.footprint == footprint_b)) continue;
       if (only && !std::binary_search(only->begin(), only->end(), id)) continue;
       int node;
       if (it.owner >= 0) {
@@ -1132,14 +1135,14 @@ struct Router::Impl {
         if (opt.plane_tie) {
           const RootUnion u = net_roots(net, current);
           const int rz = u.find(end_root(c));
-          if (u.find(pad_root(c.pad_a)) != rz) add_tree_cells(w, net, u, rz, -1, nullptr, dst, tree_end, &is_target);
+          if (u.find(pad_root(c.pad_a)) != rz) add_tree_cells(w, net, u, rz, -1, nullptr, dst, tree_end, &is_target, c.pad_a);
         }
       } else if (opt.tree_attach) {
         const RootUnion u = net_roots(net, current);
         const int ra = u.find(pad_root(c.pad_a)), rb = u.find(pad_root(c.pad_b));
         if (ra != rb) {
-          add_tree_cells(w, net, u, ra, c.pad_a, nullptr, src, tree_start, nullptr);
-          add_tree_cells(w, net, u, rb, c.pad_b, nullptr, dst, tree_end, &is_target);
+          add_tree_cells(w, net, u, ra, c.pad_a, nullptr, src, tree_start, nullptr, c.pad_b);
+          add_tree_cells(w, net, u, rb, c.pad_b, nullptr, dst, tree_end, &is_target, c.pad_a);
         }
       }
     }
