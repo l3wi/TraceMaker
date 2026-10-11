@@ -140,15 +140,17 @@ def _overlaps(s, t):
 def target_gap(sa, sb):
     """Prototype length-weighted 0.025 mm gap mode, or None if unobserved.
 
-    Only edge gaps in [0, 0.5] mm count; ties keep the first observed bin.
+    Only edge gaps in [0, 0.5] mm count; ties select the smallest gap bin.
     """
-    histogram = collections.Counter()
-    for s in sa:
-        for t in sb:
+    contributions = collections.defaultdict(list)
+    order = lambda s: (s["layer"], s["sx"], s["sy"], s["ex"], s["ey"], s["width"], s["len"])
+    for s in sorted(sa, key=order):
+        for t in sorted(sb, key=order):
             overlap = _overlaps(s, t)
             if overlap and 0 <= overlap[2] <= 0.5:
-                histogram[round(overlap[2] / 0.025) * 0.025] += overlap[1] - overlap[0]
-    return histogram.most_common(1)[0][0] if histogram else None
+                contributions[round(overlap[2] / 0.025) * 0.025].append(overlap[1] - overlap[0])
+    histogram = {gap: math.fsum(lengths) for gap, lengths in contributions.items()}
+    return min(histogram, key=lambda gap: (-histogram[gap], gap)) if histogram else None
 
 
 def coupled(sa, sb, gap):
