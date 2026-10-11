@@ -4,6 +4,9 @@ import json
 import pathlib
 import tempfile
 import unittest
+from unittest.mock import patch
+
+import quality
 
 import quality_rules as rules
 
@@ -57,6 +60,37 @@ class RuleTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 rules.load_interfaces(d, 'b')
             self.assertIsNone(rules.load_interfaces(d, 'other'))
+
+    def test_profile_without_manifest_board_job_and_markdown(self):
+        d = dict(nets=[], pads=[], tracks=[], arcs=[], vias=[], copper_layers=['F.Cu', 'B.Cu'])
+        provenance = dict(rules={})
+        profile = dict(id='test', rules=[SKEW])
+        with tempfile.TemporaryDirectory() as directory:
+            reference = pathlib.Path(directory)/'human'
+            (reference/'boards').mkdir(parents=True)
+            board = reference/'boards'/'b.kicad_pcb'
+            board.write_text('(kicad_pcb)')
+            router = pathlib.Path(directory)/'router'
+            (router/'boards').mkdir(parents=True)
+            (router/'boards'/'b.kicad_pcb').write_text('(kicad_pcb)')
+            for interface_dir in (None, pathlib.Path(directory)/'missing'):
+                with self.subTest(interface_dir=interface_dir), \
+                     patch.object(quality.io, 'fixture', return_value=None), \
+                     patch.object(quality.io, 'inspect', return_value=d), \
+                     patch.object(quality.io, 'prepare', return_value=(board, {}, provenance)), \
+                     patch.object(quality.craft, 'metadata', return_value={}), \
+                     patch.object(quality.identity, 'canonical_human', return_value=(d, {})), \
+                     patch.object(quality.si, 'all_fills', return_value={}), \
+                     patch.object(quality.si, 'fills', return_value=({}, set(), 'hash')):
+                    result = quality.board_job(('b', [router], reference, None, '10', interface_dir, profile))
+                self.assertEqual(result['errors'], {})
+                self.assertEqual(result['runs'][str(reference)]['coverage']['interfaces']['status'], 'missing')
+                report = dict(reference='human', kicad_version='10', seconds=0, gates={}, categories={},
+                              noise_floor={}, limits=[], errors={}, rules={}, boards=[result])
+                self.assertIn('| b | human | missing | N/A | 0 | N/A |', quality.markdown(report))
+                # Old cached arms may predate coverage publication.
+                result['runs'][str(reference)]['coverage'].pop('interfaces')
+                self.assertIn('| b | human | missing | N/A | 0 | N/A |', quality.markdown(report))
 
     def test_summary_keeps_human_failures_and_missing_items(self):
         human = {'b': {}}

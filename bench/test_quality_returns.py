@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from shapely.geometry import box
 import quality
+import quality_compare
 import quality_returns as returns
 import quality_si as si
 
@@ -119,6 +120,35 @@ class ReturnTests(unittest.TestCase):
         r=quality.effective_paths(d,manifest,fills)['C1.1>U1.1']
         self.assertIsNone(r['return_lead_mm'])
         self.assertEqual(r['effective_mm'],10)
+    def test_lost_cap_ground_is_a_return_obligation_loss(self):
+        human = dict(nets=['VCC', 'GND'], copper_layers=['F.Cu', 'B.Cu'], arcs=[], vias=[],
+                     pads=[pad('C1', '1', 'VCC', 0, 2), pad('U1', '1', 'VCC', 10, 2),
+                           pad('C1', '2', 'GND', 0), pad('U1', '2', 'GND', 10)],
+                     tracks=[track('VCC', (0, 2), (10, 2)), track('GND', (0, 0), (10, 0))])
+        router = copy.deepcopy(human)
+        router['tracks'] = [t for t in router['tracks'] if t['net'] != 'GND']
+        intent = {'connections': [{'from': 'C1.1', 'to': 'U1.1'}]}
+        with patch.object(si, 'all_fills', return_value={}), patch.object(si, 'fills', return_value=({}, set(), 'hash')):
+            reference, _, _ = quality.measure(human, intent, pathlib.Path('unused'), {}, [])
+            routed, _, _ = quality.measure(router, intent, pathlib.Path('unused'), {}, ['GND'])
+            unknown, _, _ = quality.measure(router, intent, pathlib.Path('unused'), {}, [], censored=True)
+            unrepresented, _, _ = quality.measure(router, intent, pathlib.Path('unused'), {}, [])
+        key = 'C1.1>U1.1'
+        self.assertEqual(reference['decoupling'][key]['return_lead_mm'], 10)
+        self.assertTrue(reference['decoupling'][key]['return_connected'])
+        self.assertTrue(routed['decoupling'][key]['connected'])
+        self.assertFalse(routed['decoupling'][key]['return_connected'])
+        self.assertIsNone(unknown['decoupling'][key]['return_connected'])
+        self.assertTrue(unrepresented['decoupling'][key]['return_connected'])
+        summary = quality_compare.summarize({'b': reference}, {'T': {'b': routed}})
+        returns_view = summary['decoupling']['return_lead_mm']['arms']['T']['all_obligations']
+        self.assertEqual((returns_view['missing'], returns_view['loss'], returns_view['not_assessable']), (1, 1, 0))
+        supply_view = summary['decoupling']['effective_mm']['arms']['T']['all_obligations']
+        self.assertEqual((supply_view['missing'], supply_view['tie']), (0, 1))
+        for categories in (unknown, unrepresented):
+            view = quality_compare.summarize({'b': reference}, {'T': {'b': categories}})['decoupling']['return_lead_mm']['arms']['T']['all_obligations']
+            self.assertEqual((view['missing'], view['not_assessable']), (0, 1))
+
 
     def test_single_manifest_lane_added_without_changing_legacy_fields(self):
         with patch.object(si, 'all_fills', return_value=self.fills), patch.object(si, 'fills', return_value=({'In1.Cu': box(-1, -2, 11, 2)}, {'In1.Cu'}, 'hash')):

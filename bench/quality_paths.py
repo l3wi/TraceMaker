@@ -134,7 +134,7 @@ def _pad_region(p, info=None):
     elif not known:
         return Point(p['x']/NM, p['y']/NM), min(w, h)/2, False
     dx, dy = max(0, w/2-radius), max(0, h/2-radius)
-    angle = math.radians(p.get('angle', 0))
+    angle = -math.radians(p.get('angle', 0))
     def xy(x, y):
         return (p['x']/NM+x*math.cos(angle)-y*math.sin(angle),
                 p['y']/NM+x*math.sin(angle)+y*math.cos(angle))
@@ -414,6 +414,42 @@ def pair_metrics(p, n):
                 via_layer_mismatch=0, reason=None)
 
 
+def _orient_pair(d, p_ends, n_ends):
+    """Match frozen terminals jointly, preferring footprints then proximity.
+
+    Geometry comes only from endpoint bindings, never route copper. Equal
+    correspondence evidence is ambiguous; pad dimensions cannot break that tie.
+    """
+    if len(p_ends) != 2 or len(n_ends) != 2:
+        return None
+    order = lambda e: (e['x_nm'], e['y_nm'], e['net'], tuple(sorted(e['layers'])))
+    pp, nn = sorted(p_ends, key=order), sorted(n_ends, key=order)
+    def ref(e):
+        matches = {p['ref'] for p in d.get('pads', []) if _binding(p, e)}
+        return next(iter(matches)) if len(matches) == 1 else None
+    p_refs, n_refs = [ref(e) for e in pp], [ref(e) for e in nn]
+    def score(indices):
+        footprint_matches = sum(p_refs[i] is not None and p_refs[i] == n_refs[j] for i, j in enumerate(indices))
+        distance = sum((pp[i]['x_nm']-nn[j]['x_nm'])**2+(pp[i]['y_nm']-nn[j]['y_nm'])**2
+                       for i, j in enumerate(indices))
+        return -footprint_matches, distance
+    forward, reverse = score((0, 1)), score((1, 0))
+    if forward == reverse:
+        return None
+    return pp, nn if forward < reverse else list(reversed(nn))
+
+
+def _lane_endpoints(d, lane, series):
+    endpoints = lane.get('endpoints', [])
+    if not lane.get('n'):
+        return endpoints
+    inner = [e for s in series for e in s.get('endpoints', [])]
+    legs = [[e for e in endpoints if e.get('net') in _closure(lane[leg], series) and e not in inner]
+            for leg in ('p', 'n')]
+    oriented = _orient_pair(d, *legs)
+    return oriented[0]+oriented[1]+[e for e in endpoints if e in inner] if oriented else []
+
+
 def infer_endpoints(d):
     """Freeze physical two-pad endpoints for legacy name-inferred candidates.
 
@@ -421,10 +457,13 @@ def infer_endpoints(d):
     Keys/values may be reused unchanged for every comparison arm.
     """
     out = {}
-    for net in sorted({n for pair in si.pairs(d) for n in pair}):
-        pads = _unique(p for p in d['pads'] if p['net'] == net)
-        if len(pads) == 2:
-            out[net] = [dict(x_nm=p['x'], y_nm=p['y'], net=net, layers=sorted(p['layers'])) for p in pads]
+    for p, n in si.pairs(d):
+        pads = [_unique(pad for pad in d['pads'] if pad['net'] == net) for net in (p, n)]
+        endpoints = [[dict(x_nm=pad['x'], y_nm=pad['y'], net=net, layers=sorted(pad['layers']))
+                      for pad in leg] for net, leg in zip((p, n), pads)]
+        oriented = _orient_pair(d, *endpoints)
+        if oriented:
+            out[p], out[n] = oriented
     return out
 
 
@@ -566,7 +605,8 @@ def measure_rules(d, interfaces, profile, ctx):
         lanes = sorted(iface['lanes'], key=lambda l: l['id'])
         measured = {}
         for lane in lanes:
-            measured[lane['id']] = {leg: endpoint_path(d, lane[leg], lane.get('endpoints', []), iface.get('series', []),
+            endpoints = _lane_endpoints(d, lane, iface.get('series', []))
+            measured[lane['id']] = {leg: endpoint_path(d, lane[leg], endpoints, iface.get('series', []),
                                                       pad_metadata=pad_metadata)
                                      for leg in ('p', 'n') if lane.get(leg)}
         for measure in measures:
@@ -574,7 +614,7 @@ def measure_rules(d, interfaces, profile, ctx):
                 selected = [l for l in lanes if not rule.get('role') or l.get('role') in (rule['role'], None, 'unknown')]
                 if measure == 'group_skew_mm':
                     group = rule.get('group')
-                    relevant = [l for l in lanes if l.get('role') in ('data', 'tx', 'rx', 'clock')]
+                    relevant = [l for l in lanes if l.get('role') in ('data', 'single', 'tx', 'rx', 'clock')]
                     reason = 'unknown group lane role' if any(l.get('role') not in ('data', 'tx', 'rx', 'clock', 'single') for l in lanes) else None
                     means = {}
                     for lane in relevant:

@@ -579,15 +579,22 @@ omitted until real stackup data and a validated solver exist. Numeric checks use
 boundary band; integer counts use an exact zero band. These old carrier-board recommendations are
 explicitly opt-in context, not new hard gates or current interface-standard compliance.
 
+An active profile always publishes interface coverage, including `status: missing` when no manifest
+is supplied or a scheduled board's manifest is absent. Markdown also treats older arms without that
+coverage field as missing, rather than failing report generation.
+
 ### Frozen endpoint and segment checks (D-SC-PATHS)
 
 `bench/quality_paths.py` measures the required electrical path between physical endpoints from a schema-1
 interface manifest, including declared series parts joining split nets. Each differential lane supplies two
-ordered outer endpoints per leg; series-pad bindings may also appear in the lane's endpoint list when the
-series entry supplies its own physical `endpoints` to exclude. Order must identify the same source-to-sink
-direction for P and N. The manifest is frozen from the common input/human, never fitted to a router arm.
-Extra ESD/test-point pads do not disqualify a unique path. Without explicit intent, the new parity fields use
-only the human's physically unique two-pad candidate endpoints, reused unchanged across arms.
+outer endpoints per leg; series-pad bindings may also appear in the lane's endpoint list when the
+series entry supplies its own physical `endpoints` to exclude. P/N correspondence is resolved jointly
+from their physical bindings: prefer endpoints on the same footprint, then nearest endpoint pairing;
+equal evidence is ambiguous and yields N/A. The same correspondence is used for manifest traversal
+and inferred parity endpoints. The manifest is frozen from the common input/human, never fitted to a
+router arm. Extra ESD/test-point pads do not disqualify a unique path. Without explicit intent, the new
+parity fields use only the human's physically unique two-pad candidate endpoints, reused unchanged
+across arms. Pad dimensions and file order never choose opposite traversal directions.
 
 The graph splits straight tracks and exact circular arcs at conductive junctions. Physical duplicate copper
 and vias are merged; sub-nanometre intersection coordinates are snapped to integer nanometres. Pads are
@@ -601,7 +608,7 @@ internal lengths, package delays and unknown external cables are not inferred fr
 |---|---|
 | `intra_skew_mm` | Absolute difference between P and N endpoint-path lengths |
 | `segment_skew_mm` | Worst absolute difference between the P/N lengths of successive sections bounded by matching ordered via, layer-changing-pad or series transitions; +1 mm before a via and −1 mm afterward is 1 mm, not zero |
-| `group_skew_mm` | Per-lane mean of P/N lengths (single-ended path length when applicable), compared with the one declared clock or the spread over declared data/TX/RX lanes, selected by the profile's `group` |
+| `group_skew_mm` | Per-lane mean of P/N lengths (`single` data lanes use their one path length), compared with the one `clock` lane or the spread over declared data/single/TX/RX lanes, selected by the profile's `group` |
 | `max_length_mm` | Longest individual leg's endpoint-path planar length |
 | `vias_per_leg` | Unique vias actually traversed on each leg, not total same-net vias; profile `role` and `mode` select budgets |
 | `between_legs_items` | Unique unrelated tracks/arcs, pads, vias and same-layer filled islands intruding into the edge-to-edge corridor along parallel straight path sections; declared series pads and both legs' nets are excluded |
@@ -615,8 +622,10 @@ metrics retain their original meanings and values.
 The absolute millimetre checks use the shared 1 µm boundary band; count checks have band zero. Human
 violations remain visible and guide-derived limits are not new hard gates or current protocol certification.
 Unknown interface identity, lane role, group membership or geometry is never a pass. Supported pad shapes
-(rectangle, round rectangle, oval and circle) use the frozen metadata where supplied; otherwise only
-inscribed-disk contact is represented, with potential corridor intrusions from unknown pad shapes marked N/A.
+(rectangle, round rectangle, oval and circle) use the frozen `pad_metadata` where supplied, including
+canonical renamed references; the board-reader fallback runs only when that map is absent.
+Local-to-board pad rotation follows KiCad's y-down negative-angle convention. Without known shapes,
+only inscribed-disk contact is represented, with potential corridor intrusions marked N/A.
 Curved pair-corridor correspondence is currently N/A rather than a chord-based claim; foreign arcs beside
 straight coupled sections use exact circular distance and copper width. All geometry and sums are ordered
 by physical identity so item reordering cannot change a measurement or modal-gap tie.
@@ -666,8 +675,11 @@ Each frozen cap-to-supply-pin obligation also publishes `return_lead_mm` (lower 
 equivalence band). Select the capacitor's unique ground pad and the nearest IC ground pin to
 the obligated supply pin on their common, unambiguous ground net. The same track-or-free-plane-hop
 lower bound then measures the ground-side lead; free travel requires contacts reaching the
-**same grounded refilled island**. Missing/ambiguous pads or unrepresented ground paths are N/A.
-The old `effective_mm` supply metric is unchanged. Neither side is a loop-inductance estimate.
+**same grounded refilled island**. The separate `return_connected` state is qualified by the judged
+ground-net connectivity: known-incomplete ground is a missing return obligation/loss, censored ground
+is N/A, and a complete ground net with an unrepresented path is a coverage N/A. Missing/ambiguous
+ground-pad bindings remain N/A. Aggregation uses this state only for `return_lead_mm`; the old
+`effective_mm` supply metric and its supply connectivity are unchanged. Neither side is a loop-inductance estimate.
 
 ### Guide spacing and bend screens (D-SC-SPACING)
 

@@ -168,9 +168,52 @@ class PathTests(unittest.TestCase):
 
     def test_single_ended_group_clock(self):
         d = board()
-        a = dict(id='D', role='data', p='SD_D0', n=None, endpoints=leg(d, 'SD_D0', 10))
+        a = dict(id='D', role='single', p='SD_D0', n=None, endpoints=leg(d, 'SD_D0', 10))
         b = dict(id='CLK', role='clock', p='SD_CLK', n=None, endpoints=leg(d, 'SD_CLK', 12, 2))
         self.assertEqual(results(d, manifest([a, b]), 'group_skew_mm', 1, group='clock')[0]['value'], 2)
+
+    def test_single_ended_group_spread_producer_roles(self):
+        d = board()
+        lanes = [dict(id=f'D{i}', role='single', p=f'RGB_D{i}', n=None,
+                      endpoints=leg(d, f'RGB_D{i}', length, i*2))
+                 for i, length in enumerate((10, 12, 11))]
+        lanes.append(dict(id='CLK', role='clock', p='RGB_CLK', n=None,
+                          endpoints=leg(d, 'RGB_CLK', 20, 6)))
+        self.assertEqual(results(d, manifest(lanes), 'group_skew_mm', 1, group='spread')[0]['value'], 2)
+
+    def test_inferred_pair_orientation_ignores_endpoint_pad_attributes(self):
+        d = board()
+        lane = pair(d, name='USB')
+        # Inline same-layer vias expose ordered path sections without changing lengths.
+        d['vias'] = [dict(net=net, x=nm(2), y=nm(y), top='F.Cu', bottom='F.Cu', size=200000, drill=100000)
+                     for net, y in ((lane['p'], 0), (lane['n'], .4))]
+        next(p for p in d['pads'] if p['net'] == lane['n'] and p['x'] == nm(10))['h'] = 90000
+        frozen = paths.infer_endpoints(d)
+        self.assertEqual(paths.parity_metrics(d, lane['p'], lane['n'], frozen)['segment_skew_mm'], 0)
+        # A manifest's independently ordered N endpoints must be aligned as well.
+        lane['endpoints'] = lane['endpoints'][:2]+list(reversed(lane['endpoints'][2:]))
+        self.assertEqual(results(d, manifest([lane]), 'segment_skew_mm', 1)[0]['value'], 0)
+        d['pads'].reverse()
+        self.assertEqual(frozen, paths.infer_endpoints(d))
+
+    def test_pair_orientation_uses_same_footprint_before_distance(self):
+        d = board()
+        lane = pair(d, name='USB')
+        # Physical mates share refs, even when geometry alone would reverse them.
+        for p in d['pads']:
+            if p['net'] == lane['n']:
+                p['ref'] = 'J1' if p['x'] == 0 else 'U1'
+        frozen = paths.infer_endpoints(d)
+        self.assertEqual(frozen[lane['n']][0]['x_nm'], nm(10))
+
+    def test_pair_orientation_ambiguous_is_not_assessable(self):
+        d = board()
+        p = [pad('USB_P', -1, 0, 'P1'), pad('USB_P', 1, 0, 'P2')]
+        n = [pad('USB_N', 0, -1, 'N1'), pad('USB_N', 0, 1, 'N2')]
+        d['pads'], d['nets'] = p+n, ['USB_P', 'USB_N']
+        lane = dict(id='D', role='data', p='USB_P', n='USB_N', endpoints=[endpoint(x) for x in p+n])
+        self.assertEqual(paths.infer_endpoints(d), {})
+        self.assertEqual(results(d, manifest([lane]), 'segment_skew_mm', 1)[0]['outcome'], 'na')
 
     def test_integer_via_limit_role_and_mode(self):
         d = board()

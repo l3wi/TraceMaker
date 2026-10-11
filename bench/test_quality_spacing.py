@@ -2,6 +2,11 @@
 import math
 import random
 import unittest
+from unittest.mock import patch
+
+from shapely.geometry import Point
+import intent_quality
+import quality_paths
 
 import quality_spacing as spacing
 
@@ -34,6 +39,41 @@ def ctx(d):
 
 
 class SpacingTests(unittest.TestCase):
+    def test_pad_rotation_matches_kicad_inverse(self):
+        p = dict(ref='U1', num='1', net='S', x=0, y=0, w=2000000, h=100000, angle=45)
+        meta = {'U1.1': dict(shape='rect')}
+        core, radius, known = quality_paths._pad_region(p, meta['U1.1'])
+        shape = spacing._pad_shape(p, meta)
+        self.assertTrue(known)
+        for x, y, inside in ((500000, -500000, True), (500000, 500000, False)):
+            self.assertEqual(core.distance(Point(x/1e6, y/1e6)) <= radius, inside)
+            self.assertEqual(shape.covers(Point(x, y)), inside)
+        rng = random.Random(114)
+        for angle in (-135, -45, 0, 30, 45, 90, 165):
+            p['angle'] = angle
+            core, radius, _ = quality_paths._pad_region(p, meta['U1.1'])
+            shape = spacing._pad_shape(p, meta)
+            for _ in range(200):
+                x, y = rng.randrange(-1100000, 1100000), rng.randrange(-1100000, 1100000)
+                expected = intent_quality.in_pad(p, x, y, margin=-intent_quality.TOL)
+                self.assertEqual(core.distance(Point(x/1e6, y/1e6)) <= radius, expected)
+                self.assertEqual(shape.covers(Point(x, y)), expected)
+
+    def test_pair_spacing_uses_frozen_renamed_pad_metadata(self):
+        d = pairs()
+        d['pads'] = [dict(ref='U1@0,0', num='1', net='BP', x=1000000, y=400000,
+                          w=100000, h=100000, angle=0, layers=['F.Cu'])]
+        context = dict(ctx(d), board_path='router.kicad_pcb', pad_metadata={'U1@0,0.1': dict(shape='rect')})
+        with patch.object(spacing.craft, 'metadata', side_effect=AssertionError('must use frozen metadata')):
+            measured = spacing.pair_spacing(d, manifest(), context)
+            self.assertAlmostEqual(measured['bus:a']['pair_gap_mm'], .1)
+            self.assertEqual(measured, spacing.pair_spacing(d, manifest(), context, indexed=False))
+        with patch.object(spacing.craft, 'metadata', return_value=context['pad_metadata']) as reader:
+            fallback = dict(context)
+            fallback.pop('pad_metadata')
+            self.assertEqual(measured, spacing.pair_spacing(d, manifest(), fallback))
+            reader.assert_called_once_with('router.kicad_pcb')
+
     def test_meander_boundary_and_linear_reference(self):
         for gap, count in [(399000, 1), (400000, 0), (401000, 0)]:
             d = meander(gap)

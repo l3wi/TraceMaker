@@ -103,6 +103,7 @@ def effective_paths(d, manifest, fills, *, _return=True, _graphs=None, _leads=No
             choices = [(p, q) for p in cap_ground for q in ic_ground if p['net'] == q['net']]
             ground_nets = {p['net'] for p, _ in choices}
             results[key]['return_lead_mm'] = None
+            results[key]['return_connected'] = None
             results[key]['return_reason'] = 'ground pads missing or reference ambiguous'
             if len(ground_nets) == 1:
                 # Nearest IC ground pin to the obligated supply pin is frozen placement evidence.
@@ -123,8 +124,10 @@ def effective_paths(d, manifest, fills, *, _return=True, _graphs=None, _leads=No
                         valid_fills = {k: unary_union(v) for k, v in valid_fills.items()}
                     ground_result = effective_paths(gd, {'connections': [ground_connection]}, valid_fills, _return=False,
                                                     _graphs=ground_graphs, _leads=ground_leads)
-                    lead = next(iter(ground_result.values()))['effective_mm']
+                    ground_path = next(iter(ground_result.values()))
+                    lead = ground_path['effective_mm']
                     results[key].update(return_lead_mm=lead, return_net=p['net'],
+                                        return_connected=ground_path['connected'],
                                         return_reason=None if lead is not None else 'ground path unavailable')
     return results
 
@@ -147,6 +150,13 @@ def measure(d, manifest, board, meta, bad, *, censored=False, interfaces=None, p
         if item.get('connected') is False and state is not False:
             # A model-unrepresented path on a KiCad-connected net is unknown, not unroutable.
             item.update(connected=state,coverage_reason='censored connectivity' if state is None else 'path not represented by plane/track model')
+        if 'return_connected' in item and item.get('return_net') is not None:
+            return_state = complete.get(item['return_net'], False)
+            # KiCad's ground-net judgment distinguishes lost return copper from
+            # a connected path that this lower-bound model cannot represent.
+            item['return_connected'] = return_state
+            if return_state is not True:
+                item['return_reason'] = 'ground net incomplete' if return_state is False else 'censored ground connectivity'
     reference_error = None
     try:
         ground,broad,fill_hash=si.fills(board)
@@ -228,7 +238,7 @@ def measure(d, manifest, board, meta, bad, *, censored=False, interfaces=None, p
     coverage = dict(fill_hash=fill_hash,broad_reference_layers=sorted(broad),
                     reference_error=reference_error,manifest_obligations=len(manifest.get('connections',[])),
                     differential_candidates=len(candidates), thermal_candidates=len(thermals))
-    if interfaces is not None:
+    if interfaces is not None or profile is not None:
         coverage['interfaces'] = interface_io.coverage(interfaces, d)
     if profile is not None:
         coverage['rules'] = measure_rules(d, interfaces, profile,
@@ -357,6 +367,8 @@ def board_job(job):
                         unknown=arm['categories'][category].setdefault(key,{})
                         unknown.update(connected=True,coverage_reason='unmatched physical terminal' if physical_unknown else 'fixture design copper not comparable')
                         unknown.update({metric:None for metric in metrics})
+                        if category == 'decoupling':
+                            unknown['return_connected'] = None
             missing_arrays={k:dict(human=v['via_count'],router=arm['categories']['thermal'][k].get('via_count')) for k,v in array.items()
                             if arm['categories']['thermal'][k].get('via_count') is None or arm['categories']['thermal'][k]['via_count']<v['via_count']}
             mfg=arm['manufacturing']; exempt=h['manufacturing']['via_in_pad']>0
@@ -430,7 +442,7 @@ def markdown(result):
                   '|---|---|---|---|---:|---:|']
         for board in result['boards']:
             for run, arm in board['runs'].items():
-                cov = arm['coverage']['interfaces']
+                cov = arm.get('coverage', {}).get('interfaces') or interface_io.coverage(None, {})
                 for iface in cov['interfaces']:
                     missing = sum(l['interface'] == iface['id'] for l in cov['lanes_not_bound'])
                     lines.append(f"| {board['board']} | {Path(run).name} | {iface['id']} | {iface['confidence']} | {iface['lanes']} | {missing} |")

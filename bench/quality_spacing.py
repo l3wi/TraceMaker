@@ -227,7 +227,7 @@ def _pad_shape(p, meta):
     else:
         return None
     from shapely.affinity import translate
-    return translate(rotate(g, p.get('angle', 0), origin=(0, 0)), p['x'], p['y'])
+    return translate(rotate(g, -p.get('angle', 0), origin=(0, 0)), p['x'], p['y'])
 
 
 def _arc_line(arc):
@@ -324,7 +324,7 @@ def pair_spacing(d, interfaces, ctx, *, indexed=True):
     Round copper uses >=128 chords/quadrant with <=100nm sagitta, below the
     1um verdict band. Returns the excluded pad-comparison count, not hidden zeros.
     """
-    meta = ctx.get('metadata')
+    meta = ctx.get('pad_metadata')
     if meta is None:
         meta = craft.metadata(ctx['board_path']) if ctx.get('board_path') else {}
     rows, unknown = _copper(d, ctx.get('fills', {}), meta)
