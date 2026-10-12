@@ -453,7 +453,7 @@ floating-point addition once per hit (not hit-count multiplication), preserving 
 even outside the exact-double integer range. Queries allocate no heap memory.
 `--no-pair-exit-index` disables both index and memo for the linear reference. The mirrored
 three-lane test checks identical copper and charged work; randomized/edge tests compare bitwise costs,
-including odd widths, degenerate/reversed segments, collisions and rebuilds. Work charging,
+including odd widths, degenerate/reversed segments, every memo-key field, collisions and rebuilds. Work charging,
 polling, routing caps and USB integration budgets are unchanged.
 
 **Bounded upfront pair probes (D127).** Coupling cannot spend the work needed to complete other nets.

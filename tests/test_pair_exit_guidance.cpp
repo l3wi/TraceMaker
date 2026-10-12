@@ -85,6 +85,36 @@ TEST_CASE("pair exit guidance retains duplicate hits, odd radii and strict bound
   CHECK(index.cost({-20, 4}, {20, 4}, 0, 1, 3, 0, 1, true, allow) == 0);
 }
 
+TEST_CASE("pair exit guidance memo distinguishes every cost parameter", "[diffpair][guidance]") {
+  const std::vector<PairExitGuide> guides{
+      {{-10, 0}, {10, 0}, model::layer_bit(0), 3, 5},
+      {{-10, 7}, {10, 7}, model::layer_bit(1), 4, 3},
+      {{-10, 7}, {10, 7}, model::layer_bit(1), 4, 3},
+      {{0, -10}, {0, 10}, model::layer_bit(0) | model::layer_bit(1), 2, 1}};
+  route::PairExitGuidance index;
+  index.rebuild(guides);
+  // Reuse endpoints while changing one or more scalar fields. Random unique
+  // segments alone cannot detect an omitted scalar field in the memo key.
+  for (const Point p : {Point{-20, 0}, Point{-20, 4}}) {
+    for (const Point q : {Point{20, 0}, Point{20, 4}}) {
+      for (const int layer : {0, 1, 2}) {
+        for (const model::NetId net : {1, 2, 3, 4}) {
+          const auto allow = [net](model::NetId other) { return other != (net ^ 1); };
+          for (const Coord width : {1, 3, 9}) {
+            for (const Coord clearance : {0, 2, 7}) {
+              for (const Coord pitch : {1, 150'001}) {
+                const double expected = original_cost(guides, p, q, layer, net, width, clearance, pitch, allow);
+                identical(index.cost(p, q, layer, net, width, clearance, pitch, true, allow), expected);
+                identical(index.cost(p, q, layer, net, width, clearance, pitch, true, allow), expected);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 TEST_CASE("pair exit guidance memo collisions evict safely and rebuild invalidates eligibility", "[diffpair][guidance]") {
   std::vector<PairExitGuide> guides{{{-10, 0}, {10, 0}, model::layer_bit(0), 3, 5}};
   route::PairExitGuidance index;
