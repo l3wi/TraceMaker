@@ -19,14 +19,10 @@ import pathlib
 import shutil
 import subprocess
 import sys
-from collections import Counter
+from drc_judge import instance_counts, violations
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PCBENCH = ROOT / "bench/data/freerouting/scripts/benchmark/fixtures/PCBench"
-# Not caused by copper: KiCad reports these differently from run to run of the same board, or they concern
-# libraries and silkscreen only.
-IGNORED = {"lib_footprint_issues", "lib_footprint_mismatch", "footprint_symbol_mismatch", "missing_footprint", "extra_footprint",
-           "duplicate_footprints", "footprint_filters_mismatch", "footprint_type_mismatch"}
 
 
 def run(cmd: list[str], timeout: int) -> subprocess.CompletedProcess:
@@ -40,8 +36,8 @@ def judge(board: pathlib.Path, refill: bool) -> dict | None:
     if not out.exists():
         return None
     d = json.loads(out.read_text())
-    types = Counter(f"{v['type']} ({v.get('severity', '?')})" for v in d.get("violations", []) if v["type"] not in IGNORED)
-    return {"violations": dict(types), "unconnected": len(d.get("unconnected_items", [])),
+    types = instance_counts(violations(d, severity=None), severity_labels=True)
+    return {"violations": types, "report": d, "unconnected": len(d.get("unconnected_items", [])),
             "via_dangling": sum(1 for v in d.get("violations", []) if v["type"] == "via_dangling")}
 
 
@@ -66,8 +62,9 @@ def one(name: str, a: argparse.Namespace, outdir: pathlib.Path) -> dict:
             res["error"] = f"kicad-cli failed on the {tag} board"
             return res
     off, on = res["off"]["judge"], res["on"]["judge"]
-    res["added"] = {t: n - off["violations"].get(t, 0) for t, n in on["violations"].items() if n > off["violations"].get(t, 0)}
-    res["removed"] = {t: n - on["violations"].get(t, 0) for t, n in off["violations"].items() if n > on["violations"].get(t, 0)}
+    off_instances, on_instances = violations(off["report"], severity=None), violations(on["report"], severity=None)
+    res["added"] = instance_counts(on_instances-off_instances, severity_labels=True)
+    res["removed"] = instance_counts(off_instances-on_instances, severity_labels=True)
     res["pass"] = not res["added"] and on["unconnected"] <= off["unconnected"] and res["on"]["routed"] == res["off"]["routed"]
     return res
 

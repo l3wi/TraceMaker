@@ -108,39 +108,6 @@ def inspect(board, run, name):
     return iq.inspect(board, cache)
 
 
-def violations(report):
-    """Canonical violation-instance multiset; no cancellation across locations/items."""
-    from collections import Counter
-    import re
-    def signature(v):
-        items = []
-        for item in v.get('items', []):
-            # Native legacy conversion regenerates UUIDs and PCBench renames
-            # references. Physical item kind/net/layer/location is the identity.
-            description=re.sub(r'\s+of\s+\S+', '', item.get('description',''))
-            position=item.get('pos',{})
-            identity=item.get('uuid','') if not position else ''
-            items.append((identity,description,json.dumps(position,sort_keys=True)))
-        return (v.get('type'), v.get('severity'), tuple(sorted(items)), v.get('description','') if not items else '')
-    return Counter(signature(v) for v in report.get('violations',[]) if v.get('severity') == 'error')
+from drc_judge import bracket_nets, judge, violations
 
 
-def judge(before, after):
-    from collections import Counter
-    ub, ua = len(before.get('unconnected_items',[])), len(after.get('unconnected_items',[]))
-    added = violations(after)-violations(before)
-    counts = Counter()
-    for signature,n in added.items():
-        counts[signature[0]] += n
-    censored = ub >= 499 or ua >= 499
-    return dict(judge='KiCad', common_denominator=ub, unconnected=ua, censored=censored,
-                completion=None if censored or ub==0 else max(0,1-ua/ub), already_connected=ub==0,
-                electrical_pass=ua==0, added_errors=dict(sorted(counts.items())), drc_pass=not added,
-                denominator_method='uncapped KiCad unconnected-list ratio; unknown at 499 saturation',
-                engine_denominator_used=False,
-                unconnected_nets=sorted({net for v in after.get('unconnected_items',[]) for item in v.get('items',[]) for net in bracket_nets(item.get('description',''))}))
-
-
-def bracket_nets(text):
-    import re
-    return re.findall(r'\[([^\]]+)\]',text)

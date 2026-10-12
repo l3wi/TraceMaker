@@ -12,9 +12,10 @@ its own fetcher, bench/prepare_modern.py.
 """
 import argparse
 import pathlib
+import subprocess
 import sys
 
-from prepare_inputs import prepare_board, set_boards
+from prepare_inputs import invalidate_fixture, prepare_board, set_boards
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SEARCH = [ROOT / "bench/data/kicad/demos", ROOT / "tests/boards"]
@@ -25,12 +26,13 @@ def find(name: str) -> pathlib.Path:
         hits = sorted(base.glob(f"*/{name}.kicad_pcb"))
         if hits:
             return hits[0]
-    raise SystemExit(f"board not found: {name} (looked in {', '.join(str(s) for s in SEARCH)})")
+    raise FileNotFoundError(f"board not found: {name} (looked in {', '.join(str(s) for s in SEARCH)})")
 
 
 def prepare(name: str, out: pathlib.Path) -> pathlib.Path:
-    src = find(name)
     dst = out / name / "unrouted.kicad_pcb"
+    invalidate_fixture(dst.parent, 'preparation in progress')
+    src = find(name)
     prepare_board(src, dst)
     return dst
 
@@ -47,10 +49,16 @@ def main() -> int:
     if not names:
         ap.error("give --set or board names")
     out = pathlib.Path(a.out).resolve()
+    failed = False
     for n in names:
-        prepare(n, out)
+        try:
+            prepare(n, out)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            invalidate_fixture(out / n, error)
+            print(f"FAILED {n}: {error}", file=sys.stderr)
+            failed = True
     print(out)
-    return 0
+    return int(failed)
 
 
 if __name__ == "__main__":

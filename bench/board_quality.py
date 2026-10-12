@@ -170,11 +170,10 @@ def metrics(unrouted: pathlib.Path, routed: pathlib.Path) -> dict:
     before, after = bench_run.drc(unrouted), bench_run.drc(routed)
     res = {"board": str(routed)}
     if before and after:
-        added = {t: n - before["routed_errors"].get(t, 0) for t, n in after["routed_errors"].items()
-                 if t not in bench_run.NOT_ROUTING and n - before["routed_errors"].get(t, 0) > 0}
-        res.update({"unconnected": after["unconnected"], "router_errors": added,
-                    "completion": 1.0 if before["unconnected"] == 0 else round(1 - after["unconnected"] / before["unconnected"], 4),
-                    "clean": after["unconnected"] == 0 and not added})
+        additions = bench_run.added_errors(before, after)
+        res.update({"unconnected": after["unconnected"], "router_errors": additions["added_errors"],
+                    **additions, **bench_run.completion(before["unconnected"], after["unconnected"]),
+                    "clean": after["unconnected"] == 0 and not additions["added_errors"]})
     bj = board_json(routed)
     res.update(geometry(bj))
     res.update(coupling(bj))

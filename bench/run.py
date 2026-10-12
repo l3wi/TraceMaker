@@ -23,6 +23,7 @@ import argparse
 import concurrent.futures as cf
 import datetime
 import hashlib
+import functools
 import json
 import os
 import pathlib
@@ -38,6 +39,8 @@ from collections import Counter
 
 from plane_metrics import copper_totals, plane_nets, unconnected_split
 from prepare_inputs import copy_rules, refill_board, set_boards
+from drc_judge import (JUDGE_CODE_VERSION, JUDGE_FLAGS, METRIC_SCHEMA_VERSION,
+                       added_errors as instance_added_errors, completion, instance_counts, violations)
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 FIX = ROOT / "bench/data/freerouting/scripts/benchmark/fixtures/PCBench"
@@ -52,13 +55,78 @@ REFILL = False   # --refill: KiCad refills zones before judging
 HUMAN = False    # --human: judge the prepared routed original without running the router
 INTENTS = None   # --intents DIR: route each board with DIR/<board>.intent.json (drafted from its input when missing)
 DRC_CACHE = ROOT / "build/drc/kicad"
-# Violation types that routing cannot cause; ignored when counting added errors.
-NOT_ROUTING = {"lib_footprint_issues", "lib_footprint_mismatch", "silk_overlap", "silk_over_copper", "silk_edge_clearance",
-               "text_height", "text_thickness", "courtyards_overlap", "missing_courtyard", "malformed_courtyard",
-               "footprint_type_mismatch", "footprint_filters_mismatch", "nonmirrored_text_on_back_layer",
-               "npth_inside_courtyard", "pth_inside_courtyard", "duplicate_footprints", "extra_footprint",
-               "missing_footprint", "footprint_symbol_mismatch", "unconnected_items", "track_dangling", "via_dangling",
-               "isolated_copper", "starved_thermal", "lib_footprint_mismatch", "holes_co_located"}
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@functools.cache
+def kicad_version():
+    result = subprocess.run(["kicad-cli", "--version"], capture_output=True, text=True, timeout=30, check=True)
+    return result.stdout.strip()
+
+
+def atomic_json(path, data):
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.part")
+    temporary.write_text(json.dumps(data, indent=1) + "\n")
+    os.replace(temporary, path)
+
+
+def added_errors(before, after):
+    return instance_added_errors(before["report"], after["report"])
+
+
+def fixture_provenance(name, *, legacy=False):
+    fixture = SRC_FIX / name
+    manifest = fixture / "preparation.json"
+    data = json.loads(manifest.read_text())
+    if data.get("state") == "valid" and data.get("files"):
+        required = {"unrouted.kicad_pcb"}
+        if HUMAN:
+            required.add("routed.kicad_pcb")
+        required.update(path.name for stem in ("unrouted", "routed") for ext in (".kicad_pro", ".kicad_dru")
+                        if (path := fixture / (stem + ext)).exists())
+        if not required <= data["files"].keys():
+            raise ValueError(f"{name}: preparation manifest omits board/rule hashes")
+        for filename, expected in data["files"].items():
+            path = fixture / filename
+            if pathlib.Path(filename).is_absolute() or ".." in pathlib.Path(filename).parts:
+                raise ValueError(f"{name}: invalid preparation filename {filename}")
+            if not path.is_file() or digest(path) != expected:
+                raise ValueError(f"{name}: preparation hash mismatch: {filename}")
+    elif legacy and data.get("refilled") and data.get("input_sha256") == digest(fixture / "unrouted.kicad_pcb"):
+        # Explicit historical human rejudgment only: prove the preserved human is
+        # the source that the successful legacy preparation actually recorded.
+        if digest(fixture / "routed.kicad_pcb") != data.get("source_sha256"):
+            raise ValueError(f"{name}: legacy human source hash mismatch")
+    else:
+        raise ValueError(f"{name}: preparation is not validated; prepare the set first")
+    board = fixture / "unrouted.kicad_pcb"
+    return dict(board_sha256=digest(board), manifest_sha256=digest(manifest),
+                rules={ext: digest(board.with_suffix(ext)) for ext in (".kicad_pro", ".kicad_dru")
+                       if board.with_suffix(ext).exists()})
+
+
+def headline(rows, scheduled):
+    judged = [r for r in rows if r.get("judge") == "ok"]
+    known = [r["completion"] for r in judged if r.get("completion") is not None]
+    return dict(boards=scheduled, scheduled=scheduled, attempted=len(rows), judged=len(judged),
+                clean_pass=round(sum(bool(r.get("clean")) for r in rows) / scheduled, 4) if scheduled else None,
+                completion=round(sum(known) / len(known), 4) if known else None,
+                completion_boards=len(known), censored_boards=sum(bool(r.get("censored")) for r in rows),
+                judge_failures=scheduled-len(judged),
+                infrastructure_failures=sum(r.get("judge") != "ok" or r.get("exit") not in (0, 3)
+                                            or r.get("place_judge") == "failed" for r in rows),
+                seconds=round(sum(r.get("seconds", r.get("wall_s", 0)) for r in rows), 1),
+                cpu_seconds=round(sum(r.get("cpu_s", 0) for r in rows), 1))
+
+
+def attempt_board(name, outdir, time_limit):
+    try:
+        return run_board(name, outdir, time_limit)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        return dict(board=name, judge="failed", error=str(error), exit=-1)
 
 
 def fr_baseline() -> dict[str, dict]:
@@ -84,10 +152,13 @@ def fr_baseline() -> dict[str, dict]:
 def drc(path: pathlib.Path, timeout: int = 600, planes: dict | None = None,
         saved: pathlib.Path | None = None) -> dict | None:
     DRC_CACHE.mkdir(parents=True, exist_ok=True)
-    st = path.stat()
-    rules = ''.join(hashlib.sha256(path.with_suffix(ext).read_bytes()).hexdigest()
-                    for ext in (".kicad_pro", ".kicad_dru") if path.with_suffix(ext).exists())
-    key = hashlib.sha1(f"saved-refill-v1:{path.resolve()}:{st.st_mtime_ns}:{st.st_size}:{REFILL}:{rules}".encode()).hexdigest()[:16]
+    rules = {ext: digest(path.with_suffix(ext)) for ext in (".kicad_pro", ".kicad_dru")
+             if path.with_suffix(ext).exists()}
+    identity = dict(board_sha256=digest(path), rules=rules, kicad_version=kicad_version(),
+                    judge_flags=JUDGE_FLAGS, refill=REFILL, judge_code_version=JUDGE_CODE_VERSION,
+                    repair_code_sha256=digest(ROOT / "bench/prepare_inputs.py"),
+                    judge_code_sha256=digest(ROOT / "bench/drc_judge.py"))
+    key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     out = DRC_CACHE / f"{key}.json"
     filled = DRC_CACHE / f"{key}.refilled.kicad_pcb"
     if not out.exists() or (REFILL and not filled.exists()):
@@ -95,8 +166,9 @@ def drc(path: pathlib.Path, timeout: int = 600, planes: dict | None = None,
         # or raw output: KiCad saves only its private analysis copy.
         part = DRC_CACHE / f"{key}.{os.getpid()}.{threading.get_ident()}.part.json"
         try:
+            repair_metadata = {}
             if REFILL:
-                refill_board(path, filled, part, timeout)
+                repair_metadata = refill_board(path, filled, part, timeout) or {}
             else:
                 result = subprocess.run(["kicad-cli", "pcb", "drc", "--format", "json", "--severity-all",
                                          "--all-track-errors", "-o", str(part), str(path)],
@@ -107,6 +179,7 @@ def drc(path: pathlib.Path, timeout: int = 600, planes: dict | None = None,
                 return None
             json.loads(part.read_text())
             os.replace(part, out)
+            atomic_json(DRC_CACHE / f"{key}.provenance.json", dict(identity, **repair_metadata))
         except (subprocess.TimeoutExpired, RuntimeError, OSError, ValueError):
             return None
         finally:
@@ -131,7 +204,10 @@ def drc(path: pathlib.Path, timeout: int = 600, planes: dict | None = None,
         refs = [re.search(r" of ([^ ]+)(?: on [^ ]+)?$", i.get("description", "")) for i in v.get("items", [])]
         return bool(refs) and all(refs) and len({m.group(1) for m in refs}) == 1
     x = Counter(v["type"] for v in d.get("violations", []) if v.get("severity") == "error" and not own_footprint(v))
-    result = {"errors": dict(c), "routed_errors": dict(r), "cross_errors": dict(x), "unconnected": len(d.get("unconnected_items", []))}
+    result = {"errors": dict(c), "routed_errors": dict(r), "cross_errors": dict(x),
+              "unconnected": len(d.get("unconnected_items", [])), "report": d, "cache_key": key,
+              "drc_report": str(out), "provenance": identity,
+              "cross_report": {"violations": [v for v in d.get("violations", []) if not own_footprint(v)]}}
     if planes is not None:
         result.update(unconnected_split(d.get("unconnected_items", []), planes))
     return result
@@ -173,17 +249,20 @@ def place_board(name: str, src: pathlib.Path, outdir: pathlib.Path, res: dict) -
         res["hpwl_after"] = j.get("after", {}).get("hpwl_mm")
     except (OSError, ValueError):
         res["place"] = "ok (no report)"
+    copy_rules(src, placed)
     # Errors the placement itself introduced (any items), against the human board.
     ref = FIX / name / "unrouted.kicad_pcb"
     human, moved = drc(ref if ref.exists() else src), drc(placed)
     if human and moved:
         res["place_added"] = place_added(human, moved)
+    else:
+        res["place_judge"] = "failed"
     return placed
 
 
 def place_added(human: dict, moved: dict) -> dict:
-    hc, mc = human.get("cross_errors", human["errors"]), moved.get("cross_errors", moved["errors"])
-    return {t: n - hc.get(t, 0) for t, n in mc.items() if t in PLACEMENT_ERRORS and n - hc.get(t, 0) > 0}
+    added = violations(moved["cross_report"]) - violations(human["cross_report"])
+    return {t: n for t, n in instance_counts(added).items() if t in PLACEMENT_ERRORS}
 
 
 def dead_pins(board: pathlib.Path, out_json: pathlib.Path) -> int | None:
@@ -251,7 +330,8 @@ def run_board(name: str, outdir: pathlib.Path, time_limit: float) -> dict:
     out.parent.mkdir(parents=True, exist_ok=True)
     # Route and judge use the fixture's original net classes/custom rules.
     copy_rules(src0, out)
-    res = {"board": name}
+    res = {"board": name, "metric_schema_version": METRIC_SCHEMA_VERSION,
+           "input_sha256": digest(src0)}
     preparation = src0.with_name("preparation.json")
     if preparation.exists():
         res["preparation"] = json.loads(preparation.read_text())
@@ -284,10 +364,14 @@ def run_board(name: str, outdir: pathlib.Path, time_limit: float) -> dict:
                     subprocess.run([str(TM), "rules", str(src), "--intent-draft", str(man)], check=True, capture_output=True)
                 intent = ["--intent", str(man)]
                 res["intent"] = str(man)
-            code, stdout, stderr, cpu = run_measured(
-                [str(TM), "route", str(src), "-o", str(out), "--time", str(time_limit), "--threads", str(THREADS),
-                 "--json", str(out) + ".route.json"] + budget + intent + EXTRA,
-                time_limit * 3 + 60)
+            cmd = [str(TM), "route", str(src), "-o", str(out), "--time", str(time_limit), "--threads", str(THREADS),
+                   "--json", str(out) + ".route.json"] + budget + intent + EXTRA
+            res["effective_args"] = cmd
+            res["argument_file_sha256"] = {arg: digest(pathlib.Path(arg)) for arg in cmd[2:]
+                                           if pathlib.Path(arg).is_file()}
+            if intent:
+                res["intent_sha256"] = digest(man)
+            code, stdout, stderr, cpu = run_measured(cmd, time_limit * 3 + 60)
             res["exit"] = code
             res["cpu_s"] = round(cpu, 2)
             if code not in (0, 3):
@@ -317,11 +401,11 @@ def run_board(name: str, outdir: pathlib.Path, time_limit: float) -> dict:
     if before is None or after is None:
         res["judge"] = "failed"
         return res
-    added = {t: n - before["routed_errors"].get(t, 0) for t, n in after["routed_errors"].items()
-             if t not in NOT_ROUTING and n - before["routed_errors"].get(t, 0) > 0}
-    # All added error types too (diagnostics only).
-    res["added_any"] = {t: n - before["errors"].get(t, 0) for t, n in after["errors"].items()
-                        if t not in NOT_ROUTING and n - before["errors"].get(t, 0) > 0}
+    additions = added_errors(before, after)
+    res.update(additions)
+    added = additions["added_errors"]
+    res["judge"] = "ok"
+    res["judge_cache_keys"] = {"before": before.get("cache_key"), "after": after.get("cache_key")}
     res.update({"unconnected_before": before["unconnected"], "unconnected_after": after["unconnected"], "added_errors": added})
     if planes is not None:
         res.update({f"{group}_unconnected_{stage}": judge[f"{group}_unconnected"]
@@ -331,12 +415,16 @@ def run_board(name: str, outdir: pathlib.Path, time_limit: float) -> dict:
                     for group in ("plane", "signal")})
         res.update({f"{group}_track_mm_added": round(final[f"{group}_track_mm"] - initial[f"{group}_track_mm"], 4)
                     for group in ("plane", "signal")})
-    res["completion"] = 1.0 if before["unconnected"] == 0 else round(1 - after["unconnected"] / before["unconnected"], 4)
-    res["clean"] = after["unconnected"] == 0 and not added and not res.get("place_added")
+    res.update(completion(before["unconnected"], after["unconnected"]))
+    if res["completion"] is not None:
+        res["completion"] = round(res["completion"], 4)
+    res["clean"] = (res["exit"] in (0, 3) and after["unconnected"] == 0
+                    and not added and not res.get("place_added") and res.get("place_judge") != "failed")
     return res
 
 
 def main() -> int:
+    global TM, PLACE, PLACE_MODE, PLACE_TIMEOUT, PLACE_WORK, PLACE_CRULES
     ap = argparse.ArgumentParser()
     ap.add_argument("--tier", default="A", help="Freerouting tier: A, B, C, D or all")
     ap.add_argument("--limit", type=int, default=50)
@@ -363,7 +451,12 @@ def main() -> int:
     ap.add_argument("--full", action="store_true", help="also route the set's `#slow` boards (the largest; run before committing, doc 10 §4)")
     ap.add_argument("--set-name", help="name of the board set for the summary (default: the tier)")
     ap.add_argument("--intents", help="route with DIR/<board>.intent.json routing intent manifests (doc 05 §45); missing ones are drafted from the input")
+    ap.add_argument("--rejudge-human", action="store_true",
+                    help="explicitly replace an existing human run's judgments, preserving its exact roster")
     a = ap.parse_args()
+    explicit_boards = a.boards is not None
+    if a.rejudge_human and (not a.human or not a.name or explicit_boards):
+        ap.error("--rejudge-human requires --human --name and the existing full set roster")
     global THREADS, PLACE_THREADS, SRC_FIX, PLACE_ARGS, WORK, REFILL, EXTRA, INTENTS, HUMAN
     PLACE_ARGS = (a.place_args or "").split()
     # With --work every board runs the whole portfolio whatever the thread count (D47); one thread runs its eight
@@ -403,19 +496,47 @@ def main() -> int:
         names = sorted(n for n, v in base.items() if (a.tier == "all" or v.get("tier") == a.tier) and (FIX / n / "unrouted.kicad_pcb").exists())
         random.Random(a.seed).shuffle(names)
         names = sorted(names[: a.limit])
+    if not names or len(names) != len(set(names)):
+        ap.error("run roster must be non-empty and contain no duplicate boards")
     missing = [n for n in names if not (SRC_FIX / n / "unrouted.kicad_pcb").is_file()
                or (HUMAN and not (SRC_FIX / n / "routed.kicad_pcb").is_file())]
     if missing:
         ap.error(f"missing prepared fixtures in {SRC_FIX}: {', '.join(missing)}; prepare the set first (see doc 10); check exclusions.json")
     run_id = a.name or datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + f"-tier{a.tier}"
     outdir = ROOT / "bench/results" / run_id
+    if outdir.exists() and any(outdir.iterdir()):
+        if not a.rejudge_human:
+            ap.error(f"run directory is not empty: {outdir}; use a new run name")
+        prior = json.loads((outdir / "summary.json").read_text())
+        prior_roster = [json.loads(line)["board"] for line in (outdir / "boards.jsonl").read_text().splitlines() if line.strip()]
+        if not prior.get("human") or sorted(prior_roster) != sorted(names) or prior.get("refill") != a.refill:
+            ap.error("human rejudgment must preserve the existing human roster and refill policy")
+    elif a.rejudge_human:
+        ap.error("--rejudge-human requires an existing human run")
+    try:
+        inputs = {name: fixture_provenance(name, legacy=a.rejudge_human) for name in names}
+        version = kicad_version()
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        ap.error(str(error))
     outdir.mkdir(parents=True, exist_ok=True)
+    selection_mode = "boards" if explicit_boards else ("full" if a.full else "everyday") if a.board_list else "sample"
+    provenance = dict(metric_schema_version=METRIC_SCHEMA_VERSION, kicad_version=version,
+                      judge_flags=JUDGE_FLAGS + (["--refill-zones", "--save-board"] if REFILL else []),
+                      judge_code_version=JUDGE_CODE_VERSION, inputs=inputs,
+                      binary_sha256=None if HUMAN else digest(TM), effective_args=vars(a),
+                      set_roster=set_boards(a.board_list, full=True) if a.board_list else names,
+                      selection_mode=selection_mode)
+    manifest = dict(run=run_id, state="running", roster=names, full=a.full,
+                    selection_mode=selection_mode, scheduled=len(names), provenance=provenance,
+                    rejudge_human=a.rejudge_human)
+    atomic_json(outdir / "manifest.json", manifest)
     # Snapshot the engine binary so rebuilding during a run cannot mix versions.
-    global TM, PLACE, PLACE_MODE, PLACE_TIMEOUT, PLACE_WORK, PLACE_CRULES
     if not HUMAN:
         snap = outdir / "tracemaker"
         shutil.copy2(TM, snap)
         TM = snap
+        provenance["binary_sha256"] = digest(TM)
+        atomic_json(outdir / "manifest.json", manifest)
     PLACE_MODE, PLACE_TIMEOUT, PLACE_WORK, PLACE_CRULES = a.place, a.place_timeout, a.place_work, a.place_crules
     if PLACE_MODE:
         psnap = outdir / "tracemaker-place"
@@ -426,7 +547,7 @@ def main() -> int:
     print(f"run {run_id}: {len(names)} boards, {a.set_name or 'tier ' + a.tier}, {budget} per board, {a.jobs} jobs", flush=True)
     rows = []
     with cf.ThreadPoolExecutor(a.jobs) as ex, (outdir / "boards.jsonl").open("w") as f:
-        for r in ex.map(lambda n: run_board(n, outdir, a.time), names):
+        for r in ex.map(lambda n: attempt_board(n, outdir, a.time), names):
             fr = base.get(r["board"], {})
             r["fr_rc12"] = fr.get("2.5.0-RC12")
             r["fr_241"] = fr.get("2.4.1")
@@ -434,13 +555,12 @@ def main() -> int:
             rows.append(r)
             f.write(json.dumps(r) + "\n")
             f.flush()
-            tag = "CLEAN" if r.get("clean") else ("ERR  " if r.get("error") or r.get("judge") else "     ")
+            tag = "CLEAN" if r.get("clean") else ("ERR  " if r.get("error") or r.get("judge") == "failed" else "     ")
             frc = r["fr_rc12"]["clean"] if r.get("fr_rc12") else None
             print(f"{tag} {r['board'][:44]:44} routed {r.get('routed', '?')}/{r.get('connections', '?')} unconn {r.get('unconnected_after', '?')} "
                   f"added {r.get('added_errors', {})} {r.get('seconds', 0):.1f}s  FR-RC12 clean={frc}", flush=True)
-    judged = [r for r in rows if "clean" in r]
-    n = len(judged)
-    clean = sum(r["clean"] for r in judged)
+    judged = [r for r in rows if r.get("judge") == "ok"]
+    n = len(names)
     fr_rows = [r for r in judged if r.get("fr_rc12")]
     fr_clean = sum(r["fr_rc12"]["clean"] for r in fr_rows)
     fr241 = [r for r in judged if r.get("fr_241")]
@@ -457,10 +577,7 @@ def main() -> int:
         "human": HUMAN,
         "fixtures": str(SRC_FIX),
         "place_crules": a.place_crules,
-        "clean_pass": round(clean / n, 4) if n else None,
-        "completion": round(sum(r["completion"] for r in judged) / n, 4) if n else None,
-        "seconds": round(sum(r.get("seconds", 0) for r in judged), 1),
-        "cpu_seconds": round(sum(r.get("cpu_s", 0) for r in judged), 1),
+        **headline(rows, n),
         "time_limit_s": a.time, "threads": a.threads, "work": a.work, "refill": a.refill, "full": a.full, "route_args": " ".join(EXTRA),
         "intents": str(INTENTS) if INTENTS else None,
         "fr_rc12_clean_pass": round(fr_clean / len(fr_rows), 4) if fr_rows else None,
@@ -468,7 +585,7 @@ def main() -> int:
         "both_clean": both, "only_tracemaker_clean": only_tm, "only_freerouting_clean": only_fr,
         "boards_with_added_errors": sum(1 for r in judged if r["added_errors"]),
         "added_error_types": dict(added_types),
-        "judge_failures": len(rows) - n,
+        "state": "final", "roster": names, "selection_mode": selection_mode, "provenance": provenance,
     }
     feasible = [r for r in judged if r.get("dead_pins") == 0]
     summary["feasible_boards"] = len(feasible)
@@ -484,21 +601,25 @@ def main() -> int:
     summary["style"] = style_total([r["style"] for r in with_style])
     summary["style_ref"] = style_total([r["style_ref"] for r in with_ref])
     summary["style_same_boards"] = style_total([r["style"] for r in with_ref])
-    (outdir / "summary.json").write_text(json.dumps(summary, indent=1))
+    atomic_json(outdir / "summary.json", summary)
     label = "Human" if HUMAN else "TraceMaker"
     notes = (["human originals (no routing)"] if HUMAN else [f"{budget} per board"]) + (["zones refilled and saved before judging"] if a.refill else []) + ([f"route options `{' '.join(EXTRA)}`"] if EXTRA and not HUMAN else [])
     lines = [f"# Benchmark {run_id}", "", f"{a.set_name or 'PCBench tier ' + a.tier}, {n} boards, {', '.join(notes)}.", "",
              f"| Metric | {label} | Freerouting 2.5.0-RC12 | Freerouting 2.4.1 |", "|---|--:|--:|--:|",
              f"| Clean pass (KiCad DRC) | {format(summary['clean_pass'], '.1%') if n else 'unknown'} | {summary['fr_rc12_clean_pass'] or 0:.1%} | {summary['fr_241_clean_pass'] or 0:.1%} |",
-             f"| Mean completion | {format(summary['completion'], '.1%') if n else 'unknown'} | | |",
+             f"| Mean completion (known boards only) | {format(summary['completion'], '.1%') if summary['completion'] is not None else 'unknown'} | | |",
              f"| Route CPU time, all boards | {summary['cpu_seconds']:,.0f} s | | |", "",
              f"Both clean: {both}; only {label}: {only_tm}; only Freerouting: {only_fr}.",
              f"Boards with added DRC errors: {summary['boards_with_added_errors']} ({dict(added_types)})."]
+    lines += [f"Scheduled / attempted / judged: {n} / {summary['attempted']} / {summary['judged']}; "
+              f"judge failures: {summary['judge_failures']}; censored boards: {summary['censored_boards']}.",
+              f"New non-routing error instances (diagnostic): "
+              f"{dict(sum((Counter(r.get('added_nonrouting', {})) for r in rows), Counter()))}."]
     lines += ["", "| Board | Routed / connections | KiCad completion | Plane unconnected | Signal unconnected | Vias | Plane / signal vias added | Plane / signal track mm added |",
               "|---|---:|---:|---:|---:|---:|---:|---:|"]
     for row in rows:
-        completion = f"{row['completion']:.1%}" if "completion" in row else "judge failed"
-        lines.append(f"| {row['board']} | {row.get('routed', '?')} / {row.get('connections', '?')} | {completion} | "
+        completion_label = f"{row['completion']:.1%}" if row.get("completion") is not None else ("censored" if row.get("censored") else "judge failed")
+        lines.append(f"| {row['board']} | {row.get('routed', '?')} / {row.get('connections', '?')} | {completion_label} | "
                      f"{row.get('plane_unconnected_after', '?')} | {row.get('signal_unconnected_after', '?')} | {row.get('vias', '?')} | "
                      f"{row.get('plane_vias_added', '?')} / {row.get('signal_vias_added', '?')} | "
                      f"{row.get('plane_track_mm_added', '?')} / {row.get('signal_track_mm_added', '?')} |")
@@ -515,7 +636,9 @@ def main() -> int:
             lines += [style_row(f"{label}, boards with a reference", summary["style_same_boards"]), style_row("Reference routing", summary["style_ref"])]
     (outdir / "report.md").write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
-    return 0
+    atomic_json(outdir / "manifest.json", dict(manifest, state="final", attempted=len(rows),
+                                               judged=summary["judged"], judge_failures=summary["judge_failures"]))
+    return 1 if summary["infrastructure_failures"] else 0
 
 
 if __name__ == "__main__":

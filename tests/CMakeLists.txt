@@ -101,3 +101,14 @@ set_tests_properties(after_route_passes PROPERTIES LABELS "route;integration" TI
 # copper, every connection routed or reported; byte-identical conversion; KiCad's ratsnest when kicad-cli is there.
 add_test(NAME srj_roundtrip COMMAND python3 ${PROJECT_SOURCE_DIR}/tests/integration/srj_roundtrip.py $<TARGET_FILE:tracemaker> ${CMAKE_BINARY_DIR}/integration/srj_roundtrip)
 set_tests_properties(srj_roundtrip PROPERTIES LABELS "route;integration" TIMEOUT 600)
+
+# Harness unit tests need no engine, fixtures, network or KiCad. Geometry tests skip without Shapely.
+if(EXISTS "${PROJECT_SOURCE_DIR}/.venv/bin/python")
+  set(TMK_HARNESS_PYTHON "${PROJECT_SOURCE_DIR}/.venv/bin/python")
+else()
+  find_program(TMK_HARNESS_PYTHON NAMES python3 REQUIRED)
+endif()
+add_test(NAME bench_unittests COMMAND ${TMK_HARNESS_PYTHON} ${PROJECT_SOURCE_DIR}/tests/run_bench_unittests.py)
+set_tests_properties(bench_unittests PROPERTIES SKIP_RETURN_CODE 77 LABELS "python;bench" TIMEOUT 120)
+add_test(NAME harness_support_unittests COMMAND ${TMK_HARNESS_PYTHON} -m unittest discover -s ${PROJECT_SOURCE_DIR}/tests -p test_harness_support.py)
+set_tests_properties(harness_support_unittests PROPERTIES LABELS "python;bench" TIMEOUT 120)

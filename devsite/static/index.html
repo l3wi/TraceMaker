@@ -382,19 +382,27 @@ function renderBench(s) {
     return;
   }
   const pct = (v) => (v == null ? "–" : (v * 100).toFixed(1) + "%");
+  const count = (v) => v == null ? "–" : String(v);
+  const failed = s.benchmarks.filter((b) => b.judge_failures > 0);
   replace("bench",
-    el("div", { class: "sub", style: "margin-bottom:8px", text: "PCBench fixtures judged by kicad-cli DRC (clean = fully routed and zero added errors). Freerouting columns: its own published results on the same boards." }),
-    el("table", {},
-      el("thead", {}, el("tr", {}, ["Run", "Set", "Boards", "TraceMaker", "FR 2.5.0-RC12", "FR 2.4.1", "Completion", "Added errors"].map((h, i) => el("th", { class: i > 1 ? "r" : "", text: h })))),
+    el("div", { class: "sub", style: "margin-bottom:8px", text: "Fixtures judged by kicad-cli DRC (clean = fully routed and zero added errors). New-run clean pass uses every scheduled board; completion may be unknown. Freerouting columns: published results on matched boards." }),
+    ...failed.map((b) => el("div", { class: "s-fail", role: "alert", style: "font-weight:600;margin-bottom:8px",
+      text: `${b.run}: ${b.judge_failures} judge failure(s) — scheduled ${count(b.scheduled)}, attempted ${count(b.attempted)}, judged ${count(b.judged)}. Failed judgments are not passes.` })),
+    el("div", { style: "overflow-x:auto" }, el("table", {},
+      el("thead", {}, el("tr", {}, ["Run", "Set", "Scheduled", "Attempted", "Judged", "Judge failures", "TraceMaker", "FR 2.5.0-RC12", "FR 2.4.1", "Completion", "Added errors"].map((h, i) => el("th", { class: i > 1 ? "r" : "", text: h })))),
       el("tbody", {}, s.benchmarks.slice().reverse().map((b) => el("tr", {},
-        el("td", { class: "mono", text: b.run }),
+        el("td", { class: "mono" }, el("span", { text: b.run }),
+          ...(b.state_note ? [el("div", { class: "sub", text: b.state_note })] : [])),
         el("td", { text: b.set || "" }),
-        el("td", { class: "r num", text: b.boards ?? "" }),
+        el("td", { class: "r num", text: count(b.scheduled) }),
+        el("td", { class: "r num", text: count(b.attempted) }),
+        el("td", { class: "r num", text: count(b.judged) }),
+        el("td", { class: `r num${b.judge_failures > 0 ? " s-fail" : ""}` }, el("b", { text: count(b.judge_failures) })),
         el("td", { class: "r num" }, el("b", { text: pct(b.clean_pass) })),
         el("td", { class: "r num", text: pct(b.fr_rc12_clean_pass) }),
         el("td", { class: "r num", text: pct(b.fr_241_clean_pass) }),
         el("td", { class: "r num", text: pct(b.completion) }),
-        el("td", { class: "r num", text: b.boards_with_added_errors == null ? "–" : String(b.boards_with_added_errors) }))))));
+        el("td", { class: "r num", text: count(b.boards_with_added_errors) })))))));
 }
 
 function renderQuality(s) {
@@ -408,6 +416,7 @@ function renderQuality(s) {
   const paired = q.by_router.paired || {};
   replace("quality",
     el("div", { class: "sub", style: "margin-bottom:8px", text: `${q.run} · ${q.boards} PCBench boards never used in development (tiers ${q.tiers.join(", ")}) · every router run on this machine and judged by KiCad's DRC · ${ago(q.finished)}` }),
+    ...(q.state_note ? [el("div", { class: "sub", style: "margin-bottom:8px", text: q.state_note })] : []),
     el("table", {},
       el("thead", {}, el("tr", {}, ["Router", "KiCad clean", "Fully connected", "Mean completion", "Boards with router errors", "Median time"].map((h, i) => el("th", { class: i ? "r" : "", text: h })))),
       el("tbody", {}, routers.map((k) => {

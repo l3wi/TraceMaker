@@ -12,10 +12,12 @@ boards retain the published input and an explicit coverage warning; human stays 
 import argparse
 import json
 import pathlib
+import subprocess
 import sys
 
 from plane_metrics import child, children, parse
-from prepare_inputs import expressions, prepare_board, set_boards, strip_design_routing, terminal_signature, without_spans
+from prepare_inputs import (expressions, invalidate_fixture, prepare_board, set_boards,
+                            strip_design_routing, terminal_signature, without_spans)
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SOURCE = ROOT / 'bench/data/freerouting/scripts/benchmark/fixtures/PCBench'
@@ -96,6 +98,7 @@ def transplant_design_copper(raw_text, published_text):
 
 
 def prepare(name, source, out):
+    invalidate_fixture(out / name, 'preparation in progress')
     raw, published = source / name / 'raw.kicad_pcb', source / name / 'unrouted.kicad_pcb'
     text = raw.read_text()
     board = parse(text)
@@ -113,16 +116,13 @@ def prepare(name, source, out):
     differences = [label for label, a, b in zip(labels, original, expected) if a != b]
     transplanted, raw_stats = transplant_design_copper(text, published_text)
     destination = out / name / 'unrouted.kicad_pcb'
-    stats = prepare_board(raw, destination, input_text=transplanted, rules_source=published)
-    stats.update(raw_stats)
-    if terminal_signature(destination.read_text()) != expected:
-        raise ValueError('prepared input differs from published unrouted nets/references/pads')
-    stats.update({'board': name, 'identity_matches_pcbench': True, 'human_confirmed': True,
-                  'human_tracks': tracks, 'ground_truth_source': truth['source_pcb'],
-                  'raw_published_differences': differences, 'preparation': 'published terminals + raw design copper'})
+    raw_stats.update({'board': name, 'identity_matches_pcbench': True, 'human_confirmed': True,
+                      'human_tracks': tracks, 'ground_truth_source': truth['source_pcb'],
+                      'raw_published_differences': differences, 'preparation': 'published terminals + raw design copper'})
+    stats = prepare_board(raw, destination, input_text=transplanted, rules_source=published,
+                          metadata=raw_stats, expected_terminals=expected)
     if stats.get('reason'):
         print(f'COVERAGE {name}: {stats["reason"]}', file=sys.stderr, flush=True)
-    destination.with_name('preparation.json').write_text(json.dumps(stats, indent=2) + '\n')
     return stats
 
 
@@ -145,13 +145,11 @@ def main():
             stats = prepare(name, args.source, args.out)
             records.append(stats)
             print(f'{name}: zones={stats["zones"]}, fixed_vias={stats["fixed_vias"]}, identity OK', flush=True)
-        except (OSError, ValueError, RuntimeError) as error:
-            record = {'board': name, 'excluded': True, 'reason': str(error)}
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            record = {'board': name, 'state': 'invalid', 'excluded': True, 'reason': str(error)}
             records.append(record)
             excluded.append(record)
-            destination = args.out / name / 'unrouted.kicad_pcb'
-            if destination.exists():
-                destination.unlink()  # An older successful preparation must not mask this exclusion.
+            invalidate_fixture(args.out / name, error)
             print(f'EXCLUDED {name}: {error}', file=sys.stderr, flush=True)
     # Retain exclusions from other sets previously prepared into this directory.
     old = args.out / 'exclusions.json'

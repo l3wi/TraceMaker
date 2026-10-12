@@ -16,7 +16,7 @@ import pathlib
 import subprocess
 import sys
 
-from prepare_inputs import prepare_board, set_boards
+from prepare_inputs import invalidate_fixture, prepare_board, set_boards
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SOURCES = ROOT / "bench/sets/modern-planes.json"
@@ -43,7 +43,7 @@ def fetch(board: dict, data: pathlib.Path) -> pathlib.Path:
     git("fetch", "--quiet", "--depth", "1", "--filter=blob:none", "origin", board["commit"], cwd=dst)
     git("checkout", "--quiet", "--detach", board["commit"], cwd=dst)
     if not (dst / board["pcb"]).is_file():
-        raise SystemExit(f"{board['name']}: {board['pcb']} missing at {board['commit']}")
+        raise FileNotFoundError(f"{board['name']}: {board['pcb']} missing at {board['commit']}")
     return dst
 
 
@@ -70,11 +70,18 @@ def main() -> int:
             raise SystemExit(f"unknown board(s): {', '.join(sorted(unknown))}")
         boards = [b for b in boards if b["name"] in a.names]
     data, out = pathlib.Path(a.data).resolve(), pathlib.Path(a.out).resolve()
+    failed = False
     for b in boards:
-        prepare(b, fetch(b, data), out)
-        print(f"  {b['name']}", file=sys.stderr)
+        invalidate_fixture(out / b['name'], 'preparation in progress')
+        try:
+            prepare(b, fetch(b, data), out)
+            print(f"  {b['name']}", file=sys.stderr)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            invalidate_fixture(out / b['name'], error)
+            print(f"FAILED {b['name']}: {error}", file=sys.stderr)
+            failed = True
     print(out)
-    return 0
+    return int(failed)
 
 
 if __name__ == "__main__":

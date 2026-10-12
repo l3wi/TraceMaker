@@ -8,8 +8,13 @@ bench/data/dac2020_prepared/bmN/ with:
   unrouted.kicad_pcb  the same board with its tracks, track arcs and vias removed (the DAC 2020 authors' intended use)
   unrouted.dsn        Freerouting's Specctra fixture for the board (unrouted; same coordinates as the KiCad file)
 """
+import hashlib
+import json
 import pathlib
 import shutil
+import sys
+
+from prepare_inputs import copy_rules, fixture_transaction, invalidate_fixture, terminal_signature
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SRC = ROOT / "bench/data/dac2020"
@@ -63,22 +68,48 @@ def strip_routing(text: str) -> str:
     return "".join(out)
 
 
+def prepare(pcb, dsn, destination):
+    metadata = {'board': destination.name, 'refilled': False, 'human_available': True,
+                'preparation': 'legacy DAC2020 all-vias-stripped', 'report': 'preparation.report.json'}
+    with fixture_transaction(destination, metadata) as stage:
+        human = stage / 'routed.kicad_pcb'
+        shutil.copyfile(pcb, human)
+        shutil.copyfile(pcb, stage / 'raw.kicad_pcb')
+        shutil.copyfile(dsn, stage / 'unrouted.dsn')
+        board = stage / 'unrouted.kicad_pcb'
+        board.write_text(strip_routing(pcb.read_text()))
+        for target in (human, board, stage / 'raw.kicad_pcb'):
+            copy_rules(pcb, target)
+        if terminal_signature(board.read_text()) != terminal_signature(human.read_text()):
+            raise ValueError('stripping changed nets, footprint references or pads')
+        metadata.update(source=str(pcb), source_sha256=hashlib.sha256(human.read_bytes()).hexdigest())
+        (stage / 'preparation.report.json').write_text(json.dumps({'terminal_identity_matches': True}) + '\n')
+    return metadata
+
+
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
+    failed = False
     for d in sorted(SRC.glob("bm*")):
         n = int(d.name[2:])
         dsn = DSN / f"DAC2020_bm{n:02d}.dsn"
         pcb = next(iter(d.glob("*.kicad_pcb")), None)
+        destination = OUT / d.name
         if not dsn.exists() or pcb is None:
-            print(f"skip {d.name}: no Specctra fixture" if pcb else f"skip {d.name}: no board")
+            reason = 'no Specctra fixture' if pcb else 'no board'
+            invalidate_fixture(destination, reason)
+            print(f"skip {d.name}: {reason}")
+            failed = True
             continue
-        o = OUT / d.name
-        o.mkdir(exist_ok=True)
-        shutil.copy(pcb, o / "raw.kicad_pcb")
-        shutil.copy(dsn, o / "unrouted.dsn")
-        (o / "unrouted.kicad_pcb").write_text(strip_routing(pcb.read_text()))
-        print("prepared", o)
+        try:
+            prepare(pcb, dsn, destination)
+            print("prepared", destination)
+        except (OSError, ValueError, RuntimeError) as error:
+            invalidate_fixture(destination, error)
+            print(f"FAILED {d.name}: {error}", file=sys.stderr)
+            failed = True
+    return int(failed)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

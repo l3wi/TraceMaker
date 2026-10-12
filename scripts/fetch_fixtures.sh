@@ -27,22 +27,23 @@ ref_for() {  # NAME pin -> the commit to use, or "latest"
   if [[ -n ${!var:-} ]]; then echo "${!var}"; elif [[ ${TM_FIXTURES:-} == latest ]]; then echo latest; else echo "$2"; fi
 }
 
-# Puts the checkout at `ref` (a commit: fetched on its own, shallow) or, for "latest", at the branch head.
+# Always materialise the work tree, including a no-checkout clone already at its pinned HEAD.
 pin_checkout() {  # dir ref
-  local dir=$DATA/$1 ref=$2
+  local dir=$DATA/$1 ref=$2 target=$2
   if [[ $ref == latest ]]; then
-    git -C "$dir" pull --ff-only --quiet || true
+    git -C "$dir" fetch --quiet --depth 1 origin HEAD
+    target=FETCH_HEAD
   elif [[ $(git -C "$dir" rev-parse HEAD 2>/dev/null) != "$ref" ]]; then
     git -C "$dir" fetch --quiet --depth 1 origin "$ref"
-    git -C "$dir" checkout --quiet --detach "$ref"
+    target=FETCH_HEAD
   fi
+  git -C "$dir" checkout --quiet --detach "$target"
 }
 sparse_clone() {  # url dir branch ref path...
   local url=$1 dir=$2 branch=$3 ref=$4; shift 4
   if [[ ! -d $DATA/$dir/.git ]]; then
     git clone --quiet --depth 1 --filter=blob:none --sparse --no-checkout --branch "$branch" "$url" "$DATA/$dir"
     git -C "$DATA/$dir" sparse-checkout set "$@"
-    [[ $ref == latest ]] && git -C "$DATA/$dir" checkout --quiet "$branch"
   fi
   pin_checkout "$dir" "$ref"
 }
@@ -77,8 +78,6 @@ derived() {
 # versions the autorouter's package.json names, in bench/data/tscircuit (bench/srj_score.py runs it with node).
 tscircuit_checker() {
   sparse_clone https://github.com/tscircuit/tscircuit-autorouter.git tscircuit/tscircuit-autorouter main "$(ref_for TSC_AUTOROUTER $PIN_TSC_AUTOROUTER)" lib types
-  # sparse_clone leaves the work tree empty when the branch head already is the pinned commit.
-  [[ -d $DATA/tscircuit/tscircuit-autorouter/lib ]] || git -C "$DATA/tscircuit/tscircuit-autorouter" checkout --quiet --detach HEAD
   cat > "$DATA/tscircuit/package.json" <<'JSON'
 {
   "name": "tracemaker-srj-checker",

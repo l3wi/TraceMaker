@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
+import hashlib
 import json
 import pathlib
+import subprocess
 import tempfile
 import unittest
 import uuid
 from unittest.mock import patch
 
 from plane_metrics import child, children, parse
-from prepare_inputs import expressions, refill_board, repair_design_ids, strip_design_routing, terminal_signature
+from prepare_inputs import (expressions, fixture_transaction, prepare_board, refill_board,
+                            repair_design_ids, strip_design_routing, terminal_signature)
 from prepare_pcbench import transplant_design_copper
 
 
@@ -58,25 +61,25 @@ class PreparationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = pathlib.Path(directory)
             source, target, report = root / 'raw.kicad_pcb', root / 'saved.kicad_pcb', root / 'drc.json'
-            source.write_text('raw')
+            source.write_text(HEADER + ')')
             source.with_suffix('.kicad_dru').write_text('rules')
             def run(command, **kwargs):
                 work = pathlib.Path(command[-1])
                 self.assertEqual(work.with_suffix('.kicad_dru').read_text(), 'rules')
                 self.assertIn('--save-board', command)
-                work.write_text('refilled')
+                work.write_text(HEADER + '(property "fill" "saved"))')
                 pathlib.Path(command[command.index('-o') + 1]).write_text('{"violations": []}')
                 return type('Result', (), {'returncode': 0})()
             with patch('prepare_inputs.subprocess.run', side_effect=run):
                 refill_board(source, target, report)
-            self.assertEqual(source.read_text(), 'raw')
-            self.assertEqual(target.read_text(), 'refilled')
+            self.assertEqual(source.read_text(), HEADER + ')')
+            self.assertEqual(target.read_text(), HEADER + '(property "fill" "saved"))')
             self.assertEqual(json.loads(report.read_text()), {'violations': []})
             self.assertEqual(target.with_suffix('.kicad_dru').read_text(), 'rules')
             with patch('prepare_inputs.subprocess.run', return_value=type('Result', (), {'returncode': 1, 'stderr': 'failed', 'stdout': ''})()):
                 with self.assertRaises(RuntimeError):
                     refill_board(source, target, report)
-            self.assertEqual(target.read_text(), 'refilled')
+            self.assertEqual(target.read_text(), HEADER + '(property "fill" "saved"))')
             self.assertEqual(json.loads(report.read_text()), {'violations': []})
 
     def test_pcbench_transplant_preserves_published_terminals(self):
@@ -113,6 +116,152 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(len(identities), len(set(identities)))
         self.assertTrue(all(identity.int for identity in identities))
         self.assertIn(f'(uuid "{valid}")', fixed)
+
+    def test_refill_converts_then_repairs_private_human_ids(self):
+        zero = '00000000-0000-0000-0000-000000000000'
+        original = HEADER + '(zone (net 1) (layer "F.Cu")) )'
+        converted = HEADER + f'(zone (uuid "{zero}")) (dimension (uuid "{zero}")) )'
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source, target, report = root / 'raw.kicad_pcb', root / 'human.kicad_pcb', root / 'report.json'
+            source.write_text(original)
+            calls = []
+
+            def run(command, **kwargs):
+                work = pathlib.Path(command[-1])
+                calls.append(work.read_text())
+                if len(calls) == 1:
+                    work.write_text(converted)
+                else:
+                    self.assertEqual(repair_design_ids(work.read_text(), 'fixture')[1], {})
+                    # Native dimension serialization reintroduces a display-text alias.
+                    text = work.read_text()
+                    dimension = children(parse(text), 'dimension')[0]
+                    identity = child(dimension, 'uuid')[1]
+                    work.write_text(text.replace(f'(dimension (uuid "{identity}"))',
+                                                f'(dimension (uuid "{identity}") (gr_text (uuid "{identity}")))'))
+                pathlib.Path(command[command.index('-o') + 1]).write_text(json.dumps({'pass': len(calls)}))
+                return subprocess.CompletedProcess(command, 0)
+
+            with patch('prepare_inputs.subprocess.run', side_effect=run):
+                stats = refill_board(source, target, report, board_name='fixture')
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(source.read_text(), original)
+            self.assertEqual(stats['identity_repairs'], {'zero': 2, 'duplicate': 1})
+            self.assertEqual(stats['post_save_identity_repairs'], {'duplicate': 1})
+            self.assertEqual(repair_design_ids(target.read_text(), 'fixture')[1], {})
+            self.assertEqual(json.loads(report.read_text()), {'pass': 2})
+
+    def test_refill_repair_failure_does_not_publish_conversion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source, target, report = root / 'raw.kicad_pcb', root / 'saved.kicad_pcb', root / 'report.json'
+            source.write_text(HEADER + ')')
+            target.write_text('old saved')
+            report.write_text('{"old": true}')
+            calls = []
+
+            def run(command, **kwargs):
+                calls.append(command)
+                if len(calls) == 2:
+                    raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+                pathlib.Path(command[-1]).write_text(HEADER + '(zone (uuid "00000000-0000-0000-0000-000000000000")))')
+                pathlib.Path(command[command.index('-o') + 1]).write_text('{}')
+                return subprocess.CompletedProcess(command, 0)
+
+            with patch('prepare_inputs.subprocess.run', side_effect=run):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    refill_board(source, target, report)
+            self.assertEqual(source.read_text(), HEADER + ')')
+            self.assertEqual(target.read_text(), 'old saved')
+            self.assertEqual(json.loads(report.read_text()), {'old': True})
+
+    @staticmethod
+    def refill_success(command, **kwargs):
+        pathlib.Path(command[command.index('-o') + 1]).write_text('{"violations": []}')
+        return subprocess.CompletedProcess(command, 0)
+
+    def test_preparation_manifest_covers_entire_published_fixture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / 'source.kicad_pcb'
+            source.write_text(HEADER + ')')
+            source.with_suffix('.kicad_pro').write_text('project')
+            source.with_suffix('.kicad_dru').write_text('rules')
+            destination = root / 'fixture' / 'unrouted.kicad_pcb'
+            destination.parent.mkdir()
+            (destination.parent / 'stale.kicad_dru').write_text('stale')
+            with patch('prepare_inputs.subprocess.run', side_effect=self.refill_success):
+                stats = prepare_board(source, destination, metadata={'board': 'fixture', 'custom': 'kept'})
+            manifest = json.loads(destination.with_name('preparation.json').read_text())
+            self.assertEqual(stats, manifest)
+            self.assertEqual(manifest['state'], 'valid')
+            self.assertEqual(manifest['custom'], 'kept')
+            self.assertEqual(set(manifest['files']), {
+                'unrouted.kicad_pcb', 'routed.kicad_pcb', 'unrouted.kicad_pro', 'unrouted.kicad_dru',
+                'routed.kicad_pro', 'routed.kicad_dru', 'preparation.drc.json'})
+            for name, digest in manifest['files'].items():
+                self.assertEqual(digest, hashlib.sha256((destination.parent / name).read_bytes()).hexdigest())
+            self.assertEqual(destination.with_name('routed.kicad_pcb').read_bytes(), source.read_bytes())
+            self.assertFalse(destination.with_name('stale.kicad_dru').exists())
+
+    def test_preparation_timeout_or_terminal_mismatch_invalidates_old_fixture(self):
+        for failure in ('timeout', 'terminals', 'bad_report'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root = pathlib.Path(directory)
+                source = root / 'source.kicad_pcb'
+                source.write_text(HEADER + '(footprint "P" (property "Reference" "U1") (pad "1" smd rect)))')
+                source.with_suffix('.kicad_dru').write_text('new rules')
+                destination = root / 'fixture' / 'unrouted.kicad_pcb'
+                destination.parent.mkdir()
+                destination.write_text('old input')
+                human = destination.with_name('routed.kicad_pcb')
+                human.write_text('old human')
+                destination.with_suffix('.kicad_dru').write_text('old rules')
+                destination.with_name('preparation.drc.json').write_text('{"old": true}')
+                destination.with_name('preparation.json').write_text('{"state": "valid"}')
+
+                def run(command, **kwargs):
+                    self.assertEqual(destination.read_text(), 'old input')
+                    self.assertEqual(human.read_text(), 'old human')
+                    self.assertEqual(json.loads(destination.with_name('preparation.json').read_text())['state'], 'invalid')
+                    if failure == 'timeout':
+                        raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+                    if failure == 'terminals':
+                        work = pathlib.Path(command[-1])
+                        work.write_text(work.read_text().replace('"U1"', '"CHANGED"'))
+                    report = pathlib.Path(command[command.index('-o') + 1])
+                    report.write_text('broken JSON' if failure == 'bad_report' else '{}')
+                    return subprocess.CompletedProcess(command, 0)
+
+                with patch('prepare_inputs.subprocess.run', side_effect=run):
+                    with self.assertRaises((ValueError, subprocess.TimeoutExpired)):
+                        prepare_board(source, destination)
+                self.assertEqual(json.loads(destination.with_name('preparation.json').read_text())['state'], 'invalid')
+                self.assertEqual(destination.read_text(), 'old input')
+                self.assertEqual(human.read_text(), 'old human')
+                self.assertEqual(destination.with_suffix('.kicad_dru').read_text(), 'old rules')
+                self.assertEqual(json.loads(destination.with_name('preparation.drc.json').read_text()), {'old': True})
+
+    def test_failed_directory_publish_restores_invalid_old_fixture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = pathlib.Path(directory) / 'fixture'
+            destination.mkdir()
+            (destination / 'unrouted.kicad_pcb').write_text('old')
+            import prepare_inputs
+            replace = prepare_inputs.os.replace
+
+            def fail_publish(source, target):
+                if pathlib.Path(source).name == 'fixture' and pathlib.Path(source).parent != destination.parent:
+                    raise OSError('injected directory publish failure')
+                return replace(source, target)
+
+            with patch('prepare_inputs.os.replace', side_effect=fail_publish):
+                with self.assertRaisesRegex(OSError, 'injected'):
+                    with fixture_transaction(destination, {}) as stage:
+                        (stage / 'unrouted.kicad_pcb').write_text('new')
+            self.assertEqual((destination / 'unrouted.kicad_pcb').read_text(), 'old')
+            self.assertEqual(json.loads((destination / 'preparation.json').read_text())['state'], 'invalid')
 
 
 if __name__ == '__main__':

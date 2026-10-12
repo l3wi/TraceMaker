@@ -16,10 +16,13 @@ connections `tracemaker route` reports for it. Exit code 1 if any board fails to
 import argparse
 import concurrent.futures as cf
 import json
+import hashlib
 import os
 import pathlib
 import subprocess
 import sys
+
+from prepare_inputs import fixture_transaction
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DATA = ROOT / "bench/data/tscircuit"
@@ -29,34 +32,46 @@ SETS = {"srj19": "dataset-srj19", "srj20": "dataset-srj20"}
 
 def convert(job: tuple[pathlib.Path, pathlib.Path, str, str, bool]) -> dict:
     problem, dst, clearance, hole, verify = job
-    dst.mkdir(parents=True, exist_ok=True)
-    board = dst / "unrouted.kicad_pcb"
     res = {"board": dst.name}
-    cmd = [str(TM), "srj-import", str(problem), "-o", str(board), "--json", str(dst / "import.json")]
-    if clearance != "default":
-        cmd += ["--clearance-mm", clearance]
-    if hole != "default":
-        cmd += ["--hole-to-hole-mm", hole]
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    if p.returncode != 0:
-        res["error"] = (p.stderr or p.stdout).strip()[-300:]
-        return res
-    link = dst / "problem.json"
-    if link.is_symlink() or link.exists():
-        link.unlink()
-    link.symlink_to(os.path.relpath(problem, dst))
-    imp = json.loads((dst / "import.json").read_text())
-    res.update(srj_pairs=imp["srj_pairs"], board_pairs=imp["board_pairs"], warnings=imp["warnings"])
-    if verify:
-        # What the router itself counts: one expansion of budget, no output kept.
-        rj = dst / "count.route.json"
-        subprocess.run([str(TM), "route", str(board), "-o", str(dst / "count.kicad_pcb"), "--work", "1", "--variants", "1", "--no-gpu",
-                        "--no-kb", "--json", str(rj)], capture_output=True, text=True)
-        res["route_connections"] = json.loads(rj.read_text())["connections"] if rj.exists() else None
-        for f in (rj, dst / "count.kicad_pcb"):
-            f.unlink(missing_ok=True)
-        imp["route_connections"] = res["route_connections"]
-        (dst / "import.json").write_text(json.dumps(imp, indent=1) + "\n")
+    metadata = {"board": dst.name, "human_available": False, "refilled": False, "report": "import.json"}
+    try:
+        with fixture_transaction(dst, metadata) as stage:
+            board = stage / "unrouted.kicad_pcb"
+            # Import exactly the frozen problem bytes recorded in the manifest.
+            (stage / "problem.json").write_bytes(problem.read_bytes())
+            cmd = [str(TM), "srj-import", str(stage / "problem.json"), "-o", str(board), "--json", str(stage / "import.json")]
+            if clearance != "default":
+                cmd += ["--clearance-mm", clearance]
+            if hole != "default":
+                cmd += ["--hole-to-hole-mm", hole]
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if p.returncode != 0:
+                raise RuntimeError((p.stderr or p.stdout).strip()[-300:])
+            imp = json.loads((stage / "import.json").read_text())
+            res.update(srj_pairs=imp["srj_pairs"], board_pairs=imp["board_pairs"], warnings=imp["warnings"])
+            if res["srj_pairs"] != res["board_pairs"]:
+                raise ValueError(f'connection count mismatch: problem {res["srj_pairs"]}, board {res["board_pairs"]}')
+            if verify:
+                # One expansion counts the requested connections; no routed output is retained.
+                rj = stage / "count.route.json"
+                counted = stage / "count.kicad_pcb"
+                p = subprocess.run([str(TM), "route", str(board), "-o", str(counted), "--work", "1",
+                                    "--variants", "1", "--no-gpu", "--no-kb", "--json", str(rj)],
+                                   capture_output=True, text=True, timeout=600)
+                if p.returncode not in (0, 3) or not rj.exists():
+                    raise RuntimeError(f'connection-count route failed: {p.stderr or p.stdout}')
+                res["route_connections"] = json.loads(rj.read_text())["connections"]
+                if res["route_connections"] != res["srj_pairs"]:
+                    raise ValueError(f'connection count mismatch: problem {res["srj_pairs"]}, route {res["route_connections"]}')
+                for path in (rj, counted, counted.with_suffix(".kicad_pro"), counted.with_suffix(".kicad_dru")):
+                    path.unlink(missing_ok=True)
+                imp["route_connections"] = res["route_connections"]
+                (stage / "import.json").write_text(json.dumps(imp, indent=1) + "\n")
+            metadata.update(res, source=str(problem),
+                            source_sha256=hashlib.sha256((stage / "problem.json").read_bytes()).hexdigest(),
+                            connections_verified=verify)
+    except (OSError, ValueError, RuntimeError, KeyError, subprocess.SubprocessError) as error:
+        res["error"] = str(error)
     return res
 
 

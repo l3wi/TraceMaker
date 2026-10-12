@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import uuid
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 
 from plane_metrics import child, children, parse, point
 
@@ -174,24 +175,40 @@ def copy_rules(source, target, fallback=None):
             dst.unlink()  # Do not reuse rules from an earlier fixture revision.
 
 
-def refill_board(source, target, report, timeout=600):
-    """Refill a private copy; publish saved board and complete report atomically."""
+def refill_board(source, target, report, timeout=600, board_name=None):
+    """Convert, repair identities and refill a private copy, leaving the source untouched."""
     target.parent.mkdir(parents=True, exist_ok=True)
     report.parent.mkdir(parents=True, exist_ok=True)
+    board_name = board_name or source.parent.name
     with tempfile.TemporaryDirectory(prefix='.refill-', dir=target.parent) as tmp:
         work = pathlib.Path(tmp) / target.name
+        private_report = pathlib.Path(tmp) / 'drc.json'
         shutil.copyfile(source, work)
         copy_rules(source, work)
-        result = subprocess.run(['kicad-cli', 'pcb', 'drc', '--format', 'json', '--severity-all', '--all-track-errors',
-                                 '--refill-zones', '--save-board', '-o', str(pathlib.Path(tmp) / 'drc.json'), str(work)],
-                                capture_output=True, text=True, timeout=timeout)
-        private_report = pathlib.Path(tmp) / 'drc.json'
-        if result.returncode != 0 or not private_report.exists():
-            raise RuntimeError(f'KiCad refill failed for {source}: {result.stderr or result.stdout}')
-        json.loads(private_report.read_text())  # Never publish an invalid or half-written DRC cache.
+
+        def refill():
+            private_report.unlink(missing_ok=True)
+            result = subprocess.run(['kicad-cli', 'pcb', 'drc', '--format', 'json', '--severity-all', '--all-track-errors',
+                                     '--refill-zones', '--save-board', '-o', str(private_report), str(work)],
+                                    capture_output=True, text=True, timeout=timeout)
+            if result.returncode != 0 or not private_report.exists():
+                raise RuntimeError(f'KiCad refill failed for {source}: {result.stderr or result.stdout}')
+            json.loads(private_report.read_text())
+
+        refill()  # Legacy conversion must precede native UUID repair.
+        corrected, repairs = repair_design_ids(work.read_text(), board_name)
+        if repairs:
+            work.write_text(corrected)
+            refill()
+        # KiCad aliases dimension display-text UUIDs to their parent on save.
+        corrected, post_save_repairs = repair_design_ids(work.read_text(), board_name)
+        if post_save_repairs:
+            work.write_text(corrected)
         copy_rules(source, target)
         os.replace(work, target)
         os.replace(private_report, report)
+        return {'identity_repairs': dict(Counter(repairs) + Counter(post_save_repairs)),
+                'post_save_identity_repairs': post_save_repairs}
 
 def canonical_net_name(name):
     # KiCad upgrades legacy overbar syntax without changing electrical identity.
@@ -269,39 +286,66 @@ def repair_design_ids(text, board_name):
 
 
 
-def prepare_board(source, destination, input_text=None, rules_source=None):
+def invalidate_fixture(destination, error):
+    """Make old fixture bytes ineligible without rewriting the human reference."""
+    destination.mkdir(parents=True, exist_ok=True)
+    record = {'state': 'invalid', 'board': destination.name, 'reason': str(error)}
+    with tempfile.NamedTemporaryFile(mode='w', prefix='.preparation-', dir=destination, delete=False) as handle:
+        temporary = pathlib.Path(handle.name)
+        json.dump(record, handle, indent=2)
+        handle.write('\n')
+    os.replace(temporary, destination / 'preparation.json')
+
+
+@contextmanager
+def fixture_transaction(destination, metadata):
+    """Publish a whole validated fixture; failures never leave a successful manifest."""
     destination.parent.mkdir(parents=True, exist_ok=True)
-    text = source.read_text() if input_text is None else input_text
-    rules_source = rules_source or source
-    stripped, stats = strip_design_routing(text)
-    human = destination.with_name('routed.kicad_pcb')
-    shutil.copyfile(source, human)
-    copy_rules(rules_source, human, fallback=source)
-    copy_rules(rules_source, destination, fallback=source)
-    with tempfile.TemporaryDirectory(prefix='.strip-', dir=destination.parent) as tmp:
-        scratch = pathlib.Path(tmp) / destination.name
-        scratch.write_text(stripped)
-        copy_rules(rules_source, scratch, fallback=source)
-        refill_board(scratch, destination, destination.with_name('preparation.drc.json'))
-        # Convert old formats first, then repair native identities. If anything
-        # changed, refill again so both saved fills and the report see distinct
-        # rule areas; the first conversion report is not the authoritative judge.
-        corrected, repairs = repair_design_ids(destination.read_text(), destination.parent.name)
-        if repairs:
-            scratch.write_text(corrected)
-            refill_board(scratch, destination, destination.with_name('preparation.drc.json'))
-        # Native dimensions alias their nested display text to the parent UUID
-        # on save. De-duplicate that serialization after the authoritative fill;
-        # this changes identity fields only, never geometry or rule-area IDs.
-        final_text, post_save_repairs = repair_design_ids(destination.read_text(), destination.parent.name)
-        if post_save_repairs:
-            scratch.write_text(final_text)
-            os.replace(scratch, destination)
-        stats['identity_repairs'] = dict(Counter(repairs) + Counter(post_save_repairs))
-        stats['post_save_identity_repairs'] = post_save_repairs
-    if terminal_signature(destination.read_text()) != terminal_signature(text):
-        raise ValueError(f'{source}: refill changed nets, footprint references or pads')
-    stats.update({'source': str(source), 'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
-                  'input_sha256': hashlib.sha256(destination.read_bytes()).hexdigest(), 'refilled': True})
-    destination.with_name('preparation.json').write_text(json.dumps(stats, indent=2) + '\n')
+    invalidate_fixture(destination, 'preparation in progress')
+    try:
+        with tempfile.TemporaryDirectory(prefix=f'.prepare-{destination.name}-', dir=destination.parent) as tmp:
+            stage = pathlib.Path(tmp) / 'fixture'
+            stage.mkdir()
+            yield stage
+            files = {path.relative_to(stage).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                     for path in sorted(stage.rglob('*')) if path.is_file() and path.name != 'preparation.json'}
+            if 'unrouted.kicad_pcb' not in files:
+                raise ValueError('preparation did not produce unrouted.kicad_pcb')
+            metadata.update(state='valid', files=files,
+                            input_sha256=files['unrouted.kicad_pcb'])
+            (stage / 'preparation.json').write_text(json.dumps(metadata, indent=2) + '\n')
+            previous = pathlib.Path(tmp) / 'previous'
+            os.replace(destination, previous)
+            try:
+                os.replace(stage, destination)
+            except BaseException:
+                os.replace(previous, destination)
+                raise
+    except BaseException as error:
+        invalidate_fixture(destination, error)
+        raise
+
+
+def prepare_board(source, destination, input_text=None, rules_source=None, metadata=None, expected_terminals=None):
+    stats = {'board': destination.parent.name, **(metadata or {})}
+    with fixture_transaction(destination.parent, stats) as stage:
+        text = source.read_text() if input_text is None else input_text
+        rules_source = rules_source or source
+        stripped, stripping = strip_design_routing(text)
+        # Transplant statistics describe the raw design, not just the already-stripped input.
+        stats.update({**stripping, **stats})
+        human = stage / 'routed.kicad_pcb'
+        shutil.copyfile(source, human)
+        copy_rules(rules_source, human, fallback=source)
+        with tempfile.TemporaryDirectory(prefix='.strip-', dir=stage.parent) as tmp:
+            scratch = pathlib.Path(tmp) / destination.name
+            scratch.write_text(stripped)
+            copy_rules(rules_source, scratch, fallback=source)
+            stats.update(refill_board(scratch, stage / destination.name, stage / 'preparation.drc.json',
+                                      board_name=destination.parent.name))
+        expected = terminal_signature(text) if expected_terminals is None else expected_terminals
+        if terminal_signature((stage / destination.name).read_text()) != expected:
+            raise ValueError(f'{source}: refill changed nets, footprint references or pads')
+        stats.update(source=str(source), source_sha256=hashlib.sha256(human.read_bytes()).hexdigest(),
+                     refilled=True, human_available=True, report='preparation.drc.json')
     return stats

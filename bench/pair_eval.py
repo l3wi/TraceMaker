@@ -59,9 +59,6 @@ def pairs(board: pathlib.Path, extra_pairs: list[str]) -> list[dict]:
     return json.loads(js.read_text())["pairs"]
 
 
-def added_errors(before: dict, after: dict) -> dict:
-    return {t: n - before["routed_errors"].get(t, 0) for t, n in after["routed_errors"].items()
-            if t not in bench_run.NOT_ROUTING and n - before["routed_errors"].get(t, 0) > 0}
 
 
 def main() -> int:
@@ -100,7 +97,7 @@ def main() -> int:
         row = {"board": tag, "mode": mode, "routed": r.get("routed"), "connections": r.get("connections")}
         if before and after:
             row["unconnected"] = after["unconnected"]
-            row["added_errors"] = added_errors(before, after)
+            row.update(bench_run.added_errors(before, after))
             row["clean"] = after["unconnected"] == 0 and not row["added_errors"]
         row["pairs"] = pairs(dst, extra_pairs.get(tag, [])) if dst.exists() else []
         rows.append(row)

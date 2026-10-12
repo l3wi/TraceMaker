@@ -61,9 +61,6 @@ def measure(board: pathlib.Path, bus_args: list[str]) -> list[dict]:
     return json.loads(js.read_text())["buses"]
 
 
-def added_errors(before: dict, after: dict) -> dict:
-    return {t: n - before["routed_errors"].get(t, 0) for t, n in after["routed_errors"].items()
-            if t not in bench_run.NOT_ROUTING and n - before["routed_errors"].get(t, 0) > 0}
 
 
 def main() -> int:
@@ -120,7 +117,7 @@ def main() -> int:
             before, after = drcs.get(out / tag / f"{tag}.kicad_pcb"), drcs.get(dst)
             if before and after:
                 row["unconnected"] = after["unconnected"]
-                row["added_errors"] = added_errors(before, after)
+                row.update(bench_run.added_errors(before, after))
             rows.append(row)
     print(f"{'board':10} {'mode':4} {'routed':>9} {'vias':>4} {'added':>5}  group: routed, vias per member min-max, left the bus, skew / limit")
     for r in rows:

@@ -201,25 +201,53 @@ def docs() -> list[dict]:
 
 
 def benchmarks() -> list[dict]:
-    """Full benchmark runs (>= 20 boards), oldest first (the page shows newest first)."""
+    """Final declared-roster runs, oldest first; label unverified legacy summaries."""
     out = []
     files = sorted((ROOT / "bench" / "results").glob("*/summary.json"), key=lambda f: f.stat().st_mtime)
     for f in files:
         s = read_json(f, None)
-        if isinstance(s, dict) and (s.get("boards") or 0) >= 20:
-            s.setdefault("run", f.parent.name)
-            s["finished"] = f.stat().st_mtime
-            out.append(s)
+        if not isinstance(s, dict):
+            continue
+        manifest_path = f.parent / "manifest.json"
+        if "state" in s or manifest_path.exists():
+            manifest = read_json(manifest_path, None)
+            if s.get("state") != "final" or not isinstance(manifest, dict) or manifest.get("state") != "final":
+                continue
+            roster = manifest.get("roster")
+            if (not isinstance(roster, list) or not roster or
+                    any(not isinstance(name, str) or not name for name in roster) or
+                    len(set(roster)) != len(roster) or s.get("roster") != roster):
+                continue
+            scheduled = len(roster)
+            if s.get("scheduled") != scheduled or manifest.get("scheduled") != scheduled:
+                continue
+            counts = [s.get(key) for key in ("attempted", "judged", "judge_failures")]
+            if any(type(count) is not int or count < 0 for count in counts):
+                continue
+            attempted, judged, failures = counts
+            if judged > attempted or attempted > scheduled or failures != attempted - judged:
+                continue
+            if any(manifest.get(key) != s[key] for key in ("attempted", "judged", "judge_failures")):
+                continue
+        else:
+            s["state_note"] = "Legacy: final state and scheduled roster not recorded; coverage unverified."
+        s.setdefault("run", f.parent.name)
+        s["finished"] = f.stat().st_mtime
+        out.append(s)
     return out[-30:]
 
 
 def quality_runs() -> list[dict]:
-    """Held-out quality benchmark runs (bench/quality_bench.py), oldest first."""
+    """Final held-out quality summaries; label legacy summaries without state."""
     out = []
     files = sorted((ROOT / "bench" / "results").glob("*/quality_summary.json"), key=lambda f: f.stat().st_mtime)
     for f in files:
         s = read_json(f, None)
         if isinstance(s, dict) and s.get("by_router"):
+            if "state" in s and s["state"] != "final":
+                continue
+            if "state" not in s:
+                s["state_note"] = "Legacy: final state not recorded; coverage unverified."
             s["finished"] = f.stat().st_mtime
             out.append(s)
     return out[-10:]

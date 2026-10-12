@@ -6,6 +6,7 @@ Exit code 0 when everything required is present. Optional tools are reported but
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import re
 import shutil
@@ -26,6 +27,11 @@ def run(cmd: list[str], timeout: float = 120) -> tuple[int, str]:
         return 1, str(e)
 
 
+def engine_binary() -> pathlib.Path:
+    """Use the same explicit override/release default as bench/run.py."""
+    return pathlib.Path(os.environ.get("TM_BINARY", ROOT / "build/release/src/app/tracemaker"))
+
+
 def main() -> int:
     ok = True
     # Required: kicad-cli 10.x (the DRC judge).
@@ -36,14 +42,14 @@ def main() -> int:
     else:
         print(f"FAIL  kicad-cli 10.x not usable: {out[-200:]}")
         ok = False
-    # Required: the engine binary (any preset).
-    exes = sorted(ROOT.glob("build/*/src/app/tracemaker"))
-    if exes:
-        code, out = run([str(exes[0]), "version"])
-        print(f"OK    {out} ({exes[0].relative_to(ROOT)})" if code == 0 else f"FAIL  {exes[0]}: {out}")
+    # Required: the engine the routing harness will actually use.
+    exe = engine_binary()
+    if exe.is_file():
+        code, out = run([str(exe), "version"])
+        print(f"OK    {out} ({exe})" if code == 0 else f"FAIL  {exe}: {out}")
         ok &= code == 0
     else:
-        print("FAIL  no tracemaker binary; run scripts/bootstrap.sh")
+        print(f"FAIL  tracemaker binary not found at {exe}; run scripts/bootstrap.sh or set TM_BINARY")
         ok = False
     # Optional: Freerouting baseline.
     fr = next((p for p in FREEROUTING_CANDIDATES if p.exists()), None) or shutil.which("freerouting")

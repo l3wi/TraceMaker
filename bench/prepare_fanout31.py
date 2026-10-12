@@ -18,11 +18,14 @@ the repository). Each carries `simpleRouteJson` and `solverOptions`. The convers
 """
 import argparse
 import concurrent.futures as cf
+import hashlib
 import json
 import os
 import pathlib
 import subprocess
 import sys
+
+from prepare_inputs import fixture_transaction
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 TM = pathlib.Path(os.environ.get("TM_BINARY", ROOT / "build/release/src/app/tracemaker"))
@@ -30,15 +33,29 @@ TM = pathlib.Path(os.environ.get("TM_BINARY", ROOT / "build/release/src/app/trac
 
 def convert(job):
     src, dst = job
-    d = json.loads(src.read_text())
-    srj = d["simpleRouteJson"]
-    srj["tracemakerTrackLayers"] = d["solverOptions"]["escapeLayers"]
-    dst.mkdir(parents=True, exist_ok=True)
-    (dst / "problem.json").write_text(json.dumps(srj))
-    cmd = [str(TM), "srj-import", str(dst / "problem.json"), "-o", str(dst / "unrouted.kicad_pcb"), "--json", str(dst / "import.json"),
-           "--clearance-mm", "0.08128", "--outline-margin-mm", "0.5", "--unpointed-keepout"]
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    return {"board": dst.name, "error": (p.stderr or p.stdout).strip()[-300:] if p.returncode else None}
+    metadata = {"board": dst.name, "human_available": False, "refilled": False, "report": "import.json"}
+    try:
+        with fixture_transaction(dst, metadata) as stage:
+            source_bytes = src.read_bytes()
+            d = json.loads(source_bytes)
+            srj = d["simpleRouteJson"]
+            srj["tracemakerTrackLayers"] = d["solverOptions"]["escapeLayers"]
+            (stage / "source.json").write_bytes(source_bytes)
+            (stage / "problem.json").write_text(json.dumps(srj))
+            cmd = [str(TM), "srj-import", str(stage / "problem.json"), "-o", str(stage / "unrouted.kicad_pcb"),
+                   "--json", str(stage / "import.json"), "--clearance-mm", "0.08128",
+                   "--outline-margin-mm", "0.5", "--unpointed-keepout"]
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if p.returncode:
+                raise RuntimeError((p.stderr or p.stdout).strip()[-300:])
+            imp = json.loads((stage / "import.json").read_text())
+            if imp["srj_pairs"] != imp["board_pairs"]:
+                raise ValueError(f'connection count mismatch: problem {imp["srj_pairs"]}, board {imp["board_pairs"]}')
+            metadata.update(source=str(src), source_sha256=hashlib.sha256(source_bytes).hexdigest(),
+                            srj_pairs=imp["srj_pairs"], board_pairs=imp["board_pairs"])
+    except (OSError, ValueError, RuntimeError, KeyError, subprocess.SubprocessError) as error:
+        return {"board": dst.name, "error": str(error)}
+    return {"board": dst.name, "error": None}
 
 
 def main() -> int:
@@ -54,11 +71,11 @@ def main() -> int:
     bad = [r for r in rows if r["error"]]
     for r in bad:
         print("FAILED", r["board"], r["error"])
-    names = [r["board"] for r in rows if not r["error"]]
+    names = [r["board"] for r in rows]  # Failed fixtures remain scheduled and fail manifest preflight.
     sets = ROOT / "bench/sets/fanout31.txt"
     sets.write_text("# tscircuit fan-out benchmark (dataset-fanout31-am62l, 72 SoC fan-out cases), converted by bench/prepare_fanout31.py (doc 16 Track B).\n"
                     f"#fixtures: {pathlib.Path(a.out).resolve().relative_to(ROOT)}\n" + "\n".join(names) + "\n")
-    print(f"{len(files)} inputs, {len(names)} converted -> {a.out}")
+    print(f"{len(files)} inputs, {len(rows) - len(bad)} converted -> {a.out}")
     return 1 if bad else 0
 
 
