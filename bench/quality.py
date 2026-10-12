@@ -364,10 +364,10 @@ def board_job(job):
             data,_,terminal_coverage=identity.match(raw_data,human_geometry) if run!=reference else (human_geometry,{},dict(matched=len(human_geometry['pads']),unmatched=0,ambiguous=0,tolerance_nm=identity.TOL_NM))
             judged=io.judge(input_report,report)
             bad_nets = judged['unconnected_nets']
-            judged['judge_list_censored'] = judged.pop('censored', judged.get('judge_list_censored'))
+            judged.pop('censored', None)  # Report saturation and connectivity uncertainty are distinct.
             categories,mfg,coverage=measure(data,manifest,filled,meta,bad_nets,
                                             censored=judged['output_unconnected_censored'],
-                                            per_net=judged.get('unconnected_per_net', {}).get('after'),
+                                            per_net=(report.get('connectivity') or {}).get('per_net'),
                                             unconnected_items=report.get('unconnected_items', []),
                                             interfaces=interfaces, profile=profile,
                                             intended_references=intended_references,pair_endpoints=pair_endpoints)
@@ -399,7 +399,7 @@ def board_job(job):
             if run==reference:
                 original,_,_=measure(data,manifest,source,meta,judged['unconnected_nets'],interfaces=interfaces,
                                      censored=judged['output_unconnected_censored'],
-                                     per_net=judged.get('unconnected_per_net', {}).get('after'),
+                                     per_net=(report.get('connectivity') or {}).get('per_net'),
                                      unconnected_items=report.get('unconnected_items', []),
                                      intended_references=intended_references,pair_endpoints=pair_endpoints)
                 result['original_human']=original
@@ -501,8 +501,9 @@ def markdown(result):
             lines.append(f"| {board['board']} | {Path(run).name} | {arm['router_stop']} | {arm['budget_stopped']} | {arm['equal_work_valid']} | {arm['judge'].get('drc_pass')} | {g.get('near_pad_human_count')} / {g.get('near_pad_router_count')} | {g.get('absolute_small_pad_screen_pass')} | {g.get('small_pad_manufacturing')} |")
     for board in result['boards']:
         for run, arm in board['runs'].items():
-            if arm['judge'].get('capped_types'):
-                lines.append(f"\n{board['board']} / {Path(run).name}: capped DRC types {', '.join(arm['judge']['capped_types'])}; new-DRC gate unknown.")
+            capped = [kind for kind in arm['judge'].get('capped_types', []) if kind != 'unconnected_items']
+            if capped:
+                lines.append(f"\n{board['board']} / {Path(run).name}: capped DRC types {', '.join(capped)}; new-DRC gate unknown.")
             if arm['judge'].get('connectivity_unavailable'):
                 lines.append(f"\n{board['board']} / {Path(run).name}: connectivity fallback: "+json.dumps(arm['judge']['connectivity_unavailable']))
     finished = result['common_finished']

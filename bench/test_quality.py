@@ -220,7 +220,7 @@ class QualityTests(unittest.TestCase):
                  patch.object(scorecard.identity,'canonical_human',return_value=(data,{})), \
                  patch.object(scorecard.returns,'inferred_references',return_value={}), \
                  patch.object(scorecard.qpaths,'infer_endpoints',return_value={}):
-                result=scorecard.board_job(('synthetic',[],reference,None,'10.0.3'))
+                result=scorecard.board_job(('synthetic',[reference/'router'],reference,None,'10.0.3'))
             self.assertIn(str(reference),result['errors'])
             self.assertNotIn(str(reference),result['runs'])
 

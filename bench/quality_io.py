@@ -136,6 +136,8 @@ def judge(before, after):
     if before is None:
         result.update(common_denominator=None, completion=None, already_connected=False,
                       drc_pass=None, error_gate='unknown')
+    elif result['common_denominator'] == 0:
+        result['completion'] = None  # Already-connected inputs are outside the ratio cohort.
     return result
 
 
