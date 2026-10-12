@@ -755,7 +755,9 @@ def main() -> int:
             f.flush()
             tag = "CLEAN" if r.get("clean") else ("ERR  " if r.get("error") or r.get("judge") == "failed" else "     ")
             frc = r["fr_rc12"]["clean"] if r.get("fr_rc12") else None
-            print(f"{tag} {r['board'][:44]:44} routed {r.get('routed', '?')}/{r.get('connections', '?')} unconn {r.get('unconnected_after', '?')} "
+            print(f"{tag} {r['board'][:44]:44} routed {r.get('routed', '?')}/{r.get('connections', '?')} "
+                  f"unconn {r.get('unconnected_uncapped', {}).get('after', r.get('unconnected_after', '?'))} "
+                  f"(DRC listed {r.get('unconnected_after', '?')}) gate {r.get('error_gate', 'unknown')} "
                   f"added {r.get('added_errors', {})} {r.get('seconds', 0):.1f}s  FR-RC12 clean={frc}", flush=True)
             if r.get("judge") == "failed" and r.get("error"):
                 print(f"JUDGE FAILURE {r['board']}: {r['error']}", file=sys.stderr, flush=True)
@@ -816,6 +818,8 @@ def main() -> int:
               f"judge failures: {summary['judge_failures']}; censored boards: {summary['censored_boards']}.",
               f"New non-routing error instances (diagnostic): "
               f"{dict(sum((Counter(r.get('added_nonrouting', {})) for r in rows), Counter()))}."]
+    lines += [f"Unknown evaluated-error gates: {summary['error_gate_unknown_boards']}; capped types by board: "
+              f"{ {r['board']: r.get('capped_evaluated_types', []) for r in rows if r.get('error_gate') == 'unknown'} }."]
     lines += ["", "| Board | Routed / connections | KiCad completion | Plane unconnected | Signal unconnected | Vias | Plane / signal vias added | Plane / signal track mm added |",
               "|---|---:|---:|---:|---:|---:|---:|---:|"]
     for row in rows:
