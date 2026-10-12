@@ -2,7 +2,6 @@
 #include "route/router.hpp"
 #include "route/bus.hpp"
 #include "route/diff_pair.hpp"
-#include "route/pair_exit_guidance.hpp"
 #include "route/escape.hpp"
 #include "route/escape_flow.hpp"
 #include "route/heat_grid.hpp"
@@ -2300,29 +2299,21 @@ struct Router::Impl {
   std::string pair_why;
   std::string pair_tag;  // TM_DEBUG_PAIRS: which unhandled situation the last pair was in
   std::vector<std::uint8_t> pad_routed_here;  // board pad -> an end of some connection (filled on first use)
+  struct PairExitGuide { Point a, e; model::LayerMask layers; NetId net; Coord width; };
   std::vector<PairExitGuide> pair_exit_guides;
-  PairExitGuidance pair_exit_guidance;
-  bool pair_check_work() {
-    if (pair_probe_end > 0 && res.expansions >= pair_probe_end) return false;
-    if (opt.work_budget > 0 && static_cast<double>(res.expansions) >= static_cast<double>(opt.work_budget) * budget_scale)
-      return !stop_hit("work");
-    // Poll wall-clock/deadline every 64 real units, not at every AABB node.
-    if ((res.pair_work & 63) == 0 && out_of_budget()) return false;
-    ++res.expansions;
-    ++res.pair_work;
-    ++wc().expansions;
-    return true;
-  }
-  double pair_exit_cost(Point p, Point q, int layer, NetId net, Coord width) {
-    return pair_exit_guidance.cost(pair_exit_guides, p, q, layer, net, width, netclass(net).clearance, pitch,
-                                  opt.pair_exit_index, [&](NetId other) { return !pair_wanted(net, other); },
-                                  [&] { return pair_check_work(); });
+  double pair_exit_cost(Point p, Point q, int layer, NetId net, Coord width) const {
+    double cost = 0;
+    for (const auto& guide : pair_exit_guides) {
+      if (!(guide.layers & model::layer_bit(layer)) || guide.net == net || pair_wanted(net, guide.net)) continue;
+      if (geom::seg_seg_closer(p, q, guide.a, guide.e, (width + guide.width) / 2 + netclass(net).clearance))
+        cost += 8.0 * static_cast<double>(pitch);
+    }
+    return cost;
   }
   // Is the first unrouted connection at `pad` boxed in? A strict search from the pad (60k expansions at most) that
   // exhausts its open list inside the window proves it; any path, or a search cut short, says no.
   bool pin_boxed_in(int pad) {
     for (std::size_t ci = 0; ci < cs.size(); ++ci) {
-      if (!pair_check_work()) return false;
       const auto& st = cs[ci];
       if (st.routed || (st.c.pad_a != pad && st.c.pad_b != pad)) continue;
       Connection r = st.c;
@@ -2339,9 +2330,7 @@ struct Router::Impl {
       soft = false;
       expansion_cap = 60'000;
       std::vector<PathNode> path;
-      const long before = res.expansions;
       const bool found = search(r, w, path);
-      res.pair_work += res.expansions - before;
       expansion_cap = 0;
       soft = saved_soft;
       return !found && last_miss == Miss::Enclosed;
@@ -2364,7 +2353,7 @@ struct Router::Impl {
     std::array<std::uint8_t, 60> checked{};  // 0 unknown, 1 legal, 2 blocked, at each width
     std::size_t count = 0, order_count = 0;
   };
-  bool make_leg_candidates(PairLegCandidates& plans, const model::Pad& pad, Point X, Dir2 a, Dir2 n, int layer, NetId net, Coord w) {
+  void make_leg_candidates(PairLegCandidates& plans, const model::Pad& pad, Point X, Dir2 a, Dir2 n, int layer, NetId net, Coord w) {
     const Point p = pad.pos;
     auto& cand = plans.cand;
     auto with_dogs = [&](Point f, Point t, std::optional<Point> tail, bool from_exit = false) {
@@ -2394,7 +2383,6 @@ struct Router::Impl {
       with_dogs(exit, offset_point(X, a, -std::max(lateral, static_cast<double>(w))), X, true);
     }
     for (std::size_t i = 0; i < plans.count; ++i) {
-      if (!pair_check_work()) return false;
       const auto& v = cand[i];
       if (v.size >= 2) {
         const Point q = v.pts[v.size - 2], e = v.pts[v.size - 1];
@@ -2404,9 +2392,7 @@ struct Router::Impl {
       double guidance = 0;
       for (std::size_t j = 0; j + 1 < v.size; ++j) {
         len += std::hypot(static_cast<double>(v.pts[j + 1].x - v.pts[j].x), static_cast<double>(v.pts[j + 1].y - v.pts[j].y));
-        const double cost = pair_exit_cost(v.pts[j], v.pts[j + 1], layer, net, w);
-        if (cost < 0) return false;
-        guidance += cost;
+        guidance += pair_exit_cost(v.pts[j], v.pts[j + 1], layer, net, w);
       }
       cand[i].len = len;
       cand[i].guidance = guidance;
@@ -2415,7 +2401,6 @@ struct Router::Impl {
     std::sort(plans.order.begin(), plans.order.begin() + static_cast<std::ptrdiff_t>(plans.order_count));
     const Coord neck = neck_width(net);
     plans.widths = {w, neck > 0 && neck < w ? neck : Coord{0}};
-    return true;
   }
   template <class Poll, class Accept>
   std::optional<PairLeg> pair_leg(PairLegCandidates& plans, int layer, NetId net, std::span<const Point> partner_run,
@@ -2434,7 +2419,7 @@ struct Router::Impl {
           }
           if (good) {
             if (!poll()) return std::nullopt;
-            good = legs_clear(v.points(), ww, partner_run, run_width, gap, poll);
+            good = legs_clear(v.points(), ww, partner_run, run_width, gap);
           }
           plans.checked[key] = good ? std::uint8_t{1} : std::uint8_t{2};
         }
@@ -2449,13 +2434,10 @@ struct Router::Impl {
   }
 
   // Do two legs of different halves keep the gap the rules require between the halves?
-  template <class Poll>
-  bool legs_clear(std::span<const Point> x, Coord wx, std::span<const Point> y, Coord wy, Coord req, Poll&& poll) {
+  bool legs_clear(std::span<const Point> x, Coord wx, std::span<const Point> y, Coord wy, Coord req) const {
     for (std::size_t i = 0; i + 1 < x.size(); ++i)
-      for (std::size_t j = 0; j + 1 < y.size(); ++j) {
-        if (!poll()) return false;
+      for (std::size_t j = 0; j + 1 < y.size(); ++j)
         if (geom::seg_seg_closer(x[i], x[i + 1], y[j], y[j + 1], (wx + wy) / 2 + req)) return false;
-      }
     return true;
   }
 
@@ -2463,24 +2445,18 @@ struct Router::Impl {
   // half's coupled run near the far end of a short pair). Geometry only; the exact check follows.
   // `vm`: mask expansion of untented vias, which Obstacles adds between a via and other copper (once) or another via
   // (twice).
-  bool halves_clear(const PairHalf& x, const PairHalf& y, Coord req, Coord vd, Coord vm) {
+  static bool halves_clear(const PairHalf& x, const PairHalf& y, Coord req, Coord vd, Coord vm) {
     for (const auto& [la, sa] : x.segs)
-      for (const auto& [lb, sb] : y.segs) {
-        if (!pair_check_work()) return false;
+      for (const auto& [lb, sb] : y.segs)
         if (la == lb && geom::seg_seg_closer(sa.a, sa.b, sb.a, sb.b, (sa.w + sb.w) / 2 + req)) return false;
-      }
     const Coord req_vt = vm > 0 ? std::max(req, vm + 1'000) : req, req_vv = vm > 0 ? std::max(req, 2 * vm + 1'000) : req;
     for (const PairHalf* h : {&x, &y}) {
       const PairHalf* o = h == &x ? &y : &x;
       for (const Point v : h->vias) {
-        for (const auto& [l, sg] : o->segs) {
-          if (!pair_check_work()) return false;
+        for (const auto& [l, sg] : o->segs)
           if (geom::point_seg_closer(v, sg.a, sg.b, vd / 2 + sg.w / 2 + req_vt)) return false;
-        }
-        for (const Point w : o->vias) {
-          if (!pair_check_work()) return false;
+        for (const Point w : o->vias)
           if (geom::point_seg_closer(v, w, w, vd + req_vv)) return false;
-        }
       }
     }
     return true;
@@ -2503,9 +2479,16 @@ struct Router::Impl {
       emit_via_add(static_cast<int>(b.vias.size() - 1));
     }
   }
-  bool half_legal(const PairHalf& h, Coord vd, Coord vdrill) {
+  bool half_legal(const PairHalf& h, Coord vd, Coord vdrill, bool charged = false) {
     const bool dbg = std::getenv("TM_DEBUG_PAIRS") != nullptr;
-    auto check_work = [&] { return pair_check_work(); };
+    auto check_work = [&] {
+      if (!charged) return true;
+      if (out_of_budget()) return false;
+      ++res.expansions;
+      ++res.pair_work;
+      ++wc().expansions;
+      return true;
+    };
     for (const auto& [layer, s] : h.segs)
       if (!check_work() || !tracks_ok(layer) || obs->segment_state(s.a, s.b, layer, s.w, h.net, false, nullptr) != 0) {
         if (dbg)
@@ -2521,12 +2504,12 @@ struct Router::Impl {
     return true;
   }
   enum class PairCommit { Coupled, Incompatible, Rejected };
-  PairCommit commit_pair_halves(int ia, int ib, const PairHalf& ha, const PairHalf& hb, const PairRule& pr) {
+  PairCommit commit_pair_halves(int ia, int ib, const PairHalf& ha, const PairHalf& hb, const PairRule& pr, bool charged = false) {
     if (!halves_clear(ha, hb, pr.required_gap, pr.via_diameter, obs->via_mask())) return PairCommit::Incompatible;
-    if (!half_legal(ha, pr.via_diameter, pr.via_drill) || !half_legal(hb, pr.via_diameter, pr.via_drill))
+    if (!half_legal(ha, pr.via_diameter, pr.via_drill, charged) || !half_legal(hb, pr.via_diameter, pr.via_drill, charged))
       return PairCommit::Rejected;
     commit_half(ia, ha, pr.via_diameter, pr.via_drill);
-    if (!half_legal(hb, pr.via_diameter, pr.via_drill)) {
+    if (!half_legal(hb, pr.via_diameter, pr.via_drill, charged)) {
       lift_items(ia);
       return PairCommit::Rejected;
     }
@@ -2543,7 +2526,7 @@ struct Router::Impl {
     res.pair_attempts.push_back({a.net, c.net,
         {b.pads[static_cast<std::size_t>(a.pad_a)].pos, b.pads[static_cast<std::size_t>(a.pad_b)].pos,
          b.pads[static_cast<std::size_t>(c.pad_a)].pos, b.pads[static_cast<std::size_t>(c.pad_b)].pos},
-        phase, cleanup, ok, res.pair_work - before, ok ? "coupled" : RouteResult::Unrouted::classify(pair_why), (ok ? "coupled" : pair_why) + pair_tag});
+        phase, cleanup, ok, res.pair_work - before, ok ? "coupled" : RouteResult::Unrouted::classify(pair_why), pair_why + pair_tag});
     if (ok) ++res.pair_successes;
     return ok;
   }
@@ -2560,22 +2543,20 @@ struct Router::Impl {
     for (int l = 0; l < nl; ++l)
       if (layer_ok(A.net, l) && layer_ok(B.net, l)) allowed |= model::layer_bit(l);
     const model::LayerMask s_layers = pa1.copper & pb1.copper & allowed, e_layers = pa2.copper & pb2.copper & allowed;
-    // Orientation is diagnostic, not a proof of failure: legal layer twists can swap the halves.
+    // Diagnostics (TM_DEBUG_PAIRS): the two situations the coupled search does not handle (doc 05 §15, §24).
     pair_tag.clear();
     {
       const Point s{(pa1.pos.x + pb1.pos.x) / 2, (pa1.pos.y + pb1.pos.y) / 2}, e{(pa2.pos.x + pb2.pos.x) / 2, (pa2.pos.y + pb2.pos.y) / 2};
       const auto side = [&](Point p, Point q) { return geom::orient(s, e, Point{e.x + (q.x - p.x), e.y + (q.y - p.y)}); };
       const auto s1 = side(pa1.pos, pb1.pos), s2 = side(pa2.pos, pb2.pos);
       if ((s1 > 0 && s2 < 0) || (s1 < 0 && s2 > 0)) pair_tag += " [pin order mirrored between the ends]";
-      for (std::size_t k = 0; k < cs.size(); ++k) {
-        if (!pair_check_work()) { pair_why = "out of budget"; return false; }
+      for (std::size_t k = 0; k < cs.size(); ++k)
         if (static_cast<int>(k) != ia && static_cast<int>(k) != ib && cs[k].routed && !cs[k].items.empty() && (cs[k].c.net == A.net || cs[k].c.net == B.net) &&
             (cs[k].c.pad_a == A.pad_a || cs[k].c.pad_a == A.pad_b || cs[k].c.pad_b == A.pad_a || cs[k].c.pad_b == A.pad_b || cs[k].c.pad_a == B.pad_a ||
              cs[k].c.pad_a == B.pad_b || cs[k].c.pad_b == B.pad_a || cs[k].c.pad_b == B.pad_b)) {
           pair_tag += " [an end pad already carries routed copper]";
           break;
         }
-      }
     }
     if (!s_layers || !e_layers) { pair_why = "no common layer at an end"; return false; }
     // A pin of another net between the two pins of an end (the ground pin between P and N on HDMI connectors and
@@ -2583,25 +2564,16 @@ struct Router::Impl {
     // pair that boxes in a pin which could escape before is taken back (below).
     std::vector<int> straddled;
     if (pad_routed_here.size() != b.pads.size()) {
-      std::vector<std::uint8_t> routed_here;
-      routed_here.reserve(b.pads.size());
-      for (std::size_t pi = 0; pi < b.pads.size(); ++pi) {
-        if (!pair_check_work()) { pair_why = "out of budget"; return false; }
-        routed_here.push_back(0);
-      }
-      for (const auto& st : cs) {
-        if (!pair_check_work()) { pair_why = "out of budget"; return false; }
+      pad_routed_here.assign(b.pads.size(), 0);
+      for (const auto& st : cs)
         for (int pd : {st.c.pad_a, st.c.pad_b})
-          if (pd >= 0) routed_here[static_cast<std::size_t>(pd)] = 1;
-      }
-      pad_routed_here = std::move(routed_here);
+          if (pd >= 0) pad_routed_here[static_cast<std::size_t>(pd)] = 1;
     }
     for (const auto& [p1, p2] : {std::pair{&pa1, &pb1}, std::pair{&pa2, &pb2}}) {
       const double dx = static_cast<double>(p2->pos.x - p1->pos.x), dy = static_cast<double>(p2->pos.y - p1->pos.y), L2 = dx * dx + dy * dy;
       for (const int fp : {p1->footprint, p2->footprint}) {
         if (fp < 0 || L2 <= 0) continue;
         for (const int pi : b.footprints[static_cast<std::size_t>(fp)].pads) {
-          if (!pair_check_work()) { pair_why = "out of budget"; return false; }
           const auto& q = b.pads[static_cast<std::size_t>(pi)];
           if (q.net == A.net || q.net == B.net || q.net == 0 || !pad_routed_here[static_cast<std::size_t>(pi)] || !(q.copper & p1->copper & p2->copper)) continue;
           const double qx = static_cast<double>(q.pos.x - p1->pos.x), qy = static_cast<double>(q.pos.y - p1->pos.y);
@@ -2612,10 +2584,7 @@ struct Router::Impl {
       }
     }
     std::vector<std::uint8_t> boxed_before;
-    for (const int pi : straddled) {
-      boxed_before.push_back(pin_boxed_in(pi) ? 1 : 0);
-      if (out_of_budget()) { pair_why = "out of budget"; return false; }
-    }
+    for (const int pi : straddled) boxed_before.push_back(pin_boxed_in(pi) ? 1 : 0);
     const PairRule pr = pair_rule(b, rules, obs->rules(), A.net, B.net, obs->via_mask());
     const Coord w = pr.width;
     const double off = static_cast<double>(pr.offset);
@@ -2623,15 +2592,13 @@ struct Router::Impl {
     const Point E{(pa2.pos.x + pb2.pos.x) / 2, (pa2.pos.y + pb2.pos.y) / 2};
     const double se = d(S, E);
     auto finish = [&] {
-      for (std::size_t k = 0; k < straddled.size(); ++k) {
-        const bool boxed = !boxed_before[k] && pin_boxed_in(straddled[k]);
-        if (boxed || out_of_budget()) {
+      for (std::size_t k = 0; k < straddled.size(); ++k)
+        if (!boxed_before[k] && pin_boxed_in(straddled[k])) {
           lift_items(ia);
           lift_items(ib);
-          pair_why = boxed ? "would enclose pin " + pad_label(straddled[k]) + " between the halves" : "out of budget";
+          pair_why = "would enclose pin " + pad_label(straddled[k]) + " between the halves";
           return false;
         }
-      }
       for (int ci : {ia, ib}) {
         auto& st = cs[static_cast<std::size_t>(ci)];
         st.deps.clear();
@@ -2657,7 +2624,7 @@ struct Router::Impl {
         if (!(s_layers & e_layers & model::layer_bit(layer))) continue;
         for (double fraction : {0.15, 0.25, 0.35})
           for (double side : {1.0, -1.0}) {
-            if (!pair_check_work()) { pair_why = "out of budget"; return false; }
+            if (out_of_budget()) { pair_why = "out of budget"; return false; }
             const Point start = offset_point(S, u, se * fraction), end = offset_point(E, u, -se * fraction);
             const Point xa = offset_point(start, n, side * off), xb = offset_point(start, n, -side * off);
             const Point ya = offset_point(end, n, side * off), yb = offset_point(end, n, -side * off);
@@ -2669,7 +2636,7 @@ struct Router::Impl {
               if (!(p == q)) ha.segs.push_back({layer, {p, q, w}});
             for (const auto& [p, q] : {std::pair{pb1.pos, xb}, std::pair{xb, yb}, std::pair{yb, pb2.pos}})
               if (!(p == q)) hb.segs.push_back({layer, {p, q, w}});
-            if (commit_pair_halves(ia, ib, ha, hb, pr) == PairCommit::Coupled) return finish();
+            if (commit_pair_halves(ia, ib, ha, hb, pr, true) == PairCommit::Coupled) return finish();
           }
       }
       if (out_of_budget()) pair_why = "out of budget";
@@ -2774,11 +2741,9 @@ struct Router::Impl {
       const int gy0 = std::max(wy0, to_iy(S.y - static_cast<Coord>(Rs))), gy1 = std::min(wy1, to_iy(S.y + static_cast<Coord>(Rs)));
       for (int gy = gy0; gy <= gy1; ++gy)
         for (int gx = gx0; gx <= gx1; ++gx) {
-          if (!pair_check_work()) { pair_why = "out of budget"; return false; }
           const Point c = at(gx, gy);
           if (d(c, S) > Rs) continue;
           for (int dd = 0; dd < 8; ++dd) {
-            if (!pair_check_work()) { pair_why = "out of budget"; return false; }
             const Dir2 n = left_normal(dd);
             const Point L = offset_point(c, n, off), Rt = offset_point(c, n, -off);
             const double c0 = d(pa1.pos, L) + d(pb1.pos, Rt), c1 = d(pa1.pos, Rt) + d(pb1.pos, L);
@@ -2790,13 +2755,13 @@ struct Router::Impl {
           }
         }
     }
-    // Directly charged work includes candidate/guidance construction and every exact comparison.
-    // Closed states are also charged here; the local state cap remains independent of auxiliary work.
+    // Work units of this attempt (rule 5): closed states and exact leg checks of start and goal candidates. Rejected
+    // candidates are not free: with every leg blocked by fill polygons an attempt once ran minutes at zero counted work.
     long expanded = 0, leg_checks = 0, charged = 0;
     bool stopped = false;
     // Charges the work done since the last call to the router's total, so the work budget sees it during the attempt.
     auto charge = [&] {
-      const long now = expanded;
+      const long now = expanded + leg_checks;
       res.expansions += now - charged;
       res.pair_work += now - charged;
       wc().expansions += now - charged;
@@ -2804,7 +2769,7 @@ struct Router::Impl {
     };
     auto poll_leg = [&] {
       charge();
-      if (stopped || !pair_check_work()) { stopped = true; return false; }
+      if (stopped || out_of_budget()) { stopped = true; return false; }
       ++leg_checks;
       return true;
     };
@@ -2824,16 +2789,16 @@ struct Router::Impl {
       const double run = static_cast<double>(K * pitch) * (at_start ? 1.0 : -1.0);
       const std::array<Point, 2> run_a{XA, offset_point(XA, u, run)}, run_b{XB, offset_point(XB, u, run)};
       PairLegCandidates candidates_a;
-      if (!make_leg_candidates(candidates_a, at_start ? pa1 : pa2, XA, a, n, cd.l, A.net, w)) { stopped = true; return false; }
+      make_leg_candidates(candidates_a, at_start ? pa1 : pa2, XA, a, n, cd.l, A.net, w);
       std::optional<PairLegCandidates> candidates_b;
       std::optional<PairLeg> lb;
       auto la = pair_leg(candidates_a, cd.l, A.net, run_b, w, pr.required_gap, poll_leg, [&](const LegCandidate& candidate_a, Coord wa) {
         if (!candidates_b) {
           candidates_b.emplace();
-          if (!make_leg_candidates(*candidates_b, at_start ? pb1 : pb2, XB, a, n, cd.l, B.net, w)) { stopped = true; return false; }
+          make_leg_candidates(*candidates_b, at_start ? pb1 : pb2, XB, a, n, cd.l, B.net, w);
         }
         lb = pair_leg(*candidates_b, cd.l, B.net, run_a, w, pr.required_gap, poll_leg, [&](const LegCandidate& candidate_b, Coord wb) {
-          return legs_clear(candidate_a.points(), wa, candidate_b.points(), wb, pr.required_gap, poll_leg);
+          return legs_clear(candidate_a.points(), wa, candidate_b.points(), wb, pr.required_gap);
         });
         return lb.has_value();
       });
@@ -2854,12 +2819,7 @@ struct Router::Impl {
       }
       pq.push({g + hcost(c, l), seq++, 0, k});
     };
-    auto seg_ok = [&](Point p, Point q, int l, NetId net) {
-      return p == q || (poll_leg() && layer_ok(net, l) && obs->segment_state(p, q, l, w, net, false, nullptr) == 0);
-    };
-    auto via_ok = [&](Point p, NetId net) {
-      return poll_leg() && obs->via_state(p, pr.via_diameter, pr.via_drill, net, 0, false, nullptr) == 0;
-    };
+    auto seg_ok = [&](Point p, Point q, int l, NetId net) { return p == q || (layer_ok(net, l) && obs->segment_state(p, q, l, w, net, false, nullptr) == 0); };
     auto delta = [&](int dd, int k, int& gx, int& gy) {
       gx += k * kDx[dd];
       gy += k * kDy[dd];
@@ -2868,7 +2828,6 @@ struct Router::Impl {
     auto build = [&](const Cand& goal, PairHalf& ha, PairHalf& hb) {
       std::vector<std::uint64_t> chain;
       for (std::uint64_t k = goal.node;; k = nodes.at(k).parent) {
-        if (!poll_leg()) return false;
         chain.push_back(k);
         if (nodes.at(k).move == kStart) break;
       }
@@ -2890,7 +2849,6 @@ struct Router::Impl {
         };
         for (std::size_t i = 1; i < ls.pts.size(); ++i) to(ls.pts[i], ls.w);
         for (std::size_t i = 1; i < chain.size(); ++i) {
-          if (!poll_leg()) return false;
           const Dec p = decode(chain[i - 1]), q = decode(chain[i]);
           const Point cp = at(p.gx, p.gy), cq = at(q.gx, q.gy);
           const std::uint8_t mv = nodes.at(chain[i]).move;
@@ -2937,7 +2895,6 @@ struct Router::Impl {
         // Merge collinear runs of one layer and width.
         std::vector<std::pair<int, PairSeg>> merged;
         for (const auto& [l, s] : h.segs) {
-          if (!poll_leg()) return false;
           if (!merged.empty()) {
             auto& [ml, m] = merged.back();
             if (ml == l && m.w == s.w && m.b == s.a && geom::orient(m.a, m.b, s.b) == 0 &&
@@ -2950,7 +2907,6 @@ struct Router::Impl {
         }
         h.segs = std::move(merged);
       }
-      return true;
     };
 
     // Search budget: in proportion to the pair's length in lattice steps (short pairs that cannot couple fail fast).
@@ -2968,7 +2924,6 @@ struct Router::Impl {
     // reached goals rather than discard a finish queued on the last expansion.
     std::priority_queue<QE, std::vector<QE>, std::greater<>> gq;
     while ((expanded < cap || !gq.empty()) && !done && !stopped) {
-      if (!poll_leg()) break;  // heap entries and rejected candidates are work, not only closed states
       // Every 64 steps (one candidate or state each) the attempt's work joins the total and the budget is checked:
       // deterministic under a work budget, and the time limit stops a long attempt instead of waiting for it.
       if ((++iterations & 63) == 0) {
@@ -2995,18 +2950,14 @@ struct Router::Impl {
         }
         if (pr.max_uncoupled) {
           std::uint64_t k = cd.node;
-          while (nodes.at(k).move != kStart) {
-            if (!poll_leg()) break;
-            k = nodes.at(k).parent;
-          }
-          if (stopped) break;
+          while (nodes.at(k).move != kStart) k = nodes.at(k).parent;
           const Cand& s0 = starts[static_cast<std::size_t>(nodes.at(k).start)];
           const double lim = static_cast<double>(*pr.max_uncoupled);
           if (s0.la.len + cd.la.len > lim || s0.lb.len + cd.lb.len > lim) continue;
         }
         ha = PairHalf{};
         hb = PairHalf{};
-        if (!build(cd, ha, hb)) break;
+        build(cd, ha, hb);
         const auto committed = commit_pair_halves(ia, ib, ha, hb, pr);
         if (committed == PairCommit::Incompatible) continue;
         if (committed == PairCommit::Coupled) {
@@ -3117,7 +3068,7 @@ struct Router::Impl {
               const Point P = offset_point(c, n, sg * off);
               const Point V = offset_point(offset_point(c, u, hj), n, sg * static_cast<double>(pr.via_offset));
               const Point Q = offset_point(offset_point(c, u, 2 * hj), n, sg * off);
-              good = seg_ok(P, V, x.l, net) && via_ok(V, net) && seg_ok(V, Q, l2, net) &&
+              good = seg_ok(P, V, x.l, net) && obs->via_state(V, pr.via_diameter, pr.via_drill, net, 0, false, nullptr) == 0 && seg_ok(V, Q, l2, net) &&
                      seg_ok(Q, offset_point(c2, n, sg * off), l2, net);
             }
             if (good) relax(key(l2, gx, gy, x.dd, x.s), g + MV * steplen(x.dd, l2) + via_pair_cost, q.id, -1, kVia, c2, l2);
@@ -3138,12 +3089,12 @@ struct Router::Impl {
             const Point VR = pt(hj, -vo), VL = pt(hj + 2.0 * twD, -vo);
             const bool good =
                 // right half
-                seg_ok(pt(0, -off), VR, x.l, nr_) && via_ok(VR, nr_) &&
+                seg_ok(pt(0, -off), VR, x.l, nr_) && obs->via_state(VR, pr.via_diameter, pr.via_drill, nr_, 0, false, nullptr) == 0 &&
                 seg_ok(VR, pt(hj + twD / 2, -vo), l2, nr_) && seg_ok(pt(hj + twD / 2, -vo), pt(hj + 1.5 * twD, off), l2, nr_) &&
                 seg_ok(pt(hj + 1.5 * twD, off), pt(twT, off), l2, nr_) && seg_ok(pt(twT, off), offset_point(c2, n, off), l2, nr_) &&
                 // left half
                 seg_ok(pt(0, off), pt(hj + twD / 2, off), x.l, nl_) && seg_ok(pt(hj + twD / 2, off), pt(hj + 1.5 * twD, -vo), x.l, nl_) &&
-                seg_ok(pt(hj + 1.5 * twD, -vo), VL, x.l, nl_) && via_ok(VL, nl_) &&
+                seg_ok(pt(hj + 1.5 * twD, -vo), VL, x.l, nl_) && obs->via_state(VL, pr.via_diameter, pr.via_drill, nl_, 0, false, nullptr) == 0 &&
                 seg_ok(VL, pt(twT, -off), l2, nl_) && seg_ok(pt(twT, -off), offset_point(c2, n, -off), l2, nl_);
             // Dearer than a plain via pair by its uncoupled length: used only where the pin order calls for it.
             if (good)
@@ -3209,23 +3160,10 @@ struct Router::Impl {
     return saved;
   }
   int route_diff_pairs(bool recouple = false) {
-    const long before = res.expansions;
-    if (!recouple && opt.work_budget > 0) {
-      const long allowance = std::max(1L, opt.work_budget / 10);
-      if (first_pair_work >= allowance) return 0;
-      pair_probe_end = res.expansions + allowance - first_pair_work;
-    }
-    const int done = route_diff_pairs_impl(recouple);
-    if (!recouple) first_pair_work += res.expansions - before;
-    pair_probe_end = 0;
-    return done;
-  }
-  int route_diff_pairs_impl(bool recouple) {
     if (!recouple) pair_partner.assign(cs.size(), -1);
     if (pair_retries.size() != cs.size()) pair_retries.assign(cs.size(), 0);
     std::map<NetId, std::vector<int>> by_net;
     for (std::size_t ci = 0; ci < cs.size(); ++ci) {
-      if (!pair_check_work()) return 0;
       const auto& st = cs[ci];
       if (st.c.pad_b < 0) continue;
       // Replacing an anchored trunk would strand its routed children on the old copper.
@@ -3244,7 +3182,6 @@ struct Router::Impl {
     std::vector<PairJob> jobs;
     for (const auto& [na, la] : by_net)
       for (const auto& [nb, lb] : by_net) {
-        if (!pair_check_work()) return done;
         if (na >= nb || !pair_wanted(na, nb)) continue;
         // Pair up connections whose two ends lie close to each other (each half may have several connections).
         std::vector<char> used(lb.size(), 0);
@@ -3253,7 +3190,6 @@ struct Router::Impl {
           int best = -1;
           double bd = 4e6;
           for (std::size_t k = 0; k < lb.size(); ++k) {
-            if (!pair_check_work()) return done;
             if (used[k]) continue;
             const auto& B = cs[static_cast<std::size_t>(lb[k])].c;
             const double d1 = std::max(dist(pos(A.pad_a), pos(B.pad_a)), dist(pos(A.pad_b), pos(B.pad_b)));
@@ -3276,7 +3212,6 @@ struct Router::Impl {
         const auto& p = b.pads[static_cast<std::size_t>(pi)];
         if (p.footprint < 0) continue;
         for (int qi : b.footprints[static_cast<std::size_t>(p.footprint)].pads) {
-          if (!pair_check_work()) return done;
           const auto& q = b.pads[static_cast<std::size_t>(qi)];
           if (q.net == a.net || q.net == c.net || !(q.copper & p.copper)) continue;
           slack = std::min(slack, dist(p.pos, q.pos) - static_cast<double>(std::min(p.size_x, p.size_y) + std::min(q.size_x, q.size_y)) / 2);
@@ -3294,15 +3229,13 @@ struct Router::Impl {
       job.order = {slack, first.footprint, last.footprint, pin, first.pos.y, first.pos.x, last.pos.y, last.pos.x, job.a, job.c};
     }
     std::sort(jobs.begin(), jobs.end(), [](const auto& a, const auto& c) { return a.order < c.order; });
-    if (jobs.empty()) return done;
     if (!recouple) {
-      std::vector<PairExitGuide> guides;
+      pair_exit_guides.clear();
       // A coupled endpoint must also respect the forward escapes of ordinary
       // unrouted nets, not just adjacent differential lanes. This stays a soft
       // cost: a necessary crossing is legal and still checked exactly.
       for (const auto& st : cs) {
         const auto& c = st.c;
-        if (!pair_check_work()) return done;
         if (st.routed || c.pad_b < 0) continue;
         const Coord width = track_width(c.net);
         for (const auto& [pi, qi] : {std::pair{c.pad_a, c.pad_b}, std::pair{c.pad_b, c.pad_a}}) {
@@ -3315,11 +3248,17 @@ struct Router::Impl {
                                       static_cast<double>(candidate.y - p.pos.y) * static_cast<double>(toward.y - p.pos.y);
             if (projection > best_projection) { best_projection = projection; exit = candidate; }
           }
-          if (!(exit == p.pos)) guides.push_back({p.pos, exit, p.copper, c.net, width});
+          if (!(exit == p.pos)) pair_exit_guides.push_back({p.pos, exit, p.copper, c.net, width});
         }
       }
-      pair_exit_guides = std::move(guides);
-      if (!pair_exit_guidance.rebuild(pair_exit_guides, [&] { return pair_check_work(); })) return done;
+    }
+    // Upfront coupling gets at most 10% of fixed work, shared across restarts.
+    // A local ceiling must not mark the whole job stopped.
+    const long before_pairs = res.expansions;
+    if (!recouple && opt.work_budget > 0) {
+      const long allowance = std::max(1L, opt.work_budget / 10);
+      if (first_pair_work >= allowance) return done;
+      pair_probe_end = res.expansions + allowance - first_pair_work;
     }
     for (const auto& job : jobs) {
       if (out_of_budget()) break;
@@ -3349,6 +3288,8 @@ struct Router::Impl {
         ++done;
       }
     }
+    if (!recouple) first_pair_work += res.expansions - before_pairs;
+    pair_probe_end = 0;
     return done;
   }
 

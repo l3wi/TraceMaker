@@ -10,7 +10,6 @@
 #include "drc/rule_engine.hpp"
 #include "io/kicad/board_reader.hpp"
 #include "route/diff_pair.hpp"
-#include "route/pair_exit_guidance.hpp"
 #include "route/router.hpp"
 
 using namespace tmk;
@@ -544,7 +543,7 @@ TEST_CASE("explicit USB pairs remain selected with name detection enabled", "[di
     CHECK(result.pair_successes == 1);
     CHECK(result.pair_attempts[0].coupled);
     CHECK(result.pair_attempts[0].reason == "coupled");
-    CHECK(result.pair_attempts[0].work < result.pair_work);  // pair selection and guidance setup are charged too
+    CHECK(result.pair_attempts[0].work == result.pair_work);
   }
   route::RouterOptions unselected;
   unselected.gpu_device = -1;
@@ -553,89 +552,4 @@ TEST_CASE("explicit USB pairs remain selected with name detection enabled", "[di
   const auto ordinary = route::Router(b, r, unselected).run();
   CHECK(ordinary.pair_attempts.empty());
   CHECK(ordinary.pairs == 0);
-}
-
-TEST_CASE("pair exit guidance index equals linear exact costs and polls growing work", "[diffpair][route]") {
-  std::vector<route::PairExitGuide> guides;
-  for (int i = 0; i < 257; ++i) {
-    const Coord x = static_cast<Coord>((i * 37) % 41 - 20) * 100'000;
-    const Coord y = static_cast<Coord>((i * 17) % 43 - 21) * 100'000;
-    guides.push_back({{x, y}, {x + (i % 3 - 1) * 400'000, y + (i % 5 - 2) * 300'000},
-                      model::layer_bit(i % 2), i % 7 + 1, 150'001 + i % 11});
-  }
-  route::PairExitGuidance index;
-  long setup = 0;
-  REQUIRE(index.rebuild(guides, [&] { ++setup; return true; }));
-  CHECK(setup > static_cast<long>(guides.size()));
-  long indexed_work = 0, linear_work = 0;
-  for (int i = 0; i < 400; ++i) {
-    const Point p{static_cast<Coord>((i * 13) % 61 - 30) * 100'000,
-                  static_cast<Coord>((i * 29) % 59 - 29) * 100'000};
-    const Point q{p.x + (i % 9 - 4) * 120'000, p.y + (i % 7 - 3) * 150'000};
-    auto allow = [](model::NetId net) { return net != 2; };
-    const double indexed = index.cost(guides, p, q, i % 2, 1, 150'003, 100'001, 100'000, true, allow,
-                                       [&] { ++indexed_work; return true; });
-    const double linear = index.cost(guides, p, q, i % 2, 1, 150'003, 100'001, 100'000, false, allow,
-                                      [&] { ++linear_work; return true; });
-    CHECK(indexed == linear);
-  }
-  CHECK(indexed_work < linear_work);
-  for (bool indexed : {false, true}) {
-    long work = 0;
-    const double stopped = index.cost(guides, {-10'000'000, -10'000'000}, {10'000'000, 10'000'000},
-                                      0, 1, 150'000, 100'000, 100'000, indexed,
-                                      [](model::NetId) { return true; }, [&] { return work++ < 3; });
-    CHECK(stopped == -1);
-    CHECK(work == 4);
-  }
-  auto allow = [](model::NetId net) { return net != 2; };
-  const Point p{-500'000, 0}, q{500'000, 0};
-  const double first = index.cost(guides, p, q, 0, 1, 150'003, 100'001, 100'000, true, allow, [] { return true; });
-  long repeated_work = 0;
-  CHECK(index.cost(guides, q, p, 0, 1, 150'003, 100'001, 100'000, true, allow,
-                   [&] { ++repeated_work; return true; }) == first);
-  CHECK(repeated_work == 1);
-  long rebuild_work = 0;
-  CHECK_FALSE(index.rebuild(guides, [&] { return rebuild_work++ < 300; }));
-  const double fallback = index.cost(guides, p, q, 0, 1, 150'003, 100'001, 100'000, true, allow, [] { return true; });
-  CHECK(fallback == first);  // interrupted construction cannot leave a partial index or stale cache
-}
-
-TEST_CASE("indexed pair guidance leaves unlimited router copper identical", "[diffpair][route]") {
-  auto b = fenced_pair();
-  b.tracks.clear();
-  for (const Point pos : {Point{6'000'000, 8'000'000}, Point{34'000'000, 8'000'000}}) {
-    auto pad = b.pads.front();
-    pad.pos = pos;
-    pad.net = 3;
-    pad.size_x = 1'500'000;
-    pad.footprint = static_cast<int>(b.footprints.size());
-    pad.node = sexpr::kNoNode;
-    model::Footprint fp;
-    fp.pos = pos;
-    fp.reference = "SIGNAL" + std::to_string(pad.footprint);
-    fp.pads.push_back(static_cast<int>(b.pads.size()));
-    b.pads.push_back(pad);
-    b.footprints.push_back(std::move(fp));
-  }
-  auto r = rules_with(200'000, false, 0, 0);
-  route::RouterOptions o;
-  o.diff_pairs = true;
-  o.gpu_device = -1;
-  o.optimize = false;
-  o.work_budget = 0;  // acceleration charges less work, so compare without a budget-induced stop
-  const auto indexed = route::Router(b, r, o).run();
-  o.pair_exit_index = false;
-  const auto linear = route::Router(b, r, o).run();
-  REQUIRE(indexed.pairs == 1);
-  CHECK(indexed.routed == linear.routed);
-  REQUIRE(indexed.tracks.size() == linear.tracks.size());
-  REQUIRE(indexed.vias.size() == linear.vias.size());
-  for (std::size_t i = 0; i < indexed.tracks.size(); ++i) {
-    CHECK(indexed.tracks[i].a == linear.tracks[i].a);
-    CHECK(indexed.tracks[i].b == linear.tracks[i].b);
-    CHECK(indexed.tracks[i].width == linear.tracks[i].width);
-    CHECK(indexed.tracks[i].layer == linear.tracks[i].layer);
-    CHECK(indexed.tracks[i].net == linear.tracks[i].net);
-  }
 }

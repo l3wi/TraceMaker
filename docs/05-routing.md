@@ -786,54 +786,6 @@ KiCad 10.0.3 parity failures (`kicad_drc_parity`, `kicad_drc_broken_parity`), ou
 The work-sharing, exact local-inheritance, paired USB, synthetic repair and cached/reference
 geometry checks pass. All 37 benchmark Python tests pass. No commit or push is made.
 
-**Pair CPU/work correction (D160).** The all-net pad-exit guidance introduced in D127
-scanned every guide for every segment of every endpoint candidate, without charging that
-scan. Full-process macOS `sample` on `mechkeys_1800-controller`, with the quick T flags,
-100 M work and one thread, attributes 81.9% of pairreg main-thread CPU samples to
-`pair_exit_cost`, inside the 88.4% spent constructing/checking endpoint legs; total pair
-attempts account for 91.3%. The old binary spends only 4.3% in pair routing, with its
-ordinary and via-cleanup A* searches dominating. Short-taper/final-commit functions are
-not independently resolved in the optimized sample; they are not the dominant branch.
-Raw profiles and exact argument/input evidence are in `bench/profiles/pairperf-20261012/`.
-
-Exit guidance now uses an immutable median-split AABB broad phase, retaining the original
-exact segment-distance predicate, and a bounded 4,096-entry segment-cost cache. Every
-probe input participates in the cache key; rebuilding invalidates it, and an interrupted
-tree build uses the linear reference rather than a partial tree. The linear path remains
-available through `RouterOptions::pair_exit_index = false`. Equality tests include odd
-widths, multiple layers, partner exclusions, reversed segments, interrupted construction,
-repeated costs and unlimited router copper. No query allocates.
-
-Work now includes pair selection/ranking, guide setup/tree visits, candidate enumeration,
-heap entries, joint leg segment comparisons, short taper checks, exact finished-half
-checks, pin-access probes and path reconstruction. All upfront work shares the existing
-10% allowance; no board-specific cap or mirrored-pin rejection is added. Mirrored
-orientation is not a failure proof because twists are supported. Successful attempt
-details now say `coupled`, not the stale `no coupled path` diagnostic. Cleanup re-coupling
-already runs once per job, before the ordinary cleanup rounds: there is no repeated-pass
-retry loop to cache.
-
-The same-input diagnostic routes take 4.40 s (merged), 50.89 s (pairreg), and 5.95 s (D160)
-wall time; these are profiled diagnostic times, **not** the requested tier CPU table.
-All route 166/166 with stop `complete`. D160 consumes the entire 100 M budget, versus
-pairreg's 30.52 M, because previously free work is now counted; surviving coupled routes
-fall 18→3 and cleanup ordinary searches fall 253→0. This is explicitly **not** a
-byte-identical whole-job or pair-quality improvement claim. Pure guidance acceleration
-is checked separately without budget-induced stopping.
-
-Full CTest in `build/agent-PairPerf`: 289 passed, three skipped, only the two existing
-KiCad 10.0.3 parity failures, out of 294 cases. The USB integration keeps its five
-≥80%-coupling/gap assertions and thread-count byte equality; its budget is updated from
-15 M to the quick protocol's 100 M because guidance and joint checks are now charged.
-
-Tier acceptance is not yet established: both requested run invocations fail D145
-preflight on legacy unvalidated preparations. Official preparation scripts were run into
-isolated `build/pairperf-fixtures/` directories, leaving the original fixtures untouched.
-All 30 quick PCB hashes and four everyday-modern PCB hashes (XESC, Framos, universal logic,
-Cynthion) change; rules-sidecar hashes match. Routing those changed inputs was stopped
-instead of presenting an unlike-input comparison as a passing gate. The before/after
-hash evidence is recorded alongside the profiles.
-
 
 
 
