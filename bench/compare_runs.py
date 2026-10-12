@@ -28,7 +28,7 @@ import json
 import pathlib
 import sys
 
-from drc_judge import completion as count_completion
+from drc_judge import ROUTING_IMMUTABLE_TYPES, capped_types, completion as count_completion
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -189,6 +189,34 @@ def stop_reason(run_dir: pathlib.Path, name: str, row: dict) -> str | None:
     return json.loads(route.read_text()).get("stop") if route.exists() else None
 
 
+def evaluated_caps(row):
+    if "capped_evaluated_types" in row:
+        return set(row["capped_evaluated_types"])
+    # Older rejudgments published only the union. Do not infer a missing gate.
+    return set(row.get("capped_types", [])) - ROUTING_IMMUTABLE_TYPES - {"unconnected_items"}
+
+
+def input_caps(row):
+    recorded = set(row.get("capped", {}).get("before", {}))
+    report_path = row.get("judge_reports", {}).get("before")
+    if report_path and pathlib.Path(report_path).is_file():
+        recorded.update(capped_types(read_json(pathlib.Path(report_path))))
+    return recorded
+
+
+def comparable_unknown_gate(before, after):
+    """Inherited censoring is unjudgeable, not evidence of a new regression."""
+    types = evaluated_caps(after)
+    if not types:
+        return None
+    labels = ", ".join(sorted(types))
+    if types <= (input_caps(before) | input_caps(after)):
+        return f"error gate cannot be judged on either run (KiCad already caps {labels} on the input)"
+    if before.get("error_gate") == "unknown" and evaluated_caps(before) == types:
+        return f"error gate cannot be judged on either run (same capped evaluated types: {labels})"
+    return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("before")
@@ -268,7 +296,13 @@ def main() -> int:
         if added:
             failures.append(f"{name}: added DRC errors: {added}")
         if f.get("error_gate") == "unknown":
-            failures.append(f"{name}: DRC error gate unknown; capped types {f.get('capped_types', [])}")
+            inherited = comparable_unknown_gate(b, f)
+            if inherited:
+                metadata_notes.append(f"{name}: {inherited}")
+            else:
+                failures.append(f"{name}: DRC error gate unknown; capped types {sorted(evaluated_caps(f))}")
+        elif b.get("error_gate") == "unknown":
+            metadata_notes.append(f"{name}: baseline error gate unknown; after gate is known")
         if not same and a.expect_identical:
             failures.append(f"{name}: routed board differs")
         dc = cpu_change(b, f)

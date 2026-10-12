@@ -213,6 +213,48 @@ class GateTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('DRC error gate unknown', out)
 
+    def test_same_unknown_evaluated_caps_are_listed_without_failure(self):
+        row = dict(clean=False, completion=.9, stop='exhausted', error_gate='unknown',
+                   capped_evaluated_types=['solder_mask_bridge'], capped_types=['solder_mask_bridge'])
+        code, out = gate({'x': row}, {'x': row})
+        self.assertEqual(code, 0)
+        self.assertIn('error gate cannot be judged on either run', out)
+        self.assertIn('same capped evaluated types: solder_mask_bridge', out)
+
+    def test_input_cap_is_inherited_even_with_a_legacy_known_baseline_marker(self):
+        before = dict(clean=False, completion=.9, error_gate='pass')
+        after = dict(clean=False, completion=.9, error_gate='unknown',
+                     capped_evaluated_types=['solder_mask_bridge'],
+                     capped={'before': {'solder_mask_bridge': 199}, 'after': {'solder_mask_bridge': 199}})
+        code, out = gate({'x': before}, {'x': after})
+        self.assertEqual(code, 0)
+        self.assertIn('KiCad already caps solder_mask_bridge on the input', out)
+
+    def test_known_to_router_introduced_unknown_cap_fails(self):
+        before = dict(clean=False, completion=.9, error_gate='pass')
+        after = dict(clean=False, completion=.9, error_gate='unknown',
+                     capped_evaluated_types=['clearance'], capped={'before': {}, 'after': {'clearance': 499}})
+        code, out = gate({'x': before}, {'x': after})
+        self.assertEqual(code, 1)
+        self.assertIn('DRC error gate unknown', out)
+        self.assertNotIn('cannot be judged on either run', out)
+
+    def test_unknown_to_known_gate_does_not_fail(self):
+        before = dict(clean=False, completion=.9, error_gate='unknown', capped_evaluated_types=['clearance'])
+        after = dict(clean=False, completion=.9, error_gate='pass')
+        code, out = gate({'x': before}, {'x': after})
+        self.assertEqual(code, 0)
+        self.assertIn('baseline error gate unknown; after gate is known', out)
+
+    def test_additional_capped_type_is_not_hidden_by_shared_censoring(self):
+        before = dict(clean=False, completion=.9, error_gate='unknown',
+                      capped_evaluated_types=['solder_mask_bridge'])
+        after = dict(clean=False, completion=.9, error_gate='unknown',
+                     capped_evaluated_types=['solder_mask_bridge', 'clearance'])
+        code, out = gate({'x': before}, {'x': after})
+        self.assertEqual(code, 1)
+        self.assertIn('DRC error gate unknown', out)
+
     def test_invalid_connectivity_judgment_cannot_pass_with_clean_false(self):
         code, out = gate({'x': dict(clean=False, completion=.5)},
                          {'x': dict(judge='failed', clean=False, completion=None,
