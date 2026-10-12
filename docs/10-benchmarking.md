@@ -112,6 +112,7 @@ gates of §5.
 | `--tier`, `--limit`, `--seed` | sample PCBench boards by Freerouting tier instead of a set |
 | `--boards NAME ...` | explicit subset, overriding the set roster for smoke/paired-cohort runs; the set name is still recorded |
 | `--intents DIR` | route with `DIR/<board>.intent.json`; draft missing manifests from the input (doc 05 §45). Freeze and review them before a matched comparison |
+| `--rejudge-human` | explicit in-place rejudgment of an existing `--human --name RUN` result, with the exact same set roster and refill policy; no router results can be reused this way |
 
 **Independent refill and accounting (D116).** Harness `--refill` invokes KiCad, not the engine refill.
 The engine's `--soft-zones` refill/repair (doc 05 §36) informs its final connectivity and exit status, but
@@ -123,6 +124,37 @@ The harness retains whole-job `seconds`, `variant_seconds`, `variants`, route CP
 selected routing pass; `unconnected_after_refill` is its separate engine refill judgment. Repair work is
 charged even if its copper is rejected. No combined-revision validation is claimed by preserving either
 branch's historical measurements below.
+
+**Trustworthy judging and publication (D136–D145).** `drc_judge.py` is the stdlib-only
+violation-instance authority shared by the harness, scorecard and feature evaluators.
+Its multiset identity includes type, severity, physical item description (kind/net/layer,
+without a renamed footprint reference) and positions; UUIDs are fallback identity only
+when positions are absent. Fixing one violation cannot cancel a new one of the same type.
+A16 still gates instances involving a track/via/arc. `added_any` includes every new error;
+`added_nonrouting` publishes pad/zone/other-only instances separately, without ignored types.
+
+If either KiCad unconnected list contains **499 or more** records, `completion` is null
+and `censored` is true, including an output with zero unconnected items against a capped
+input. Summary means exclude those ratios and publish `completion_boards`/`censored_boards`;
+comparisons use the common known-completion cohort and list unknown boards without a
+completion gate. `clean` still requires zero output disconnects and zero added A16 errors.
+Scheduled/attempted/judged counts remain separate: all scheduled boards remain in the
+headline clean-pass denominator, routing costs include failed attempts, infrastructure
+failure makes run.py exit nonzero, and an abnormal router exit cannot be clean.
+
+New runs refuse nonempty directories. `manifest.json` freezes the roster with state
+`running`; atomic final summary and manifest publication set `final`. Consumers refuse
+nonfinal new runs, validate their declared roster, and label old state-less results legacy.
+Run provenance records the binary SHA-256, effective arguments, board/rule/preparation
+manifest hashes, set roster, selection mode and metric schema. DRC caches are addressed
+by board/rule **content**, KiCad version, flags, judge and identity-repair code version,
+not path/mtime/size. Placed boards receive matching sidecars before judging or routing.
+Preparation stages a complete fixture, validates it, then publishes a successful hashed
+`preparation.json`; failures including timeouts mark the fixture invalid. Normal run
+preflight requires that valid manifest and verifies every hash. The explicit historical
+human rejudge path also accepts a successful legacy refill manifest only after verifying
+its input hash and byte-original human source hash; it does not relabel that fixture valid.
+
 
 
 **Sets** (`bench/sets/`):
@@ -156,8 +188,9 @@ between router and original on all eight pairs. The first smoke recorded three `
 `C-BISCUIT_buck-reg-5v`; these were **preparation artifacts, not router defects**: KiCad's legacy conversion gave
 eight zones the same all-zero UUID, confusing keepout areas with other copper zones. Making those IDs unique
 clears the false violations; the preparation path now repairs IDs before its authoritative refill. The protocol
-flags are unchanged. KiCad can similarly misreport keepouts on byte-original human boards whose converted
-zones share zero IDs: preserve originals and report this validity limitation rather than call it a human defect.
+flags are unchanged. The shared private refill path also converts and deterministically repairs
+zero/duplicate UUIDs on human analysis copies before the authoritative refill; byte-original
+humans remain untouched. Human run rejudgments are explicitly recorded rather than hidden.
 The corrected same-budget/same-flag rerun (`d106-fixedids-final-quick`) routes C-BISCUIT 36/47 with 11 unconnected
 and no added errors; its saved KiCad report has **zero** `items_not_allowed`. No router code or flag changed.
 All 65 inputs were re-prepared and scanned after identity repair: **712,149 UUID fields checked, no zero,
@@ -210,10 +243,21 @@ A malformed outline is recorded as `plane_metrics_error`, not silently classifie
 change routing or KiCad judging. Existing metrics and routing arguments are unchanged.
 The measurement/preparation regression tests run with
 `python3 -m unittest discover -s bench -p 'test_*.py'`.
+CTest registers the same discovery as `bench_unittests` (uses `.venv/bin/python` when
+present, explicitly skips with code 77 if Shapely is unavailable), plus stdlib support
+regressions as `harness_support_unittests`. `check_env.py` inspects `TM_BINARY`, or the
+same release default as run.py, never an arbitrary first build. Fixture fetches with
+`TM_FIXTURES=latest` explicitly check out fetched origin HEAD; pinned and latest trees
+are both materialized before preparation, and fetch/checkout failures are not swallowed.
 
 **Comparing.** `bench/compare_runs.py BEFORE AFTER [--expect-identical]` lists every board whose routed output
 differs or got worse, the clean-pass and completion totals and router seconds, and exits 1 if a gate fails.
 When plane metrics are present, it also shows plane/signal unconnected columns for every paired board.
+New provenance mismatches in input/rules, KiCad, judge flags or metric version refuse the gate.
+`--allow-incompatible` is an explicit cross-version-study override, never default sign-off.
+Old runs lacking provenance remain readable with a **legacy provenance** warning, not proof
+of comparability. Full/everyday differences compare the common cohort only when the entire
+delta is exactly that named set's `#slow` boards; all other missing scheduled results fail.
 `--expect-identical` adds "every routed board byte-identical" for speed-ups and refactors. Build the "before"
 binary from the base commit (a clean `origin/main` worktree) and run both on the same machine. Route CPU time is
 printed per board and in total. When both runs used the same `--work`, boards whose output is byte-identical did the
@@ -237,7 +281,7 @@ quieter machine, a second run of one binary can. All of it is a pointer for gate
 | `ses_import.py`, `record_fr.py` | import a Freerouting session; screen-record Freerouting | utilities |
 | `cpu_sample.py` | per-thread CPU sampling from `/proc` | Linux only |
 
-**Not built** (planned in the first version of this document): manifest files, a `standard` (~300 boards) and
+**Not built** (planned in the first version of this document): a `standard` (~300 boards) and
 `full` tier as named sets, `bench/report.py` with an HTML dashboard, and a sign test. The human-parity scorecard
 provides paired-board bootstrap intervals (§9). Seeds: best-of-1 is the headline; best-of-5 is reported separately
 where a comparison needs it (PCBWorld reports baselines as best of 5).
@@ -247,11 +291,16 @@ are refilled (StickHub: 17, 15 and 13); read a change in that type alone as nois
 
 ## 5. Gates (used by the roadmap)
 
-1. No board in `quick` gets worse in clean pass or completion (`compare_runs.py`). Only boards the router
-   finished count: the router's stop reason (`<board>.kicad_pcb.route.json`, `stop`) is `complete` in the after
-   run. A board stopped by its work budget is listed, not gated, because its unconnected count shows where the
-   budget ran out rather than what the change did; a board that finished before and no longer finishes fails (D129).
-2. Zero added KiCad DRC errors on every board that was clean before (`compare_runs.py`).
+1. No board in `quick` gets worse in clean pass or known completion (`compare_runs.py`).
+   Only `stop=work` receives a work-budget exemption (listed, not gated). `complete` and
+   `exhausted` are terminal outcomes and are gated; exhaustion means the router gave up,
+   not that it ran out of work. A `complete`/`exhausted` baseline becoming work-stopped
+   fails. `time`/`deadline` fail as invalid equal-work observations. Unknown/absent stops
+   retain the legacy regression rule, explicitly labelled; no stop is invented from exit code.
+   Human runs are references, not router-regression baselines: parity deficits are visible,
+   not called finished-before regressions (D129).
+2. Zero added A16 KiCad DRC error instances on **every board**, finished or not. New
+   non-routing instances remain separate diagnostics, not silently dropped.
 3. Time within budget on every board (with `--work`, the budget is work units; wall time only stops the job).
 4. Routed boards byte-identical unless the change is meant to change results (`compare_runs.py
    --expect-identical`; then the differences are recorded).
@@ -262,11 +311,50 @@ are refilled (StickHub: 17, 15 and 13); read a change in that type alone as nois
 
 ## 6. Implementation status (2026-10-02; sets, work budgets and refill 2026-10-08, D81)
 
+**Harness audit correction evidence (2026-10-12, KiCad 10.0.3).** The three saved human
+runs were explicitly rejudged **in place**, not rerouted:
+`python3 bench/run.py --set SET --human --refill --full --name human-SET --rejudge-human`.
+All 57 boards judged successfully; all 57 fixture human-source SHA-256 values still
+match preparation records. C-BISCUIT's private human copy repaired eight zero UUIDs;
+its output DRC now has **0 `items_not_allowed`**, versus the previous false 20, and
+45→0 disconnects (100%, formerly 88.89%). Other genuine copper errors remain visible;
+identity repair is not a general clean exemption.
+
+| Saved human run | Clean pass before → after | Mean completion before → after | Known completion / scheduled; capped |
+|---|---:|---:|---:|
+| `human-quick` | 66.67% → 60.00% | 97.91% → 98.28% | 30/30; 0 |
+| `human-mid` | 9.09% → 0.00% | 98.63% → 100.00% | 3/11; 8 |
+| `human-modern-planes` | 81.25% → 81.25% | 99.93% → 99.89% | 10/16; 6 |
+
+The lower clean-pass values are the honest instance/error-policy cutover: same-type
+errors no longer cancel and formerly ignored copper-involving types are visible.
+The mid 100% is **only three uncapped ratios**, not a claim of all-board completion.
+Saved mnt-pocket-reform-wifi DRC reports in
+`pairreg-single10-all-exits-modern-planes-T` expose two **new starved-thermal instances**
+despite six total thermals before and after: `added_any`/`added_nonrouting` now report 2,
+where the old harness reported 0. A16's routed-copper gate remains 0 for these pad/zone reports.
+
+The three requested saved-result comparisons exit 0, with explicit legacy-provenance
+warnings (not new claims of verified experimental compatibility). Corrected paired
+mean-completion figures are:
+
+| Before → after run | Old cap-inclusive mean pair | Correct known-cohort mean pair | Known / paired |
+|---|---:|---:|---:|
+| `merged-quick-T` → `pairreg-single10-all-exits-quick-T` | 99.47% → 99.47% | 99.47% → 99.47% | 30/30 |
+| `dp-modern-200M-T` → `pairreg-single10-all-exits-modern-planes-T` | 88.18% → 90.11% | 90.79% → 92.75% | 10/11 |
+| `nb-mid-200M-T` → `pairreg-single10-all-exits-mid-T` | 81.47% → 84.95% | 78.32% → 79.69% | 3/8 |
+
+The mid comparison now explicitly pairs the eight everyday boards; the full-only
+three slow boards are not lost results. Capped observations are excluded from both
+means. OCuLink's 87.78%→86.67% remains work-stopped on both sides and is listed, not
+quality-gated. No routing outputs were changed for these comparisons.
+
+
 - `bench/run.py` samples PCBench boards per Freerouting tier, routes each with a binary snapshot, judges with
   `kicad-cli pcb drc`, and compares with Freerouting's published per-board results (`benchmarks.json`).
 - Samples: tier A 40 of 453 boards, tier B 40 of 560, tier C 30 of 122, tier D all 22 (seed 1).
-- Added errors count only violations involving a track, via or arc (decision A16); other new KiCad reports are
-  kept as diagnostics.
+- Added errors compare violation-instance multisets; A16 gates only instances involving a
+  track, via or arc, and every other new instance is retained in diagnostics (D137).
 - Results go to `bench/results/<run>/` and the progress site's benchmark panel.
 - Latest (`final8`): tier A 100% clean, B 65.0%, C 56.7%, D 50.0% (Freerouting 2.5.0-RC12: 100%, 50.0%, 46.7%,
   36.4%); no router-introduced DRC errors on any board.
@@ -487,17 +575,20 @@ design copper non-comparable suppress resource, return and plane-aware-cap grade
    Reference labels are removed and UUIDs are fallback identities only when position is absent, so legacy
    conversion and published-reference renaming do not manufacture new defects.
    Unlike the old harness, new non-track errors are included; noisy solder-mask reports require review.
-3. **Small-pad process eligibility:** no via centres inside, or via copper within 0.25 mm of, single-layer SMD
-   pads with minimum dimension below 2 mm (EP candidates excluded). A board whose human uses small-pad
-   via-in-pad is exempt; raw copper/hole clearance counts still publish. Unknown pad geometry is not pass.
-   This is the declared conservative screening profile, not a claim about a filled/capped or tented process.
+3. **Small-pad process eligibility (D150):** retain the human small-pad via-in-pad exemption.
+   Without that exemption, router via-in-pad is forbidden and the router's count of via copper within
+   0.25 mm of single-layer SMD pads below 2 mm must be **no greater than the human count** (EP candidates
+   excluded). Both raw counts, count-parity verdict and the original absolute zero-risk screen are published.
+   Unknown pad geometry is not pass. Human practice is the reference, not fabrication-process certification.
 4. **Thermal preservation:** retain the human's count of same-net vias in nonzero exposed-pad arrays. Explicit
    EP labels and inferred central large GND pads are marked by confidence. This detects lost arrays, not thermal
    sign-off; plating, dissipation and receiving-plane conductance are not inferred.
 
-The gate table shows evaluation coverage, individual passes, eligible boards and censored boards. No category
-improvement compensates for a gate failure. A connected-net absence from a capped DRC list is not connectivity
-proof: its conditional quality is excluded conservatively. The full per-board gate/coverage record is in JSON.
+The schema-2 gate table separates `judge_list_censored` (saturated KiCad lists) from `budget_stopped`
+(`stop=work`), and publishes each board's normalized router stop: complete/work/time/exhausted/unknown.
+Time/deadline observations explicitly invalidate equal-work comparisons. Human originals have no router
+stop and are not regression baselines. No category improvement compensates for a gate failure.
+The full per-board gate/coverage record is in JSON; unknown connectivity never proves a pass.
 
 ### Separate graded categories
 
@@ -539,6 +630,15 @@ For every arm pair, resample paired boards (SHA-256 counter RNG seed 107; 2,000 
 differences, with board win/tie/loss counts. Curated-set intervals measure board sensitivity, not population
 generalisation or routing-seed variance. Compare budgets only on a frozen cross-budget cohort, and publish
 work-stop/runtime diagnostics: budget censoring is not proof of convergence.
+
+
+The all-obligation service view keeps unfinished boards: losses on `stop=work` boards are labelled
+**not delivered at this budget**, not routing infeasibility or a finished-board regression. The separate
+`common_finished` view freezes boards with `complete` or `exhausted` in every router arm, matching §5/D129.
+Router comparisons gate a finished→work change and completion decreases on terminal outcomes; unknown
+stops use the legacy completion rule. Time/deadline makes the comparison invalid rather than silently
+passing. Added DRC remains an all-board check, outside that cohort. JSON and Markdown show cohort names,
+per-arm all-board DRC state and ordered arm-comparison failures.
 
 The noise panel compares the human reference against itself and compares original human fills with identically
 refilled-and-saved human fills. It publishes each metric's self-disagreement and changed/assessable items plus
@@ -589,8 +689,9 @@ stackup certification. Integrated magnetics' internal cable-side nodes are not P
 establish an on-board isolated domain; unsupported reference/isolation declarations remain empty.
 
 Add `--interfaces DIR --profile toradex-2015` to `bench/quality.py` to publish absolute guide-rule
-results alongside unchanged human-parity grades. Without `--profile` no rule/coverage section or new
-fields are emitted. The lazily imported `RULE_MODULES` registry supplies `measure_rules` implementations;
+results alongside unchanged human-parity measurements. Without `--profile` no profile rule/coverage
+fields are emitted; schema-2 stop/process/cohort reporting remains available. The lazily imported
+`RULE_MODULES` registry supplies `measure_rules` implementations;
 each receives the same frozen manifest/profile, fresh fills, connectivity states and analysis board.
 Duplicate rule/application keys are rejected. The human is measured too; human violations remain visible.
 Per-board provenance hashes the interface manifest. Coverage lists interface confidence and physically
@@ -609,9 +710,62 @@ omitted until real stackup data and a validated solver exist. Numeric checks use
 boundary band; integer counts use an exact zero band. These old carrier-board recommendations are
 explicitly opt-in context, not new hard gates or current interface-standard compliance.
 
+Frozen prerequisite fields (D147–D149) are explicit, never drafted from router outputs:
+
+| Rule family | Manifest evidence and actual measurement |
+|---|---|
+| Classified Ethernet/VGA `other_gap` | `aggressor_classes: {class: [net, ...]}` on the interface (or manifest default); distance is measured only to those declared nets. Missing classification is N/A. `unclassified_nearest_gap_mm` remains a separate all-signal diagnostic. |
+| RGB display length | Lane `length_metadata.flex_length_mm` and `cable_length_mm`, both nonnegative (explicit zero is allowed); verdict uses PCB endpoint length plus both external lengths. |
+| I²C length | Lane `length_metadata` declares `length_convention: total_copper`, `device_load_pf`, positive `capacitance_per_mm_pf`, `max_capacitance_pf`, and `cable_length_mm`. Measure every series-connected bus copper branch plus cable; estimated capacitance adds declared device load and must also fit the declared capacitance budget. Publish PCB endpoint length, total PCB copper length and loading separately; unknown connectivity/path identity is N/A. |
+| VGA section length | Lane `length_metadata.filter_ref`, physical `filter_boundary`, and two `section_endpoints`. The boundary must match an endpoint of the declared series inductor and one section endpoint. Measure that unique physical section without crossing the filter, not the whole logical lane. Publish whole PCB and section lengths separately. |
+| Reference gaps | Expand each leg's declared series closure and assess **every** member; sum uncovered length. Missing downstream copper/connectivity/path coverage is N/A, not zero. Arc-containing reference/isolation screens request ≤1 µm chord tessellation explicitly. |
+
+Every active profile publishes **every profile rule** in `profile_coverage`, per board/arm, in JSON and
+Markdown: applied, absent interface family, unknown mode, prerequisite missing, or not applicable.
+Pair-only checks on single-ended lanes have outcome `not_applicable`, separate from N/A and excluded
+from N/A totals. Physical measurement prerequisites remain missing even when the protocol is confirmed.
+Circle parameters for endpoint paths, spacing, exact SI lengths and SI tessellation all use the shared
+translated-coordinate `quality_si._arc_parameters` primitive (D152); >180°, reversed and large-origin
+arcs are cross-consumer regression cases. Modal-gap reduction uses canonical line/arc order, `fsum`,
+and the smallest-bin tie-break (D146).
+
+
 An active profile always publishes interface coverage, including `status: missing` when no manifest
 is supplied or a scheduled board's manifest is absent. Markdown also treats older arms without that
 coverage field as missing, rather than failing report generation.
+
+#### Audit-correction smoke evidence (D146–D152)
+
+The prescribed two-arm `modern-planes` scorecard was rerun after the full human UUID rejudgment:
+`pairreg-single10-all-exits-modern-planes-T` and `dp-modern-200M-T`, reference `human-modern-planes`,
+Toradex-2015 profile and reviewed manifests, four workers, KiCad 10.0.3. Both the isolated `6248b92`
+pre-fix scorecard replay and corrected scorecard measured all 11 everyday boards with zero evaluation
+errors; the arc crash is exercised by the synthetic declared-reference/isolated-domain regression,
+not falsely claimed as an error observed in this particular saved cohort.
+
+| Arm | Before pass / fail / N/A | After pass / fail / N/A / not applicable | Small-pad gate passes before → after |
+|---|---:|---:|---:|
+| Human | 224 / 198 / 373 | 224 / 158 / 381 / 32 | 3 → 9 |
+| Pairreg single10-all-exits | 185 / 174 / 436 | 185 / 134 / 444 / 32 | 4 → 6 |
+| DP 200M | 197 / 175 / 423 | 197 / 135 / 431 / 32 | 5 → 6 |
+
+Each arm's 40 unsupported classified Ethernet failures become N/A, while 32 pair-only single-ended
+applications move from N/A to not applicable. PCB/path measurements and completion percentages are
+unchanged apart from numerical reduction noise. Conditional RGB/I²C/VGA metadata and downstream
+series-gap branches are covered synthetically; this cohort does not establish those absent modes.
+XESC's human/router near-pad counts are 4/1 in pairreg: its new process gate passes, its absolute screen
+still fails, and its electrical gate still fails. No board-name exception is involved.
+
+Eight boards per router arm are work-stopped, distinct from one judge-list-censored board per arm.
+The frozen common-finished cohort is Pocket Reform Wi-Fi, GPS carrier and XESC carrier. The ordered
+pairreg→DP regression comparison fails on the reported all-board added DRC and terminal completion
+decreases; zero evaluation errors does **not** claim this reverse-arm comparison passes.
+
+Arc-bearing human boards are measured, not discarded: `gsg-cynthion` (138 arcs),
+`antmicro-gmsl-deserializer` (356), `antmicro-cm4-lvds-adapter` (176),
+`antmicro-framos-csi-adapter` (80), and `antmicro-m2-oculink-adapter` (8). Exact lengths, pair metrics
+and applicable endpoint length rules are present. Artifacts: `build/quality/audit-before-modern.json`,
+`build/quality/final-modern.json` and matching Markdown reports.
 
 #### Reviewed-input smoke evidence (D135)
 
