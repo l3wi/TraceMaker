@@ -44,6 +44,57 @@ def measure_rules(d, interfaces, profile, ctx):
             results[key] = entry
     return {key: results[key] for key in sorted(results)}
 
+def process_gate(human, router):
+    """Human VIP exemption is unchanged; near-pad practice uses count parity."""
+    exempt = human['via_in_pad'] > 0
+    near_pass = router['via_near_pad_025'] <= human['via_near_pad_025']
+    absolute = (False if router['via_in_pad'] or router['via_near_pad_025'] else
+                None if router['unsupported_pads'] else True)
+    value = (True if exempt else False if router['via_in_pad'] or not near_pass else
+             None if router['unsupported_pads'] or human['unsupported_pads'] else True)
+    return dict(small_pad_manufacturing=value, human_vip_exempt=exempt,
+                near_pad_human_count=human['via_near_pad_025'], near_pad_router_count=router['via_near_pad_025'],
+                near_pad_parity_pass=near_pass, absolute_small_pad_screen_pass=absolute)
+
+
+def router_stop(diagnostic):
+    stop = diagnostic.get('stop')
+    if stop in ('deadline', 'timeout'):
+        return 'time'
+    return stop if stop in ('complete', 'work', 'time', 'exhausted') else 'unknown'
+
+
+def finished_comparison(boards, runs, reference, refs, arms, stops):
+    """D129: finished-only geometry view, all-board DRC and finish-loss decisions."""
+    cohort = sorted(b for b in refs if all(stops[r.name].get(b) in ('complete', 'exhausted') for r in runs))
+    comparisons = []
+    for i, before in enumerate(runs):
+        for after in runs[i+1:]:
+            failures, invalid = [], []
+            for board in boards:
+                a, b = board['runs'].get(str(before)), board['runs'].get(str(after))
+                if not a or not b:
+                    failures.append(dict(board=board['board'], reason='evaluation missing'))
+                    continue
+                if b['judge'].get('drc_pass') is not True:
+                    failures.append(dict(board=board['board'], reason='added DRC or unknown DRC judgment'))
+                if a['router_stop'] == 'time' or b['router_stop'] == 'time':
+                    invalid.append(dict(board=board['board'], reason='time/deadline invalidates equal-work comparison'))
+                elif a['router_stop'] in ('complete', 'exhausted') and b['router_stop'] == 'work':
+                    failures.append(dict(board=board['board'], reason='finished before, no longer finishes'))
+                elif b['router_stop'] in ('complete', 'exhausted', 'unknown'):
+                    ca, cb = a['judge'].get('completion'), b['judge'].get('completion')
+                    if ca is not None and cb is not None and cb < ca:
+                        failures.append(dict(board=board['board'], reason='finished-board completion decreased'))
+            comparisons.append(dict(before=before.name, after=after.name, valid=not invalid,
+                                    pass_gate=False if failures else None if invalid else True,
+                                    failures=failures, invalid=invalid))
+    return dict(boards=cohort, categories=qc.summarize({b:refs[b] for b in cohort},
+                {a:{b:v[b] for b in cohort} for a,v in arms.items()}, stops=stops), comparisons=comparisons,
+                all_board_drc={r.name:{b['board']:b['runs'].get(str(r), {}).get('judge', {}).get('drc_pass')
+                                      for b in boards} for r in runs})
+
+
 def effective_paths(d, manifest, fills, *, _return=True, _graphs=None, _leads=None):
     """Port align.py's lower bound, but require actual contact to the SAME fill island.
 
@@ -312,6 +363,7 @@ def board_job(job):
             judged=io.judge(input_report,report) if input_report is not None else dict(electrical_pass=len(report.get('unconnected_items',[]))==0,
                                                                                      drc_pass=None,completion=None,censored=None,unconnected=len(report.get('unconnected_items',[])),unconnected_nets=sorted({n for u in report.get('unconnected_items',[]) for item in u.get('items',[]) for n in io.bracket_nets(item.get('description',''))}))
             bad_nets = judged['unconnected_nets']
+            judged['judge_list_censored'] = judged.pop('censored', judged.get('judge_list_censored'))
             categories,mfg,coverage=measure(data,manifest,filled,meta,bad_nets,
                                             censored=len(report.get('unconnected_items',[]))>=499,
                                             unconnected_items=report.get('unconnected_items', []),
@@ -333,8 +385,12 @@ def board_job(job):
                                           engine_diagnostic={k:diagnostic.get(k) for k in ('routed','connections','stop','expansions','seconds')},
                                           whole_board=dict(vias=len(data['vias']),track_arc_mm=sum(si.exact_copper_length(data,n) for n in data['nets'])))
             arm = result['runs'][str(run)]
+            arm['router_stop'] = router_stop(diagnostic)
+            arm['budget_stopped'] = arm['router_stop'] == 'work'
+            arm['equal_work_valid'] = arm['router_stop'] != 'time'
             if profile is not None:
                 arm['rules'] = coverage.pop('rules')
+                arm['profile_coverage'] = qr.coverage_inventory(profile, interfaces, arm['rules'])
             if interfaces is not None:
                 arm['interfaces_sha256'] = io.digest(interface_path)
                 arm['provenance']['interfaces_sha256'] = arm['interfaces_sha256']
@@ -393,14 +449,11 @@ def board_job(job):
                             unknown['return_connected'] = None
             missing_arrays={k:dict(human=v['via_count'],router=arm['categories']['thermal'][k].get('via_count')) for k,v in array.items()
                             if arm['categories']['thermal'][k].get('via_count') is None or arm['categories']['thermal'][k]['via_count']<v['via_count']}
-            mfg=arm['manufacturing']; exempt=h['manufacturing']['via_in_pad']>0
-            risky = mfg['via_in_pad'] > 0 or mfg['via_near_pad_025'] > 0
-            process_pass = True if exempt else False if risky else None if mfg['unsupported_pads'] else True
+            process = process_gate(h['manufacturing'], arm['manufacturing'])
             rule_hashes = lambda a: {ext: v['sha256'] for ext,v in a['provenance']['rules'].items()}
             valid = arm['placement_sha256'] == h['placement_sha256'] and rule_hashes(arm) == rule_hashes(h) and input_provenance is not None
             arm['gates']=dict(evaluation_valid=valid,electrical=arm['judge']['electrical_pass'],new_drc=arm['judge']['drc_pass'],
-                               small_pad_manufacturing=process_pass,
-                               human_vip_exempt=exempt,thermal_retained=not missing_arrays,thermal_losses=missing_arrays)
+                               **process, thermal_retained=not missing_arrays, thermal_losses=missing_arrays)
             arm['gates']['eligible']=all(arm['gates'][k] is True for k in ('evaluation_valid','electrical','new_drc','small_pad_manufacturing','thermal_retained'))
         # Original-fill control shares immutable geometry; fill-dependent metrics differ only.
         for category in qc.METRICS:
@@ -430,12 +483,32 @@ def fmt(value):
 def markdown(result):
     lines=['# PCB human-parity scorecard','',f"Reference: `{result['reference']}`. KiCad {result['kicad_version']}; runtime {result['seconds']:.1f} s.",'',
            '## Gates and evaluation coverage','',
-           '| Run | Scheduled | Judged | Valid inputs | Electrical pass | No new DRC | Small-pad process pass | Thermal retained | Eligible | Censored |',
-           '|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
+           '| Run | Scheduled | Judged | Valid inputs | Electrical pass | No new DRC | Small-pad process pass | Thermal retained | Eligible | Judge list censored | Budget stopped |',
+           '|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
     for run,g in result['gates'].items():
-        lines.append('| '+run+' | '+' | '.join(str(g[k]) for k in ('scheduled','judged','evaluation_valid','electrical','new_drc','small_pad_manufacturing','thermal_retained','eligible','censored'))+' |')
+        lines.append('| '+run+' | '+' | '.join(str(g[k]) for k in ('scheduled','judged','evaluation_valid','electrical','new_drc','small_pad_manufacturing','thermal_retained','eligible','judge_list_censored','budget_stopped'))+' |')
     for run,g in result['gates'].items():
         lines.append(f"\nCompletion {run}: macro={fmt(g['completion_macro_pct'])}%, pooled={fmt(g['completion_pooled_pct'])}% on {g['completion_boards']} uncensored nonzero-input boards; {g['already_connected']} already-connected inputs.")
+    lines += ['', '## Router stops and process screens', '',
+              '| Board | Run | Router stop | Budget stopped | Equal-work valid | No new DRC | Human / router near-pad vias | Absolute screen | Human-practice gate |',
+              '|---|---|---|---|---|---|---|---|---|']
+    for board in result['boards']:
+        for run, arm in board['runs'].items():
+            g = arm.get('gates', {})
+            lines.append(f"| {board['board']} | {Path(run).name} | {arm['router_stop']} | {arm['budget_stopped']} | {arm['equal_work_valid']} | {arm['judge'].get('drc_pass')} | {g.get('near_pad_human_count')} / {g.get('near_pad_router_count')} | {g.get('absolute_small_pad_screen_pass')} | {g.get('small_pad_manufacturing')} |")
+    finished = result['common_finished']
+    lines += ['', '## Common-finished regression view', '',
+              'Frozen boards finished in every router arm: '+(', '.join(finished['boards']) or 'none')+'.',
+              'Added DRC is checked on every board; complete/exhausted are finished, finished→work fails, time/deadline invalidates equal-work comparisons, unknown uses the legacy completion rule.',
+              '', '| Category / metric | Run | Macro parity % | Pooled parity % | Wins / ties / losses |',
+              '|---|---|---:|---:|---|']
+    for category, metrics in finished['categories'].items():
+        for metric, entry in metrics.items():
+            for run, views in entry['arms'].items():
+                v = views['all_obligations']
+                lines.append(f"| {category} / {metric} | {run} | {fmt(v['macro_parity_pct'])} | {fmt(v['pooled_parity_pct'])} | {v['win']} / {v['tie']} / {v['loss']} |")
+    for comparison in finished['comparisons']:
+        lines.append(f"\n{comparison['before']} → {comparison['after']}: {'INVALID' if not comparison['valid'] else 'PASS' if comparison['pass_gate'] else 'FAIL'}; "+json.dumps(dict(failures=comparison['failures'], invalid=comparison['invalid'])))
     lines += ['', 'Gate failures cannot be traded for category wins. N/A is not zero defects. Censored completion never uses router planned/routed counts.', '', '## Graded categories', '']
     for category,metrics in result['categories'].items():
         lines += ['### '+category.replace('_',' ').title(),'']
@@ -444,6 +517,7 @@ def markdown(result):
             for run,views in v['arms'].items():
                 c,a=views['common_connected'],views['all_obligations']
                 lines.append(f"| {metric} / {run} | {c['intersection']} | {fmt(c['macro_parity_pct'])} | {fmt(c['pooled_parity_pct'])} | {c['win']} / {c['tie']} / {c['loss']} | {fmt(a['pooled_parity_pct'])} | {a['missing']} | {a['not_assessable']} |")
+                lines.append(f"\n{run}: {a['not_delivered_at_budget']} work-stopped service losses: **not delivered at this budget**, not a finished-board regression.")
             for delta in v['paired_differences']:
                 lines.append(f"\n{metric}: {delta['arm_b']} − {delta['arm_a']} = {fmt(delta['delta_pp'])} macro pp; paired-board 95% bootstrap CI {delta['ci95_pp']}, n={delta['boards']}.")
             worst=[dict(run=run,**item) for run,views in v['arms'].items() for item in views['all_obligations']['worst'][:1]]
@@ -459,6 +533,27 @@ def markdown(result):
         lines += ['', '## Unassessable boards', '', '```json', json.dumps(result['errors'],indent=2), '```']
     if 'rules' in result:
         lines += ['', qr.markdown(result['rules'], list(result['gates'])[1:]).rstrip(),
+                  '## Profile coverage inventory', '',
+                  '| Board | Run | Rule | Applied | Absent interface family | Unknown mode | Prerequisite missing | Not applicable |',
+                  '|---|---|---|---:|---:|---:|---:|---:|']
+        for board in result['boards']:
+            for run, arm in board['runs'].items():
+                for rule, rows in arm.get('profile_coverage', {}).items():
+                    counts = [sum(r['status'] == s for r in rows) for s in
+                              ('applied', 'absent interface family', 'unknown mode', 'prerequisite missing', 'not applicable')]
+                    lines.append(f"| {board['board']} | {Path(run).name} | {rule} | "+' | '.join(map(str, counts))+' |')
+        lines += ['', '## Rule measurements and unclassified diagnostics', '',
+                  '| Board | Run | Rule / item | Verdict | Applied value | PCB endpoint mm | PCB bus copper mm | Section PCB mm | Unclassified nearest gap mm | Reason |',
+                  '|---|---|---|---|---:|---:|---:|---:|---:|---|']
+        for board in result['boards']:
+            for run, arm in board['runs'].items():
+                for entry in arm.get('rules', {}).values():
+                    if 'pcb_length_mm' not in entry and 'unclassified_nearest_gap_mm' not in entry:
+                        continue
+                    cells = [fmt(entry.get(k)) for k in ('value', 'pcb_length_mm', 'pcb_total_copper_mm',
+                                                       'section_pcb_length_mm', 'unclassified_nearest_gap_mm')]
+                    lines.append(f"| {board['board']} | {Path(run).name} | {entry['rule']} / {entry['item']} | {entry['outcome']} | "+' | '.join(cells)+f" | {entry.get('reason') or ''} |")
+        lines += [
                   '## Interface coverage', '',
                   '| Board | Run | Interface | Confidence | Lanes | Not bound |',
                   '|---|---|---|---|---:|---:|']
@@ -494,10 +589,12 @@ def main():
         boards=list(pool.map(board_job,jobs))
     refs={b['board']:b['runs'][str(reference)]['categories'] for b in boards if str(reference) in b['runs']}
     arms={r.name:{b['board']:b['runs'][str(r)]['categories'] for b in boards if str(r) in b['runs']} for r in runs}
+    stops = {r.name:{b['board']:b['runs'][str(r)]['router_stop'] for b in boards if str(r) in b['runs']} for r in runs}
     gates={}
     for run in [reference]+runs:
         rows=[b['runs'][str(run)] for b in boards if str(run) in b['runs']]
-        gates[run.name]=dict(scheduled=len(names),judged=len(rows),censored=sum(bool(r['judge'].get('censored')) for r in rows),
+        gates[run.name]=dict(scheduled=len(names),judged=len(rows),judge_list_censored=sum(bool(r['judge'].get('judge_list_censored')) for r in rows),
+                             budget_stopped=sum(r['budget_stopped'] for r in rows),
                              **{k:sum(r.get('gates',{}).get(k) is True for r in rows) for k in ('evaluation_valid','electrical','new_drc','small_pad_manufacturing','thermal_retained','eligible')})
         judged=[r['judge'] for r in rows if r['judge'].get('completion') is not None]
         denominator=sum(r['common_denominator'] for r in judged)
@@ -512,15 +609,16 @@ def main():
         'Differential nets are name-selected, two-terminal graph-qualified candidates. Coupling uses the human modal gap, not a certified impedance target; skew excludes package/vertical-via delay. Straight parallel spans and concentric circular-arc spans use exact length; mixed line/arc and nonconcentric-arc coupling are not inferred. NetGraph approximates arcs with two chords for connectivity only.',
         'Historical returns screen adjacent broad GND fills. New fields preserve intended net/island identity using frozen manifest references or unambiguous nearest endpoint-IC ground pins on the human. Anchoring means pad connectivity, not earth grounding; power-transfer capacitors and actual return-current fields are not certified. Declared Ethernet isolation is excluded from missing-ground penalties; all-layer projected isolation gaps are not safety/creepage sign-off.',
         'Supply resistance is a 35 um copper series-track diagnostic, not a loaded network: planes and parallel paths are omitted. Neck fraction is length below human median width; class neck length is separate.',
-        'Thermal pads inferred from central geometry are candidates, not datasheet-certified obligations. Retention counts same-net in-pad vias, not receiving-plane thermal conductance. Small-pad exemptions are board-wide when human has via-in-pad; raw counts remain published.',
+        'Thermal pads inferred from central geometry are candidates, not datasheet-certified obligations. Retention counts same-net in-pad vias, not receiving-plane thermal conductance. Human VIP keeps its board-wide exemption; otherwise near-pad count must not exceed human. Raw counts and the absolute zero-risk screen remain published; neither certifies fabrication.',
         'Pad-entry and acute-junction thresholds are prototype craft heuristics, not IPC errors. Unsupported/custom shapes are unassessable; arcs are omitted from pad-entry/acute screens.',
         'Efficiency uses a fixed distinct pad-ID spanning-rank proxy per net, not the router denominator. Beneficial thermal/return vias and tuning copper are not identified as waste. Legacy quick/mid router inputs omit pours, confounding electrical human comparisons.',
         'Bootstrap intervals resample paired boards (seed 107, 2000 draws); they describe curated-set sensitivity, not population confidence or routing-seed variance.',
         'Noise self-control tests deterministic measurement identity, not independent KiCad refill repeatability or systematic model accuracy. Original-fill comparisons are noise controls only and are never graded.',
     ]
     errors={b['board']:b['errors'] for b in boards if b['errors']}
-    result=dict(schema=1,reference=str(reference),runs=[str(r) for r in runs],kicad_version=version,
-                seconds=time.monotonic()-started,gates=gates,categories=qc.summarize(refs,arms),
+    result=dict(schema=2,reference=str(reference),runs=[str(r) for r in runs],kicad_version=version,
+                seconds=time.monotonic()-started,gates=gates,categories=qc.summarize(refs,arms,stops=stops),
+                common_finished=finished_comparison(boards,runs,reference,refs,arms,stops),
                 noise_floor=qc.noise(refs,{b['board']:b.get('original_human',{}) for b in boards}),
                 boards=boards,errors=errors,limits=limits)
     if profile is not None:

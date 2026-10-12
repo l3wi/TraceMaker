@@ -340,17 +340,18 @@ class InterfaceTests(unittest.TestCase):
             self.assertEqual({k:seen[0][1][k] for k in ('fills','complete','board_path')},dict(fills={},complete={},board_path=Path('unused')))
             self.assertEqual(quality.measure(d,{},Path('unused'),{},[],interfaces=manifest)[:2],old[:2])
             self.assertEqual(len(seen),1)
-        # Compare the pre-change implementation's exact serialized measurement and
-        # Markdown bytes against the default path, not just selected metric values.
+        # Preserve default measurement semantics; schema-2 reporting intentionally
+        # adds stop/process/cohort diagnostics and renames judge list censoring.
         legacy_source=subprocess.run(['git','show','e9bc174:bench/quality.py'],check=True,capture_output=True,text=True).stdout
         legacy=types.ModuleType('legacy_quality')
         exec(compile(legacy_source,'legacy_quality.py','exec'),legacy.__dict__)
         with patch.object(quality.si,'all_fills',return_value={}),patch.object(quality.si,'fills',return_value=({},set(),'hash')),patch.object(quality.craft,'measure',return_value=mfg),patch.object(quality.craft,'thermal',return_value={}),patch.object(quality.craft,'power',return_value={}):
             assert_preserves(self,quality.measure(d,{},Path('unused'),{},[]),legacy.measure(d,{},Path('unused'),{},[]))
-        result=dict(reference='human',kicad_version='test',seconds=0,gates={},categories={},noise_floor={},limits=[],errors={},boards=[])
-        self.assertEqual(quality.markdown(result).encode(),legacy.markdown(result).encode())
+        result=dict(reference='human',kicad_version='test',seconds=0,gates={},categories={},noise_floor={},limits=[],errors={},boards=[],
+                    common_finished=dict(boards=[],categories={},comparisons=[]))
+        self.assertIn('Common-finished regression view',quality.markdown(result))
         entry=qr.result(profile['rules'][0],'frozen',.2)
-        result.update(rules=qr.summarize({'b':{qr.key(entry):entry}},{'router':{'b':{qr.key(entry):entry}}}),gates={'human':dict.fromkeys(('scheduled','judged','evaluation_valid','electrical','new_drc','small_pad_manufacturing','thermal_retained','eligible','censored','completion_macro_pct','completion_pooled_pct','completion_boards','already_connected'),0),'router':dict.fromkeys(('scheduled','judged','evaluation_valid','electrical','new_drc','small_pad_manufacturing','thermal_retained','eligible','censored','completion_macro_pct','completion_pooled_pct','completion_boards','already_connected'),0)})
+        result.update(rules=qr.summarize({'b':{qr.key(entry):entry}},{'router':{'b':{qr.key(entry):entry}}}),gates={name:dict.fromkeys(('scheduled','judged','evaluation_valid','electrical','new_drc','small_pad_manufacturing','thermal_retained','eligible','judge_list_censored','budget_stopped','completion_macro_pct','completion_pooled_pct','completion_boards','already_connected'),0) for name in ('human','router')})
         self.assertIn('Layout rule profile',quality.markdown(result))
         self.assertIn('Interface coverage',quality.markdown(result))
 
@@ -399,7 +400,10 @@ class InterfaceTests(unittest.TestCase):
             legacy_source=subprocess.run(['git','show','e9bc174:bench/quality.py'],check=True,capture_output=True,text=True).stdout
             legacy=types.ModuleType('legacy_quality')
             exec(compile(legacy_source,'legacy_quality.py','exec'),legacy.__dict__)
-            assert_preserves(self,default,legacy.board_job(('b',[router],human,None,'test')))
+            old=legacy.board_job(('b',[router],human,None,'test'))
+            for arm in old['runs'].values():
+                arm['judge']['judge_list_censored']=arm['judge'].pop('censored')
+            assert_preserves(self,default,old)
 
 def assert_preserves(case, new, old, path='$'):
     """Every legacy field keeps its exact value; new fields may be added."""

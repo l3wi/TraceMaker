@@ -18,6 +18,7 @@ from shapely.strtree import STRtree
 
 import quality_craft as craft
 import quality_rules as rules
+import quality_si as si
 from intent_quality import in_pad
 
 
@@ -239,23 +240,20 @@ def _arc_line(arc):
     if not all(key in arc for key in ('sx', 'sy', 'mx', 'my', 'ex', 'ey', 'width', 'layer')):
         return None
     first, last = sorted(((arc['sx'], arc['sy']), (arc['ex'], arc['ey'])))
-    middle = (arc['mx']-first[0], arc['my']-first[1])
-    end = (last[0]-first[0], last[1]-first[1])
-    bx, by = middle
-    cx, cy = end
-    determinant = 2*(bx*cy-by*cx)
-    if determinant == 0 or arc['width'] <= 0:
+    if arc['width'] <= 0:
         return None
-    b2, c2 = bx*bx+by*by, cx*cx+cy*cy
-    centre = ((b2*cy-c2*by)/determinant, (bx*c2-cx*b2)/determinant)
-    radius = math.hypot(*centre)
-    angles = [math.atan2(p[1]-centre[1], p[0]-centre[0]) for p in ((0, 0), middle, end)]
-    sweep = (angles[2]-angles[0]) % math.tau
-    if (angles[1]-angles[0]) % math.tau > sweep:
-        sweep -= math.tau
+    canonical = dict(arc, sx=first[0], sy=first[1], ex=last[0], ey=last[1])
+    try:
+        circle = si._arc_parameters(canonical)
+    except ValueError:
+        return None
+    radius = circle['radius']*1e6
+    centre = circle['cx']*1e6-first[0], circle['cy']*1e6-first[1]
+    end = last[0]-first[0], last[1]-first[1]
+    sweep, start = circle['sweep'], circle['start']
     count = max(1, math.ceil(abs(sweep)/(2*math.acos(max(-1, 1-100/radius)))))
-    points = [(first[0]+centre[0]+radius*math.cos(angles[0]+sweep*i/count),
-               first[1]+centre[1]+radius*math.sin(angles[0]+sweep*i/count)) for i in range(count+1)]
+    points = [(first[0]+centre[0]+radius*math.cos(start+sweep*i/count),
+               first[1]+centre[1]+radius*math.sin(start+sweep*i/count)) for i in range(count+1)]
     points[0], points[-1] = first, last
     sign = 1 if sweep > 0 else -1
     tangents = {first: (centre[1]*sign, -centre[0]*sign),
@@ -307,12 +305,8 @@ def _copper(d, fills, meta):
 
 
 def _lane_nets(iface, lane):
-    nets = {n for n in (lane.get('p'), lane.get('n')) if n}
-    while True:
-        added = {s[k] for s in iface.get('series', []) if s['a'] in nets or s['b'] in nets for k in ('a', 'b')}
-        if added <= nets:
-            return nets
-        nets |= added
+    return set().union(*(rules.series_nets(net, iface.get('series', []))
+                         for net in (lane.get('p'), lane.get('n')) if net))
 
 
 def pair_spacing(d, interfaces, ctx, *, indexed=True):
@@ -330,7 +324,7 @@ def pair_spacing(d, interfaces, ctx, *, indexed=True):
     rows, unknown = _copper(d, ctx.get('fills', {}), meta)
     all_lanes = [(f, l) for f in interfaces.get('interfaces', []) for l in f.get('lanes', [])]
     all_lanes.sort(key=lambda x: (x[0]['id'], x[1]['id']))
-    lanes = [(f, l) for f, l in all_lanes if l.get('n')]
+    lanes = all_lanes
     declared = {n for f, l in all_lanes for n in _lane_nets(f, l)}
     def connector_refs(l):
         return {p['ref'] for p in d.get('pads', []) if any(p['net'] == e['net'] and (p['x'], p['y']) == (e['x_nm'], e['y_nm']) for e in l.get('endpoints', []))}
@@ -360,7 +354,10 @@ def pair_spacing(d, interfaces, ctx, *, indexed=True):
             return False
         excluded = sum(excluded_pad(r, s) for r in own if r[2][0] == 'pad'
                        for s in rows if s[0] in others and s[2][0] == 'pad')
-        for measure, target in [('pair_gap_mm', others), ('other_gap_mm', signal_others)]:
+        classes = iface.get('aggressor_classes', interfaces.get('aggressor_classes', {}))
+        targets = [('pair_gap_mm', others), ('other_gap_mm', signal_others)]
+        targets += [('other_gap_class:'+name, set(nets_in_class)-nets) for name, nets_in_class in sorted(classes.items())]
+        for measure, target in targets:
             best = None
             for r in own:
                 pool = layer_rows[r[1]]
@@ -414,9 +411,9 @@ def pair_spacing(d, interfaces, ctx, *, indexed=True):
         reason = ('unknown/incomplete lane connectivity' if any(state.get(n) is not True for n in nets) else
                   'unsupported or missing lane copper geometry' if nets & unknown else
                   'no represented lane copper' if not own else None)
-        reasons = {measure: reason or ('unsupported neighbour copper geometry' if target & unknown else None)
-                   for measure, target in [('pair_gap_mm', others), ('pair_gap_ratio', others),
-                                           ('other_gap_mm', signal_others)]}
+        reasons = {measure: reason or ('unsupported neighbour copper geometry' if target & unknown else
+                                      'declared aggressor net missing from board' if target-set(d['nets']) else None)
+                   for measure, target in targets+[('pair_gap_ratio', others)]}
         out[iface['id']+':'+lane['id']] = dict(gaps, reason=reason, reasons=reasons,
                                              excluded_pad_comparisons=excluded)
     return out
@@ -449,10 +446,27 @@ def measure_rules(d, interfaces, profile, ctx):
                         value = detail.get(measure)
                         reason = detail.get('reasons', {}).get(measure, detail.get('reason', 'not a differential lane'))
                         band = rule.get('band', detail.get('pair_ratio_band', 0.001)) if measure == 'pair_gap_ratio' else rule.get('band', 0.001)
+                        if measure in rules.PAIR_MEASURES and not lane.get('n'):
+                            entry = rules.result(rule, item, None, reason='single-ended lane: pair-only rule')
+                            entry['applicability'] = 'not applicable'
+                            entry['outcome'] = 'not_applicable'
+                            output.append(entry)
+                            continue
+                        if measure == 'other_gap_mm':
+                            classes = iface.get('aggressor_classes', interfaces.get('aggressor_classes', {}))
+                            name = rule.get('aggressor_class')
+                            if name:
+                                key = 'other_gap_class:'+name
+                                value = detail.get(key)
+                                reason = ('frozen aggressor-class net set missing: '+name if name not in classes else
+                                          detail.get('reasons', {}).get(key))
                     if iface.get('confidence') != 'confirmed' or interfaces.get('status') != 'reviewed':
                         reason = 'interface intent not confirmed/reviewed'
                     entry = rules.result(rule, item, None if reason else value, band=band,
                                          reason=reason or ('no eligible geometry/neighbour' if value is None else None))
+                    if measure == 'other_gap_mm':
+                        entry['unclassified_nearest_gap_mm'] = detail.get('other_gap_mm')
+                        entry['aggressor_class'] = rule.get('aggressor_class')
                     if detail:
                         entry['excluded_pad_comparisons'] = detail['excluded_pad_comparisons']
                     output.append(entry)

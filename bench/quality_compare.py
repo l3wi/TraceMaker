@@ -41,7 +41,7 @@ def comparison(human, router, higher, epsilon):
     return ('win' if delta < -epsilon else 'loss' if delta > epsilon else 'tie'), delta
 
 
-def summarize(reference, arms):
+def summarize(reference, arms, *, stops=None):
     """Keep all obligations and a frozen all-arm connected/assessable intersection."""
     output = {}
     for category, metrics in METRICS.items():
@@ -66,7 +66,9 @@ def summarize(reference, arms):
                     for board in boards:
                         hh = reference[board].get(category, {})
                         rr = aa.get(board, {}).get(category, {})
-                        counts = dict(win=0, tie=0, loss=0, missing=0, not_assessable=0, eligible=0)
+                        stop = (stops or {}).get(arm, {}).get(board, 'unknown')
+                        counts = dict(win=0, tie=0, loss=0, missing=0, not_assessable=0, eligible=0,
+                                      not_delivered_at_budget=0, router_stop=stop)
                         deltas = []
                         for key, h in sorted(hh.items()):
                             if h.get(metric) is None or not h.get(connectivity, True):
@@ -89,12 +91,18 @@ def summarize(reference, arms):
                                 continue
                             state, delta = comparison(h[metric], value, higher, epsilon)
                             counts[state] += 1
+                            if state == 'loss' and stop == 'work':
+                                counts['not_delivered_at_budget'] += 1
                             counts['eligible'] += 1
                             if delta is not None:
                                 deltas.append(delta)
                             if state == 'loss':
                                 worst.append(dict(board=board, item=key, human=h[metric], router=value,
-                                                  degradation=delta, missing=value is None))
+                                                  degradation=delta, missing=value is None, router_stop=stop,
+                                                  interpretation='not delivered at this budget' if stop == 'work' else
+                                                  'invalid equal-work observation' if stop == 'time' else
+                                                  'finished-board regression' if stop in ('complete', 'exhausted') else
+                                                  'legacy comparison: router stop unknown'))
                         counts['parity_pct'] = 100 * (counts['win'] + counts['tie']) / counts['eligible'] if counts['eligible'] else None
                         counts['intersection'] = len(common[board])
                         dd = sorted(deltas)
@@ -102,7 +110,7 @@ def summarize(reference, arms):
                                                            p90=dd[int(.9*(len(dd)-1))] if dd else None,
                                                            maximum=max(dd) if dd else None)
                         per_board[board] = counts
-                    sums = {key: sum(v[key] for v in per_board.values()) for key in ('win','tie','loss','missing','not_assessable','eligible')}
+                    sums = {key: sum(v[key] for v in per_board.values()) for key in ('win','tie','loss','missing','not_assessable','eligible','not_delivered_at_budget')}
                     macro = [v['parity_pct'] for v in per_board.values() if v['parity_pct'] is not None]
                     sums.update(macro_parity_pct=statistics.mean(macro) if macro else None,
                                 pooled_parity_pct=100*(sums['win']+sums['tie'])/sums['eligible'] if sums['eligible'] else None,

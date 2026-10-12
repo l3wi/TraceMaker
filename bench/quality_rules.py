@@ -17,7 +17,7 @@ import json
 from pathlib import Path
 
 PROFILES = Path(__file__).resolve().parent/'profiles'
-OUTCOMES = ('pass', 'fail', 'boundary', 'na')
+OUTCOMES = ('pass', 'fail', 'boundary', 'na', 'not_applicable')
 # Geometric uncertainty for millimetre comparisons; integer counts use 0.
 BAND_MM = 0.001
 COMPARATORS = ('<', '<=', '>', '>=')
@@ -93,6 +93,48 @@ def rules_for(profile, interface, measure, mode=None):
     return [r for r in profile['rules'] if r['interface'] in (interface, '*') and r['measure'] == measure
             and r.get('mode') in (None, mode)]
 
+
+def series_nets(net, series):
+    """Frozen per-leg transitive closure; never infer connections from output."""
+    nets = {net}
+    while True:
+        added = {s[k] for s in series if s['a'] in nets or s['b'] in nets for k in ('a', 'b')}
+        if added <= nets:
+            return nets
+        nets |= added
+
+
+PAIR_MEASURES = {'intra_skew_mm', 'segment_skew_mm', 'between_legs_items',
+                 'pair_gap_mm', 'pair_gap_ratio'}
+
+
+def coverage_inventory(profile, manifest, applications):
+    """One row for EVERY profile rule, with per-interface applicability evidence."""
+    inventory = {}
+    interfaces = (manifest or {}).get('interfaces', [])
+    for rule in profile['rules']:
+        family = [f for f in interfaces if rule['interface'] in ('*', f['interface'])]
+        rows = []
+        if not family:
+            rows.append(dict(interface=None, status='absent interface family'))
+        for iface in sorted(family, key=lambda f: f['id']):
+            if rule.get('mode') and iface.get('mode') is None:
+                rows.append(dict(interface=iface['id'], status='unknown mode'))
+                continue
+            if rule.get('mode') not in (None, iface.get('mode')):
+                rows.append(dict(interface=iface['id'], status='not applicable', reason='different declared mode'))
+                continue
+            entries = [a for a in applications.values() if a['rule'] == rule['id']
+                       and (a['item'] == iface['id'] or a['item'].startswith(iface['id']+':'))]
+            if not entries:
+                rows.append(dict(interface=iface['id'], status='not applicable', reason='no applicable lanes/roles'))
+            for entry in entries:
+                rows.append(dict(interface=iface['id'], item=entry['item'],
+                                 status='not applicable' if entry.get('applicability') == 'not applicable' else
+                                 'prerequisite missing' if entry['outcome'] == 'na' else 'applied',
+                                 reason=entry.get('reason')))
+        inventory[rule['id']] = rows
+    return inventory
 
 def load_interfaces(directory, board):
 
@@ -170,9 +212,9 @@ def markdown(summary, arm_names):
     if not summary:
         return ''
     lines = ['## Layout rule profile', '',
-             '| Rule | Limit | Human pass/fail/boundary/n.a. | '+' | '.join(f'{a} pass/fail/boundary/n.a. (fixed, broke)' for a in arm_names)+' |',
+             '| Rule | Limit | Human pass/fail/boundary/n.a./inapplicable | '+' | '.join(f'{a} pass/fail/boundary/n.a./inapplicable (fixed, broke)' for a in arm_names)+' |',
              '|---|---|---|'+'---|'*len(arm_names)]
-    fmt = lambda c: f"{c['pass']}/{c['fail']}/{c['boundary']}/{c['na']}"
+    fmt = lambda c: f"{c['pass']}/{c['fail']}/{c['boundary']}/{c['na']}/{c.get('not_applicable', 0)}"
     for rule, row in summary.items():
         cells = [fmt(row['arms'][a])+f" ({row['arms'][a]['fixed']}, {row['arms'][a]['broke']})" for a in arm_names]
         tag = '' if row['treatment'] == 'rule' else ' (report)'

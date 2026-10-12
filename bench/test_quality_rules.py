@@ -86,7 +86,8 @@ class RuleTests(unittest.TestCase):
                 self.assertEqual(result['errors'], {})
                 self.assertEqual(result['runs'][str(reference)]['coverage']['interfaces']['status'], 'missing')
                 report = dict(reference='human', kicad_version='10', seconds=0, gates={}, categories={},
-                              noise_floor={}, limits=[], errors={}, rules={}, boards=[result])
+                              noise_floor={}, limits=[], errors={}, rules={}, boards=[result],
+                              common_finished=dict(boards=[], categories={}, comparisons=[]))
                 self.assertIn('| b | human | missing | N/A | 0 | N/A |', quality.markdown(report))
                 # Old cached arms may predate coverage publication.
                 result['runs'][str(reference)]['coverage'].pop('interfaces')
@@ -102,9 +103,9 @@ class RuleTests(unittest.TestCase):
                 rr = rules.result(SKEW, item, r)
                 router['b'][rules.key(rr)] = rr
         row = rules.summarize(human, {'T': router})['pcie.intra_skew']
-        self.assertEqual(row['human'], dict(**{'pass': 2, 'fail': 2, 'boundary': 0, 'na': 0}))
-        self.assertEqual(row['arms']['T'], {'pass': 1, 'fail': 2, 'boundary': 0, 'na': 1, 'fixed': 1, 'broke': 1, 'both_fail': 1})
-        self.assertIn('| pcie.intra_skew | < 0.15 | 2/2/0/0 | 1/2/0/1 (1, 1) |', rules.markdown(rules.summarize(human, {'T': router}), ['T']))
+        self.assertEqual(row['human'], dict(**{'pass': 2, 'fail': 2, 'boundary': 0, 'na': 0, 'not_applicable': 0}))
+        self.assertEqual(row['arms']['T'], {'pass': 1, 'fail': 2, 'boundary': 0, 'na': 1, 'not_applicable': 0, 'fixed': 1, 'broke': 1, 'both_fail': 1})
+        self.assertIn('| pcie.intra_skew | < 0.15 | 2/2/0/0/0 | 1/2/0/1/0 (1, 1) |', rules.markdown(rules.summarize(human, {'T': router}), ['T']))
 
 
 if __name__ == '__main__':

@@ -100,16 +100,8 @@ def reference_bindings(interfaces):
     for iface in (interfaces or {}).get('interfaces', []):
         isolated.update(iface.get('isolated_nets', []))
         for lane in iface['lanes']:
-            nets = {lane.get('p'), lane.get('n')}
-            # Declared series sections are part of the same reference obligation.
-            changed = True
-            while changed:
-                changed = False
-                for series in iface.get('series', []):
-                    if series['a'] in nets or series['b'] in nets:
-                        before = len(nets)
-                        nets.update((series['a'], series['b']))
-                        changed |= len(nets) != before
+            nets = set().union(*(rules.series_nets(net, iface.get('series', []))
+                                 for net in (lane.get('p'), lane.get('n')) if net))
             for net in sorted(n for n in nets if n):
                 value = sorted(set(iface.get('reference_nets', []))) or None
                 if iface.get('confidence') != 'confirmed':
@@ -133,7 +125,7 @@ def domain_metrics(d, net, fills, broad, references, *, grounded=None, segments=
     identities = islands(fills)
     grounded = grounded_islands(d, fills) if grounded is None else grounded
     layers = d['copper_layers']
-    lines = si.segs(d, net) if segments is None else segments
+    lines = si.segs(d, net, tessellate_arcs=True) if segments is None else segments
     totals = [[], [], []]
     coverage = {}
     reference_layers = broad | {k[1] for k in identities if k[0] in references}
@@ -172,7 +164,7 @@ def isolation_gap(d, fills, isolated):
     for (net, _), fill in sorted(fills.items()):
         copper[net in isolated].append(fill)
     for net in sorted(d['nets']):
-        for s in si.segs(d, net):
+        for s in si.segs(d, net, tessellate_arcs=True):
             copper[net in isolated].append(copper_buffer(LineString([(s['sx'], s['sy']), (s['ex'], s['ey'])]), s['width']/2))
     for v in d['vias']:
         copper[v['net'] in isolated].append(copper_buffer(Point(v['x']/1e6, v['y']/1e6), v['size']/2e6))
@@ -230,15 +222,24 @@ def measure_rules(d, interfaces, profile, ctx):
                     value = None
                     if iface.get('confidence') != 'confirmed':
                         reason = 'interface not confirmed'
-                    elif ctx['complete'].get(net) is not True:
-                        reason = 'signal connectivity incomplete or unknown'
                     else:
-                        segments = ctx.get('lane_segments', {}).get(net) if 'lane_segments' in ctx else None
-                        if 'lane_segments' in ctx and segments is None:
-                            reason = 'endpoint path unavailable'
-                        else:
-                            r = domain_metrics(d, net, fills, broad, iface.get('reference_nets'), grounded=grounded,
+                        members = rules.series_nets(net, iface.get('series', []))
+                        values = []
+                        for member in sorted(members):
+                            if ctx['complete'].get(member) is not True:
+                                reason = 'series section connectivity incomplete or unknown: '+member
+                                break
+                            segments = ctx.get('lane_segments', {}).get(member) if 'lane_segments' in ctx else None
+                            if 'lane_segments' in ctx and segments is None:
+                                reason = 'endpoint path unavailable for series section: '+member
+                                break
+                            r = domain_metrics(d, member, fills, broad, iface.get('reference_nets'), grounded=grounded,
                                                segments=segments, isolated=isolated)
-                            value, reason = r['reference_uncovered_mm'], r['reference_reason']
+                            if r['reference_uncovered_mm'] is None:
+                                reason = 'series section '+member+': '+r['reference_reason']
+                                break
+                            values.append(r['reference_uncovered_mm'])
+                        if reason is None:
+                            value = math.fsum(values)
                     out.append(rules.result(rule, iface['id']+':'+lane['id']+':'+net, value, reason=reason))
     return out

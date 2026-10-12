@@ -36,21 +36,12 @@ class _Curve:
             self.a, self.b = self.b, self.a
         self.arc = arc
         if arc:
-            ax, ay = self.a
-            bx, by = item['mx'], item['my']
-            cx, cy = self.b
-            det = 2 * (ax*(by-cy) + bx*(cy-ay) + cx*(ay-by))
-            if det == 0:
-                raise ValueError('collinear arc')
-            aa, bb, cc = ax*ax+ay*ay, bx*bx+by*by, cx*cx+cy*cy
-            self.c = ((aa*(by-cy)+bb*(cy-ay)+cc*(ay-by))/det,
-                      (aa*(cx-bx)+bb*(ax-cx)+cc*(bx-ax))/det)
-            self.r = math.dist(self.a, self.c)
-            self.angle = math.atan2(ay-self.c[1], ax-self.c[0])
-            self.sweep = (math.atan2(cy-self.c[1], cx-self.c[0])-self.angle) % math.tau
-            if (math.atan2(by-self.c[1], bx-self.c[0])-self.angle) % math.tau > self.sweep:
-                self.sweep -= math.tau
-            self.length = self.r * abs(self.sweep)
+            canonical = dict(item, sx=self.a[0], sy=self.a[1], ex=self.b[0], ey=self.b[1])
+            circle = si._arc_parameters(canonical)
+            self.c = circle['cx']*NM, circle['cy']*NM
+            self.r = circle['radius']*NM
+            self.angle, self.sweep = circle['start'], circle['sweep']
+            self.length = self.r*abs(self.sweep)
         else:
             self.length = math.dist(self.a, self.b)
         self.cuts = {0.0, 1.0}
@@ -152,13 +143,6 @@ def _pad_contact(p, xy, margin=0, info=None):
     return core.distance(Point(xy[0]/NM, xy[1]/NM)) <= radius+margin/NM
 
 
-def _closure(net, series):
-    nets = {net}
-    while True:
-        more = {s[k] for s in series if s['a'] in nets or s['b'] in nets for k in ('a', 'b')}
-        if more <= nets:
-            return nets
-        nets |= more
 
 
 def _binding(p, e):
@@ -175,7 +159,7 @@ def endpoint_path(d, net, endpoints, series=(), *, pad_metadata=None):
     """
     def na(reason):
         return dict(length_mm=None, stub_mm=None, transitions=None, vias=None, reason=reason)
-    nets = _closure(net, series)
+    nets = rules.series_nets(net, series)
     series_ends = [e for s in series for e in s.get('endpoints', [])]
     ends = [e for e in endpoints if e.get('net') in nets
             and not any(e == inner for inner in series_ends)]
@@ -444,7 +428,7 @@ def _lane_endpoints(d, lane, series):
     if not lane.get('n'):
         return endpoints
     inner = [e for s in series for e in s.get('endpoints', [])]
-    legs = [[e for e in endpoints if e.get('net') in _closure(lane[leg], series) and e not in inner]
+    legs = [[e for e in endpoints if e.get('net') in rules.series_nets(lane[leg], series) and e not in inner]
             for leg in ('p', 'n')]
     oriented = _orient_pair(d, *legs)
     return oriented[0]+oriented[1]+[e for e in endpoints if e in inner] if oriented else []
@@ -590,6 +574,44 @@ def between_legs(d, p, n, series, fills=None, pad_metadata=None):
     return len(found), None
 
 
+def conditional_length(d, iface, lane, rule, paths, pad_metadata):
+    """Use frozen physical evidence, never mode/name alone, for conditional limits."""
+    pcb = max((p['length_mm'] for p in paths.values()), default=None) if all(
+        p['length_mm'] is not None for p in paths.values()) else None
+    detail = dict(pcb_length_mm=pcb)
+    metadata = lane.get('length_metadata', {})
+    numeric = lambda key: isinstance(metadata.get(key), (int, float)) and not isinstance(metadata.get(key), bool) and math.isfinite(metadata[key]) and metadata[key] >= 0
+    if rule['id'] == 'rgb_lcd.length.display':
+        if not numeric('flex_length_mm') or not numeric('cable_length_mm'):
+            return None, 'frozen flex/cable length missing', detail
+        detail.update(flex_length_mm=metadata['flex_length_mm'], cable_length_mm=metadata['cable_length_mm'])
+        return (pcb+metadata['flex_length_mm']+metadata['cable_length_mm'] if pcb is not None else None), None, detail
+    if rule['id'].startswith('i2c.length.'):
+        required = ('device_load_pf', 'capacitance_per_mm_pf', 'max_capacitance_pf', 'cable_length_mm')
+        if not all(numeric(k) for k in required) or metadata['capacitance_per_mm_pf'] <= 0 or metadata.get('length_convention') != 'total_copper':
+            return None, 'frozen device loading/cable/capacitance and total_copper convention required', detail
+        nets = rules.series_nets(lane['p'], iface.get('series', []))
+        # Include all branches, not just one endpoint route, in bus loading.
+        copper = math.fsum(si.exact_copper_length(d, n) for n in sorted(nets))
+        detail.update(metadata, pcb_total_copper_mm=copper)
+        total = copper+metadata['cable_length_mm']
+        detail['estimated_capacitance_pf'] = metadata['device_load_pf']+total*metadata['capacitance_per_mm_pf']
+        detail['loading_outcome'] = rules.check(detail['estimated_capacitance_pf'], metadata['max_capacitance_pf'], '<=', band=0)
+        return total, None, detail
+    if rule['id'].startswith('vga.length.section_'):
+        boundary = metadata.get('filter_boundary')
+        endpoints = metadata.get('section_endpoints', [])
+        filters = [s for s in iface.get('series', []) if s.get('ref') == metadata.get('filter_ref')
+                   and str(s.get('ref', '')).startswith('L') and boundary in s.get('endpoints', [])]
+        if not filters or len(endpoints) != 2 or boundary not in endpoints:
+            return None, 'frozen physical filter boundary and section endpoints missing', detail
+        series = [s for s in iface.get('series', []) if s not in filters]
+        section = endpoint_path(d, boundary['net'], endpoints, series, pad_metadata=pad_metadata)
+        detail.update(filter_boundary=boundary, section_endpoints=endpoints, section_pcb_length_mm=section['length_mm'])
+        return section['length_mm'], section['reason'], detail
+    return pcb, None, detail
+
+
 def measure_rules(d, interfaces, profile, ctx):
     if interfaces is None:
         return []
@@ -644,15 +666,22 @@ def measure_rules(d, interfaces, profile, ctx):
                     if iface.get('confidence') != 'confirmed':
                         reason = 'unconfirmed interface identity'
                     item = iface['id']+':'+lane['id']
+                    if measure in rules.PAIR_MEASURES and not lane.get('n'):
+                        entry = rules.result(rule, item, None, reason='single-ended lane: pair-only rule')
+                        entry.update(applicability='not applicable', outcome='not_applicable')
+                        out.append(entry)
+                        continue
                     if measure == 'vias_per_leg':
                         for leg, path in paths.items():
                             out.append(rules.result(rule, item+':'+leg, None if reason else path['vias'], reason=reason, band=0))
                         continue
                     value = None
-                    if not reason:
-                        if measure == 'max_length_mm':
-                            value = max(p['length_mm'] for p in paths.values())
-                        elif len(paths) != 2:
+                    detail = {}
+                    if measure == 'max_length_mm':
+                        value, prerequisite, detail = conditional_length(d, iface, lane, rule, paths, pad_metadata)
+                        reason = prerequisite or reason
+                    elif not reason:
+                        if len(paths) != 2:
                             reason = 'differential leg binding missing'
                         elif measure == 'intra_skew_mm':
                             value = abs(paths['p']['length_mm']-paths['n']['length_mm'])
@@ -661,6 +690,10 @@ def measure_rules(d, interfaces, profile, ctx):
                             value, reason = metrics['segment_skew_mm'], metrics['reason']
                         else:
                             value, reason = between_legs(d, paths['p'], paths['n'], iface.get('series', []), ctx.get('fills'), pad_metadata)
-                    out.append(rules.result(rule, item, value, reason=reason,
-                                            band=0 if measure == 'between_legs_items' else None))
+                    entry = rules.result(rule, item, None if reason else value, reason=reason,
+                                         band=0 if measure == 'between_legs_items' else None)
+                    entry.update(detail)
+                    if not reason and detail.get('loading_outcome') == 'fail':
+                        entry.update(outcome='fail', reason='declared device/bus capacitance exceeds frozen loading budget')
+                    out.append(entry)
     return out

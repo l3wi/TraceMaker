@@ -70,39 +70,33 @@ def pdata(d, n):
     return {"length": exact_copper_length(d, n), "vias": len(graph.vias), "pads": keys}
 
 
-def _arc_node(a):
-    return [
-        "arc",
-        ["start", str(a["sx"] / 1e6), str(a["sy"] / 1e6)],
-        ["mid", str(a["mx"] / 1e6), str(a["my"] / 1e6)],
-        ["end", str(a["ex"] / 1e6), str(a["ey"] / 1e6)],
-    ]
 
 
 def exact_copper_length(d, n):
     """Sum prototype planar track/arc lengths in mm, excluding via barrels."""
-    length = sum(
-        math.hypot(t["ex"] - t["sx"], t["ey"] - t["sy"]) / 1e6
-        for t in d["tracks"] if t["net"] == n
-    )
+    lengths = [math.hypot(t["ex"] - t["sx"], t["ey"] - t["sy"]) / 1e6
+               for t in d["tracks"] if t["net"] == n]
     for arc in d.get("arcs", []):
         if arc["net"] == n:
-            length += pm.arc_geometry(_arc_node(arc))[3]
-    return length
+            circle = _arc_parameters(arc)
+            lengths.append(circle['radius']*abs(circle['sweep']))
+    return math.fsum(sorted(lengths))
 
 
 def _arc_parameters(arc):
     """Circle centre, radius and signed angular interval from three nm points."""
-    sx, sy, mx, my, ex, ey = (arc[k] / 1e6 for k in ("sx", "sy", "mx", "my", "ex", "ey"))
-    ux, uy, vx, vy = mx - sx, my - sy, ex - sx, ey - sy
+    sx, sy = arc['sx']/1e6, arc['sy']/1e6
+    ux, uy = (arc['mx']-arc['sx'])/1e6, (arc['my']-arc['sy'])/1e6
+    vx, vy = (arc['ex']-arc['sx'])/1e6, (arc['ey']-arc['sy'])/1e6
     determinant = 2 * (ux * vy - uy * vx)
     if abs(determinant) < 1e-12:
         raise ValueError("collinear arc")
     u2, v2 = ux * ux + uy * uy, vx * vx + vy * vy
-    cx = sx + (vy * u2 - uy * v2) / determinant
-    cy = sy + (ux * v2 - vx * u2) / determinant
-    radius = math.hypot(sx - cx, sy - cy)
-    start, middle, end = (math.atan2(y - cy, x - cx) for x, y in ((sx, sy), (mx, my), (ex, ey)))
+    ox = (vy * u2 - uy * v2) / determinant
+    oy = (ux * v2 - vx * u2) / determinant
+    cx, cy = sx+ox, sy+oy
+    radius = math.hypot(ox, oy)
+    start, middle, end = (math.atan2(y - oy, x - ox) for x, y in ((0, 0), (ux, uy), (vx, vy)))
     sweep = (end - start) % math.tau
     if (middle - start) % math.tau > sweep:
         sweep -= math.tau
@@ -133,7 +127,14 @@ def segs(d, n, *, tessellate_arcs=False):
             out.append(dict(arc=circle, width=arc["width"] / 1e6, layer=arc["layer"],
                             len=circle["radius"] * abs(circle["sweep"])))
             continue
-        points = pm.arc_geometry(_arc_node(arc), True)
+        circle = _arc_parameters(arc)
+        radius, sweep, start = circle['radius'], circle['sweep'], circle['start']
+        step = 2*math.acos(max(-1, 1-.001/radius))
+        count = max(1, math.ceil(abs(sweep)/step))
+        points = [(circle['cx']+radius*math.cos(start+sweep*i/count),
+                   circle['cy']+radius*math.sin(start+sweep*i/count)) for i in range(count+1)]
+        points[0] = arc['sx']/1e6, arc['sy']/1e6
+        points[-1] = arc['ex']/1e6, arc['ey']/1e6
         for p, q in zip(points, points[1:]):
             out.append({
                 "sx": p[0], "sy": p[1], "ex": q[0], "ey": q[1],
@@ -196,7 +197,7 @@ def target_gap(sa, sb):
             for overlap in _overlaps(s, t):
                 if 0 <= overlap[2] <= 0.5:
                     contributions[round(overlap[2] / 0.025) * 0.025].append(overlap[1] - overlap[0])
-    histogram = {gap: math.fsum(lengths) for gap, lengths in contributions.items()}
+    histogram = {gap: math.fsum(sorted(lengths)) for gap, lengths in contributions.items()}
     return min(histogram, key=lambda gap: (-histogram[gap], gap)) if histogram else None
 
 
