@@ -349,8 +349,14 @@ are refilled (StickHub: 17, 15 and 13); read a change in that type alone as nois
    not called finished-before regressions (D129).
 2. Zero added A16 KiCad DRC error instances on **every board**, finished or not. New
    non-routing instances remain separate diagnostics, not silently dropped. A capped
-   gate-evaluated error type makes sign-off unknown and fails, including on
-   work-stopped boards; routing-immutable/warning-only caps are diagnostic.
+   gate-evaluated error type makes absolute sign-off unknown. In a **paired regression**
+   comparison, matching unknown evaluated-type sets on both runs, or types already
+   capped in the input report, are listed as “error gate cannot be judged on either
+   run” rather than failures; they are not DRC passes. A known baseline becoming
+   unknown because routing pushes a new type over its cap fails, including on
+   work-stopped boards. Unknown-to-known is informational improvement. Exact added
+   errors and all D129/D143 stop/completion rules still gate independently.
+   Routing-immutable/warning-only caps remain diagnostic.
 3. Time within budget on every board (with `--work`, the budget is work units; wall time only stops the job).
 4. Routed boards byte-identical unless the change is meant to change results (`compare_runs.py
    --expect-identical`; then the differences are recorded).
