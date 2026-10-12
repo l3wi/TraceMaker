@@ -13,6 +13,7 @@ import quality_io as io
 import quality as scorecard
 import quality_si as si
 import quality_identity as identity
+from drc_judge import ROUTING_IMMUTABLE_TYPES
 from shapely.geometry import Point
 
 
@@ -237,7 +238,19 @@ class QualityTests(unittest.TestCase):
                     self.assertIn(kind,judged['capped_types'])
                     self.assertNotIn(kind,judged['added_errors'])
             warnings=dict(report,violations=[dict(v,severity='warning') for v in report['violations']])
-            self.assertIsNone(io.judge(empty,warnings)['drc_pass'])
+            self.assertTrue(io.judge(empty,warnings)['drc_pass'])
+
+    def test_capped_immutable_types_are_reported_not_evaluated(self):
+        empty=dict(unconnected_items=[],violations=[])
+        for kind in sorted(ROUTING_IMMUTABLE_TYPES):
+            for severity in ('warning','error'):
+                report=dict(empty,violations=[dict(type=kind,severity=severity,description='synthetic')]*199)
+                with self.subTest(kind=kind,severity=severity):
+                    judged=io.judge(empty,report)
+                    self.assertTrue(judged['drc_pass'])
+                    self.assertIn(kind,judged['capped_types'])
+                    self.assertIn(kind,judged['capped_not_evaluated_types'])
+                    self.assertNotIn(kind,judged['capped_evaluated_types'])
 
     def test_exact_per_net_data_removes_censored_ground_na(self):
         data=dict(nets=['GND'],pads=[],tracks=[],arcs=[],vias=[],copper_layers=[])

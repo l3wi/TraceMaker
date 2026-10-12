@@ -501,9 +501,12 @@ def markdown(result):
             lines.append(f"| {board['board']} | {Path(run).name} | {arm['router_stop']} | {arm['budget_stopped']} | {arm['equal_work_valid']} | {arm['judge'].get('drc_pass')} | {g.get('near_pad_human_count')} / {g.get('near_pad_router_count')} | {g.get('absolute_small_pad_screen_pass')} | {g.get('small_pad_manufacturing')} |")
     for board in result['boards']:
         for run, arm in board['runs'].items():
-            capped = [kind for kind in arm['judge'].get('capped_types', []) if kind != 'unconnected_items']
-            if capped:
-                lines.append(f"\n{board['board']} / {Path(run).name}: capped DRC types {', '.join(capped)}; new-DRC gate unknown.")
+            evaluated = arm['judge'].get('capped_evaluated_types', [])
+            omitted = arm['judge'].get('capped_not_evaluated_types', [])
+            if evaluated:
+                lines.append(f"\n{board['board']} / {Path(run).name}: capped evaluated DRC types {', '.join(evaluated)}; new-DRC gate unknown.")
+            if omitted:
+                lines.append(f"\n{board['board']} / {Path(run).name}: {', '.join(omitted)}: capped, not evaluated.")
             if arm['judge'].get('connectivity_unavailable'):
                 lines.append(f"\n{board['board']} / {Path(run).name}: connectivity fallback: "+json.dumps(arm['judge']['connectivity_unavailable']))
     finished = result['common_finished']
@@ -614,7 +617,7 @@ def main():
     limits=[
         'Human parity is a practical reference, not SI/current/thermal/assembly certification. Categories have no weighted total.',
         'KiCad pcbnew connectivity on saved refills supplies uncapped total and per-net counts under the judge version; unavailable/mismatched KiCad Python falls back to censored report lists. The ratio is a disconnected-item denominator, not proven terminal-component rank.',
-        'DRC additions use violation-instance differences, including non-track errors. Any error type at its KiCad report cap makes the new-DRC gate unknown; saturated types are never compared as exact counts. Inspect reported instances before sign-off.',
+        'DRC additions use evaluated error-instance differences, including non-track errors but excluding shared routing-immutable footprint/library/courtyard/text types. Only capped types evaluated under that severity/type policy make the new-DRC gate unknown; warning-only and excluded caps are reported as capped, not evaluated. Saturated types are never compared as exact counts.',
         'Decoupling supply and return leads use free-plane-hop lower bounds between contacts to the same actual filled island; return hops exclude unanchored islands. Multilayer island joins and full loop impedance are not modeled. Human-invalid paths are coverage holes, not an allowed defect rate.',
         'Differential nets are name-selected, two-terminal graph-qualified candidates. Coupling uses the human modal gap, not a certified impedance target; skew excludes package/vertical-via delay. Straight parallel spans and concentric circular-arc spans use exact length; mixed line/arc and nonconcentric-arc coupling are not inferred. NetGraph approximates arcs with two chords for connectivity only.',
         'Historical returns screen adjacent broad GND fills. New fields preserve intended net/island identity using frozen manifest references or unambiguous nearest endpoint-IC ground pins on the human. Anchoring means pad connectivity, not earth grounding; power-transfer capacitors and actual return-current fields are not certified. Declared Ethernet isolation is excluded from missing-ground penalties; all-layer projected isolation gaps are not safety/creepage sign-off.',
