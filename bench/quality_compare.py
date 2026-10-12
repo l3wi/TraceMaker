@@ -20,12 +20,15 @@ class CounterRng:
 
 # Practical equivalence bands, not electrical certification limits.
 METRICS = {
-    'decoupling': {'effective_mm': (False, 1.0)},
-    'differential_pairs': {'coupled_fraction': (True, 0.001), 'skew_mm': (False, 0.01), 'via_imbalance': (False, 0)},
-    'return_paths': {'gap_fraction': (False, 0.001), 'no_return_1mm': (False, 0), 'no_return_5_08mm': (False, 0)},
+    'decoupling': {'effective_mm': (False, 1.0), 'return_lead_mm': (False, 1.0)},
+    'differential_pairs': {'coupled_fraction': (True, 0.001), 'skew_mm': (False, 0.01), 'via_imbalance': (False, 0),
+                           'segment_skew_mm': (False, 0.01), 'via_layer_mismatch': (False, 0)},
+    'return_paths': {'gap_fraction': (False, 0.001), 'no_return_1mm': (False, 0), 'no_return_5_08mm': (False, 0),
+                     'wrong_reference_mm': (False, 0.01), 'floating_reference_mm': (False, 0.01)},
     'power': {'median_width_mm': (True, 0.000001), 'resistance_35um_ohm': (False, 0.000001), 'neck_fraction': (False, 0.001)},
     'thermal': {'via_count': (True, 0)},
     'pad_entry': {'off_axis': (False, 0), 'corner': (False, 0), 'wider_than_face': (False, 0)},
+    # self_spacing_violations/short_bend_segments are report-only: they count tuning, not its quality (doc 10 §9).
     'routing_craft': {'acute_junctions': (False, 0)},
     'efficiency': {'vias_per_connection': (False, 0.000001), 'mm_per_connection': (False, 0.01)},
 }
@@ -44,15 +47,16 @@ def summarize(reference, arms):
     for category, metrics in METRICS.items():
         output[category] = {}
         for metric, (higher, epsilon) in metrics.items():
+            connectivity = 'return_connected' if category == 'decoupling' and metric == 'return_lead_mm' else 'connected'
             boards = sorted(reference)
             common = {}
             for board in boards:
                 hh = reference[board].get(category, {})
                 common[board] = {key for key, item in hh.items()
-                                 if item.get(metric) is not None and item.get('connected', True)
+                                 if item.get(metric) is not None and item.get(connectivity, True)
                                  and all(key in aa.get(board, {}).get(category, {})
                                          and aa[board][category][key].get(metric) is not None
-                                         and aa[board][category][key].get('connected', True)
+                                         and aa[board][category][key].get(connectivity, True)
                                          for aa in arms.values())}
             rows = {}
             for arm, aa in arms.items():
@@ -65,7 +69,7 @@ def summarize(reference, arms):
                         counts = dict(win=0, tie=0, loss=0, missing=0, not_assessable=0, eligible=0)
                         deltas = []
                         for key, h in sorted(hh.items()):
-                            if h.get(metric) is None or not h.get('connected', True):
+                            if h.get(metric) is None or not h.get(connectivity, True):
                                 counts['not_assessable'] += 1
                                 continue
                             if view == 'common_connected' and key not in common[board]:
@@ -73,10 +77,10 @@ def summarize(reference, arms):
                                 continue
                             r = rr.get(key, {})
                             value = r.get(metric)
-                            if 'connected' in r and r['connected'] is None:
+                            if connectivity in r and r[connectivity] is None:
                                 counts['not_assessable'] += 1
                                 continue
-                            if not r.get('connected', False):
+                            if not r.get(connectivity, False):
                                 value = None
                                 counts['missing'] += 1
                             elif value is None:

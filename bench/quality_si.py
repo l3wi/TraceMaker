@@ -184,15 +184,20 @@ def _overlaps(s, t):
 def target_gap(sa, sb):
     """Prototype length-weighted 0.025 mm gap mode, or None if unobserved.
 
-    Only edge gaps in [0, 0.5] mm count; ties keep the first observed bin.
+    Only edge gaps in [0, 0.5] mm count; ties select the smallest gap bin.
     """
-    histogram = collections.Counter()
-    for s in sa:
-        for t in sb:
+    contributions = collections.defaultdict(list)
+    # Canonical geometric order (lines and concentric arcs) so float sums and ties never follow file order.
+    order = lambda s: ((s["layer"], 1, s["arc"]["cx"], s["arc"]["cy"], s["arc"]["radius"], s["arc"]["start"],
+                        s["arc"]["sweep"], s["width"]) if "arc" in s else
+                       (s["layer"], 0, s["sx"], s["sy"], s["ex"], s["ey"], s["width"], s["len"]))
+    for s in sorted(sa, key=order):
+        for t in sorted(sb, key=order):
             for overlap in _overlaps(s, t):
                 if 0 <= overlap[2] <= 0.5:
-                    histogram[round(overlap[2] / 0.025) * 0.025] += overlap[1] - overlap[0]
-    return histogram.most_common(1)[0][0] if histogram else None
+                    contributions[round(overlap[2] / 0.025) * 0.025].append(overlap[1] - overlap[0])
+    histogram = {gap: math.fsum(lengths) for gap, lengths in contributions.items()}
+    return min(histogram, key=lambda gap: (-histogram[gap], gap)) if histogram else None
 
 
 def coupled(sa, sb, gap):
@@ -351,7 +356,7 @@ def fills(board):
     return unions, broad, hashlib.sha256(repr(raw).encode()).hexdigest()
 
 
-def retmetric(d, nets, uf, broad):
+def retmetric(d, nets, uf, broad, *, isolated=()):
     """Measure prototype adjacent-plane return gaps and stitching distances.
 
     Segment centres, not track edges, determine gaps. A layer transition counts
@@ -378,7 +383,7 @@ def retmetric(d, nets, uf, broad):
             reference_unions[l] = unary_union([uf[r] for r in refs])
     ground_vias = []
     for via in d["vias"]:
-        if not _GROUND.fullmatch(via["net"]):
+        if not _GROUND.fullmatch(via["net"]) or via["net"] in isolated:
             continue
         top, bottom = indices.get(via["top"]), indices.get(via["bottom"])
         if top is None or bottom is None:
@@ -388,6 +393,8 @@ def retmetric(d, nets, uf, broad):
         touching = {l for l in span if l in uf and uf[l].intersects(disk)}
         ground_vias.append((via, touching))
     for n in sorted(nets):
+        if n in isolated:
+            continue
         segments = segs(d, n, tessellate_arcs=True)
         lines = [LineString([(s["sx"], s["sy"]), (s["ex"], s["ey"])]) for s in segments]
         for s, line in zip(segments, lines):

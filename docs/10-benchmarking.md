@@ -552,3 +552,236 @@ Historical board-level consumers use `bench/board_quality.py` (the former `quali
 `quality.py` accepts run directories only. Measurement regressions run with
 `python3 -m unittest discover -s bench -p 'test_*.py'` in the Shapely environment.
 
+### Frozen interfaces and opt-in guide rules (D130, D134)
+
+`bench/interfaces.py --set modern-planes --out build/interfaces/modern-planes` drafts schema-1
+`<board>.interfaces.json` files from the **prepared inputs**, not router outputs. `quick` and `mid` use
+`build/pcbench`; `--board NAME` restricts a set, `--fixtures DIR` selects another prepared input root,
+and `--input INPUT.kicad_pcb --board NAME` explicitly selects an input/human board.
+Hierarchy and token boundaries are retained; P/N, +/−, DP/DN, DP/DM, `.P/.N` and lowercase variants
+are recognized. Ancillary USB-PD/HDMI lines, NCSI, analogue ID/QD pairs, SPI SCLK and generic LVDS
+expansion names are not misclassified as the guide's data interfaces.
+
+Names produce **candidate** obligations. Only independent native connector/IC pad `pinfunction`
+evidence corroborating every lane/leg upgrades a draft to **confirmed**; a footprint outline,
+filename or capacitor alone cannot. `--review` rechecks each obligation against physical input pad
+metadata, protocol-specific IC functions and standardized connector contacts. It writes
+`status: reviewed`, an evidence-bearing `review`, and `review_decision: confirmed` or
+`rejected_for_grading`; rejected candidates remain visible, never silently vanish. Generic FPGA
+SERDES, GPIO and FFC contacts cannot prove a protocol. A reviewed identity is not firmware or
+operating-speed certification. Unknown modes remain null; only explicit connector/device topology
+establishes the relevant slot/device-down mode.
+Missing native pin functions can be supplemented by narrow manufacturer pin tables for INA226
+DGS/MSOP-10 (TI SBOS547C), 24LC/AA/FC512 8-pin/DFN (Microchip DS21754M) and DP83848C LQFP-48
+(TI SNLS266E). Their exact pin/package matches and source URLs appear in the review, rather than
+promoting every pin on an I²C-capable chip. Unsupported packages and unverified pin maps stay candidate.
+
+Integer-nm endpoints retain net spelling and copper-layer sets, independent of reference renaming.
+Recognizable two-pad passive bridges join consistently named lane halves (or an anonymous half);
+their physical endpoints remain in `series`. The drafter removes internal series pads and selects
+exactly two outer component terminals per leg when the remaining pads are independently identified
+ESD/TVS, rail-shunt/pull-up, test-point or electrically equivalent duplicate connector contacts.
+Those branch contacts remain as optional `taps`, with an `endpoint_selection` explanation. Unknown
+parts, multidrop buses and multiple unequal destination contacts retain all possible terminals and
+remain ambiguous, not a farthest/shortest-path guess. A single explicit GND pour domain plus GND
+contacts on every selected terminal component can establish reference-domain intent, not a
+stackup certification. Integrated magnetics' internal cable-side nodes are not PCB nets and do not
+establish an on-board isolated domain; unsupported reference/isolation declarations remain empty.
+
+Add `--interfaces DIR --profile toradex-2015` to `bench/quality.py` to publish absolute guide-rule
+results alongside unchanged human-parity grades. Without `--profile` no rule/coverage section or new
+fields are emitted. The lazily imported `RULE_MODULES` registry supplies `measure_rules` implementations;
+each receives the same frozen manifest/profile, fresh fills, connectivity states and analysis board.
+Duplicate rule/application keys are rejected. The human is measured too; human violations remain visible.
+Per-board provenance hashes the interface manifest. Coverage lists interface confidence and physically
+unbound lanes; a missing manifest or unknown geometry/role/mode is N/A, never a pass.
+
+The bundled profile transcribes section-7 geometric limits plus the general 4W same-net meander
+spacing, 1.5W bend-segment and no-between-leg-item rules, plus a report-only no-reference-gap screen.
+The gap screen requires declared reference domains; zero uncovered length is boundary under the shared
+1 µm band, not an electrically certified pass. Clock/spread skew groups, TX/RX budgets and
+slot/device-down modes stay distinct. Length/skew in millimetres are planar proxies, **not timing or
+impedance certification**. Approximate lengths, conditional exceptions and other-signal gaps are
+report-only. USB3's printed “minimum <500 µm” comparator is preserved as report-only, not silently
+reversed. LVDS pair spacing is relative to intra-pair gap, not trace width. Cable-inclusive paths,
+VGA filter boundaries and I²C capacitance-limited lengths require reviewed metadata. Impedance is
+omitted until real stackup data and a validated solver exist. Numeric checks use the common 1 µm
+boundary band; integer counts use an exact zero band. These old carrier-board recommendations are
+explicitly opt-in context, not new hard gates or current interface-standard compliance.
+
+An active profile always publishes interface coverage, including `status: missing` when no manifest
+is supplied or a scheduled board's manifest is absent. Markdown also treats older arms without that
+coverage field as missing, rather than failing report generation.
+
+#### Reviewed-input smoke evidence (D135)
+
+The `sc/integrate` 1936fe0 path/return module registry was exercised against the 11 default non-slow
+`modern-planes` boards: `dp-modern-200M-T` versus `human-modern-planes`, `--profile toradex-2015
+--jobs 2`. Both runs had an empty benchmark error map. Draft inputs took 89.1 s; reviewed inputs
+took 90.2 s. Manifest hashes matched across both arms and the regenerated review files (22 bindings).
+
+| Arm | Draft pass / fail / N/A | Reviewed pass / fail / N/A | N/A fraction, draft → reviewed |
+|---|---:|---:|---:|
+| Human | 74 / 25 / 392 | 145 / 40 / 322 | 79.84% → 63.51% |
+| Router | 66 / 24 / 401 | 136 / 46 / 325 | 81.67% → 64.10% |
+
+Reviewed topology adds 16 slot length/RX-via obligations, so denominators are 491 and 507 rather
+than a silently narrowed cohort. Combined identity-related N/A falls from 440 to 90 and the
+two-endpoint reason from 132 to 118. Unknown-reference N/A rises from 171 to 300 as more confirmed
+paths become evaluable; no reference domain was invented to make these checks pass. Native
+MAX96724 CSI and SN65DSI84 DSI/LVDS pin evidence exposes human as well as router skew violations.
+All 57 prepared boards were reviewed: modern-planes 74 confirmed / 36 candidate interfaces,
+quick 2 / 2 and mid 6 / 11. Genuine multidrop/ambiguous paths and generic FPGA/FFC mappings remain
+N/A; the registered modules, not this drafter, determine which profile measures are implemented.
+
+### Frozen endpoint and segment checks (D131)
+
+`bench/quality_paths.py` measures the required electrical path between physical endpoints from a schema-1
+interface manifest, including declared series parts joining split nets. Each differential lane supplies two
+outer endpoints per leg; series-pad bindings may also appear in the lane's endpoint list when the
+series entry supplies its own physical `endpoints` to exclude. P/N correspondence is resolved jointly
+from their physical bindings: prefer endpoints on the same footprint, then nearest endpoint pairing;
+equal evidence is ambiguous and yields N/A. The same correspondence is used for manifest traversal
+and inferred parity endpoints. The manifest is frozen from the common input/human, never fitted to a
+router arm. Extra ESD/test-point pads do not disqualify a unique path. Without explicit intent, the new
+parity fields use only the human's physically unique two-pad candidate endpoints, reused unchanged
+across arms. Pad dimensions and file order never choose opposite traversal directions.
+
+The graph splits straight tracks and exact circular arcs at conductive junctions. Physical duplicate copper
+and vias are merged; sub-nanometre intersection coordinates are snapped to integer nanometres. Pads are
+equipotential contacts and series parts contribute zero planar length. Nonterminal leaves are peeled and
+their copper length is reported separately as `stub_mm`; a stub's vias do not consume the endpoint-path
+via budget. Disconnected endpoints, ambiguous bindings and connected loops produce N/A with reasons, not
+an electrically convenient shortest-path result. Plane transport is not represented. Via barrels, component
+internal lengths, package delays and unknown external cables are not inferred from the planar result.
+
+| Measure | Definition |
+|---|---|
+| `intra_skew_mm` | Absolute difference between P and N endpoint-path lengths |
+| `segment_skew_mm` | Worst absolute difference between the P/N lengths of successive sections bounded by matching ordered via, layer-changing-pad or series transitions; +1 mm before a via and −1 mm afterward is 1 mm, not zero |
+| `group_skew_mm` | Per-lane mean of P/N lengths (`single` data lanes use their one path length), compared with the one `clock` lane or the spread over declared data/single/TX/RX lanes, selected by the profile's `group` |
+| `max_length_mm` | Longest individual leg's endpoint-path planar length |
+| `vias_per_leg` | Unique vias actually traversed on each leg, not total same-net vias; profile `role` and `mode` select budgets |
+| `between_legs_items` | Unique unrelated tracks/arcs, pads, vias and same-layer filled islands intruding into the edge-to-edge corridor along parallel straight path sections; declared series pads and both legs' nets are excluded |
+
+`segment_skew_mm` and `via_layer_mismatch` are additional differential-pair human-parity fields, with
+0.01 mm and exact-count equivalence bands respectively. `via_layer_mismatch` counts ordered via transitions
+with differing drilled layer spans or used entry/exit layers, plus unmatched transitions. Segment skew is
+N/A when transition sequences cannot be matched. The historical whole-net `skew_mm` and via-imbalance
+metrics retain their original meanings and values.
+
+The absolute millimetre checks use the shared 1 µm boundary band; count checks have band zero. Human
+violations remain visible and guide-derived limits are not new hard gates or current protocol certification.
+Unknown interface identity, lane role, group membership or geometry is never a pass. Supported pad shapes
+(rectangle, round rectangle, oval and circle) use the frozen `pad_metadata` where supplied, including
+canonical renamed references; the board-reader fallback runs only when that map is absent.
+Local-to-board pad rotation follows KiCad's y-down negative-angle convention. Without known shapes,
+only inscribed-disk contact is represented, with potential corridor intrusions marked N/A.
+Curved pair-corridor correspondence is currently N/A rather than a chord-based claim; foreign arcs beside
+straight coupled sections use exact circular distance and copper width. All geometry and sums are ordered
+by physical identity so item reordering cannot change a measurement or modal-gap tie.
+
+Regression cases are in `bench/test_quality_paths.py`, including ±1 µm limits, skew cancellation, ESD
+branches, series coupling, loops, via spans, foreign copper, fill-layer controls and shuffled copper order.
+
+### Reference identity, isolated domains and decoupling return leads (D132)
+
+`quality_returns` preserves each actual refilled island as `(net, layer, island)` with canonical
+physical ordering. The original broad-ground `gap_fraction` and `no_return_*` measurements retain
+their historical semantics when no interface manifest is supplied. Two additional lower-is-better
+parity fields, `wrong_reference_mm` and `floating_reference_mm` (0.01 mm equivalence band), distinguish
+route centreline over the wrong ground net and over an unanchored intended-reference island.
+An island is anchored only if same-net pad copper reaches it directly, or through the existing
+track/via contact graph; a floating island cannot give reference credit. A pad anchor is not proof
+of earth grounding. Graph-unsupported connectivity is conservative coverage, not circuit sign-off.
+
+Intended references come first from frozen interface `reference_nets`. Without that declaration,
+the common human's fixed terminal geometry supplies a conservative inference: on every endpoint
+footprint whose designator starts with `U`, choose the nearest GND/GNDD/DGND/AGND pin by squared
+centre distance. All endpoint ICs must agree on one net; ties across ground nets, missing ground
+pins and connector/passive-only evidence are N/A. This inference is frozen before evaluating
+router arms, not rediscovered from routed copper. Direct `measure` callers pass that frozen map
+as `intended_references`; missing maps are N/A. Explicitly allowed reference nets may be power
+nets; their actual adjacent fills qualify for the new proxy, without changing historical GND
+eligibility. This is an adjacent-layer geometric screen, not a dielectric/stackup-selected field model.
+
+Confirmed manifest lanes with role `clock` or `single` also receive return measurements; without
+a manifest the historical pair-only obligation set is unchanged. Declared `isolated_nets` are
+excluded from missing-ground penalties and return-via credit. A signal whose entire declared
+reference belongs to that isolated domain is likewise excluded. The Ethernet MDI profile's
+`isolation_gap_mm` is the minimum projected copper edge distance across **all** layers between
+isolated and other-domain fills, traces/arcs, vias and pads. Missing/unsupported pad shape metadata,
+missing domain copper or unconfirmed interface intent is N/A. This projected 2-D distance does not
+certify safety insulation, creepage or isolation voltage.
+
+`quality_returns.measure_rules(d, interfaces, profile, ctx)` checks `reference_uncovered_mm` and
+`isolation_gap_mm` with the shared 1 µm uncertainty band. By default reference coverage measures
+**all lane-net track/arc copper**, including stubs, not an endpoint-only path. The optional
+`ctx['lane_segments']` supplies per-net, ordered endpoint-path segment dicts in millimetres to
+replace that source; a missing path in a supplied map is N/A, never an all-copper fallback.
+The context also accepts `broad` reference layers and `pad_metadata` from the frozen shape reader.
+Human reference failures remain visible alongside router failures.
+
+Each frozen cap-to-supply-pin obligation also publishes `return_lead_mm` (lower better, 1 mm
+equivalence band). Select the capacitor's unique ground pad and the nearest IC ground pin to
+the obligated supply pin on their common, unambiguous ground net. The same track-or-free-plane-hop
+lower bound then measures the ground-side lead; free travel requires contacts reaching the
+**same grounded refilled island**. A missing return obligation/loss requires both no represented
+ground path and a KiCad unconnected-item endpoint physically matching the cap ground pad or IC ground
+pin on that ground net. Matching uses report positions within the rotated pad extent plus the 1 µm
+identity tolerance, not reference names, because router fixtures may rename references.
+An incomplete ground net elsewhere does not prove this obligation lost: unrepresented paths remain
+N/A. A represented ground path retains its numeric lead despite unrelated breaks on the net.
+Censored judgments (499 or more unconnected items) and missing/ambiguous ground bindings are N/A.
+Aggregation uses the separate `return_connected` state only for `return_lead_mm`; the old
+`effective_mm` supply metric and its supply connectivity are unchanged. Neither side is a loop-inductance estimate.
+
+### Guide spacing and bend screens (D133)
+
+`quality_spacing.py` adds two report fields on each known-connected signal net:
+`self_spacing_violations` counts close-approach sites below 4W (Toradex 2015 §6.2 p17, R36), and
+`short_bend_segments` counts straight bend segments below 1.5W (R37). They are published per net in the JSON
+but are **not graded against the human**: both counts grow with the amount of length tuning, so a route that
+never meanders would "win" while losing on skew (measured: human CSI lanes on gmsl-deserializer carry 80–140
+sites each from tuning humps, the untuned router 225 in total). The guide's actual requirement is applied as
+absolute rules on manifest lanes (`self_spacing_ratio >= 4`, `bend_segment_ratio >= 1.5`), judged identically
+on the human and router. Supply/ground exclusions reuse `quality_craft.is_power`/`is_ground`. Historical
+acute-junction values and thresholds are unchanged.
+
+A **run** is a maximal equal-width straight centreline formed by coalescing degree-two collinear pieces,
+or one circular arc with analytic endpoint tangents and exact circular path length.
+A **non-local site** is an unordered same-layer run pair with no direct copper contact, common endpoint, or endpoint contacts to
+the same pad/via, and no endpoint-to-endpoint centreline path at most `2*max(Wa,Wb)`. Its gap is minimum
+centreline distance minus the two half-widths, clamped at zero; its ratio uses `max(Wa,Wb)`. This operational
+neighbourhood removes ordinary connected corners, rather than applying 4W at a joint where separation
+necessarily vanishes. One violating run pair counts once, independently of collinear file fragmentation.
+The minimum ratio is N/A when no eligible site exists, not an artificial pass. Bend segments must have real
+direction changes at both ends, degree-two joints, and endpoints outside pad/via copper; straight width
+transitions and endpoints are not bends. Arc tessellation vertices are never bend segments; tangent continuity
+uses a 1 µrad uncertainty tolerance for integer-rounded arc control points. Junction contact exclusions use
+the existing rotated pad-envelope model, not custom-pad electrical certification. Invalid arcs/widths are N/A.
+
+For frozen, reviewed interface lanes, `measure_rules(d, interfaces, profile, ctx)` supplies
+`self_spacing_ratio`, `bend_segment_ratio`, `pair_gap_mm`, `pair_gap_ratio`, and `other_gap_mm`.
+Wildcard profile interface rules apply to all declared lanes. Pair distance is the minimum same-layer
+copper-edge distance to **other declared lanes**, across interface groups. Tracks, circular arcs, vias, supported
+pads and supplied refilled signal fills participate. `other_gap_mm` reports distance to every other non-ground,
+non-supply signal net; role-specific high/low-speed distances cannot be inferred from this scalar.
+
+An optional interface `breakout_radius_nm` freezes endpoint-centred breakout disks (default zero: no exception).
+Only pad-to-pad comparisons on a shared endpoint footprint, whose pad centres fall within their respective
+lanes' declared disks, are excluded. Tracks/vias are never exempt. `excluded_pad_comparisons` publishes the
+number of excluded same-layer comparisons, independently of spatial-index traversal. Do not choose these
+disks from the evaluated router output. The LVDS ratio divides the minimum foreign-lane gap by the own-leg
+gap **at that closest site**: project the closest own-copper point onto its track centreline, then measure to
+the closest same-layer mate track, subtracting half-widths. A closest pad/via/fill/arc site, missing mate, or zero
+own gap makes the ratio N/A. This local geometric screen is not an impedance measurement.
+
+Integer-nanometre identities, canonical run/copper ordering and exact segment/polygon distances give
+item-order-independent results. Round copper is polygonized with at least 128 chords per quadrant and at
+most 0.1 µm sagitta, below the 1 µm geometric rule band. Ratio bands convert 1 µm by the minimum represented
+lane width (self/bend) or local own-leg gap (pair); an explicit profile band overrides this. Unknown connectivity,
+unreviewed/candidate intent, missing neighbour geometry, unsupported pads or invalid arcs yield N/A, never pass.
+STRtrees prune distance candidates; `indexed=False` exposes linear reference paths tested for equivalence.
+No field solver, crosstalk sign-off, optional close-parallel-length metric or new hard gate is introduced.
+
