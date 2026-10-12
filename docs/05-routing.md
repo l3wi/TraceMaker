@@ -404,6 +404,8 @@ Distances and matching costs are L1 distances in integer nanometres. Both endpoi
 are considered; eligible connection pairs are consumed in increasing `(sum, maximum, A connection
 index, B connection index)` order. This is a deterministic minimum-cost-first correspondence rule,
 not a claim of globally optimal bipartite assignment.
+The route itself uses the same eligible endpoint permutation; equal costs retain the planned
+orientation rather than introducing a floating-point rematch.
 
 For asymmetric trees whose fixed-copper clusters are all single pads without zones, with at least
 two corresponding terminals covering the smaller half, planning first builds a joint Prim tree

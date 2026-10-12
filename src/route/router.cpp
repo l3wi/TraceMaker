@@ -436,6 +436,12 @@ struct Router::Impl {
     return distance;
   }
 
+  std::optional<std::pair<Coord, Coord>> correspondence_cost(int pa, int qa, int pc, int qc) const {
+    const auto first = corresponding_end(pa, pc), last = corresponding_end(qa, qc);
+    if (!first || !last) return {};
+    return std::pair{*first + *last, std::max(*first, *last)};
+  }
+
   std::vector<Connection> plan(drc::UnionFind& uf) {
     const auto& cm = obs->copper();
     struct Cluster { std::vector<int> pads, zones; };
@@ -2657,9 +2663,11 @@ struct Router::Impl {
     Connection B = cs[static_cast<std::size_t>(ib)].c;
     auto d = [](Point u, Point v) { return std::hypot(static_cast<double>(u.x - v.x), static_cast<double>(u.y - v.y)); };
     auto pad = [&](int i) -> const model::Pad& { return b.pads[static_cast<std::size_t>(i)]; };
-    if (d(pad(A.pad_a).pos, pad(B.pad_b).pos) + d(pad(A.pad_b).pos, pad(B.pad_a).pos) <
-        d(pad(A.pad_a).pos, pad(B.pad_a).pos) + d(pad(A.pad_b).pos, pad(B.pad_b).pos))
-      std::swap(B.pad_a, B.pad_b);
+    // Use the same eligible physical correspondence as job selection, including its integer ties.
+    const auto direct = correspondence_cost(A.pad_a, A.pad_b, B.pad_a, B.pad_b);
+    const auto swapped = correspondence_cost(A.pad_a, A.pad_b, B.pad_b, B.pad_a);
+    if (!direct && !swapped) { pair_why = "no corresponding endpoints"; return false; }
+    if (swapped && (!direct || *swapped < *direct)) std::swap(B.pad_a, B.pad_b);
     const model::Pad &pa1 = pad(A.pad_a), &pa2 = pad(A.pad_b), &pb1 = pad(B.pad_a), &pb2 = pad(B.pad_b);
     model::LayerMask allowed = 0;  // layers both halves may use (custom disallow rules)
     for (int l = 0; l < nl; ++l)
@@ -3314,10 +3322,8 @@ struct Router::Impl {
             const auto& B = cs[static_cast<std::size_t>(cb)].c;
             std::optional<std::pair<Coord, Coord>> best;
             for (const auto& [p, q] : {std::pair{B.pad_a, B.pad_b}, std::pair{B.pad_b, B.pad_a}}) {
-              const auto first = corresponding_end(A.pad_a, p), last = corresponding_end(A.pad_b, q);
-              if (!first || !last) continue;
-              const std::pair cost{*first + *last, std::max(*first, *last)};
-              if (!best || cost < *best) best = cost;
+              const auto cost = correspondence_cost(A.pad_a, A.pad_b, p, q);
+              if (cost && (!best || *cost < *best)) best = cost;
             }
             if (best) candidates.emplace_back(best->first, best->second, ca, cb);
           }

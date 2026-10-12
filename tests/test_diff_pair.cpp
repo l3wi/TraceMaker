@@ -556,7 +556,7 @@ TEST_CASE("explicit USB pairs remain selected with name detection enabled", "[di
 }
 
 TEST_CASE("pair matching uses physical sites, not a fixed connector pitch", "[diffpair][route]") {
-  for (Coord spacing : {600'000, 4'000'000, 4'570'733, 6'000'000}) {
+  for (Coord spacing : {600'000, 4'000'000, 4'570'000, 4'570'733, 6'000'000}) {
     auto b = fenced_pair();
     b.tracks.clear();
     for (auto& p : b.pads)
