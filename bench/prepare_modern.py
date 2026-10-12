@@ -7,8 +7,8 @@ pinned to commits in bench/sets/modern-planes.json.
 
 For each board: a shallow, sparse git fetch of its commit into <data>/<repo>/<commit> (only KiCad project files and
 licence texts: the board, project, custom rules and schematics for review), then <out>/<name>/unrouted.kicad_pcb.
-Track/arcs and track-contact vias are removed, no-track vias and zones kept, stale fills discarded and the input
-refilled/saved by KiCad. The human original and both boards' project/custom rules are copied beside them.
+Track/arcs and ordinary track-contact vias are removed, no-track and same-pad array vias
+and zones kept, stale fills discarded and the input deterministically refilled/saved by KiCad.
 """
 import argparse
 import json

@@ -9,8 +9,8 @@ import uuid
 from unittest.mock import patch
 
 from plane_metrics import child, children, parse
-from prepare_inputs import (expressions, fixture_transaction, prepare_board, refill_board,
-                            repair_design_ids, strip_design_routing, terminal_signature)
+from prepare_inputs import (canonicalize_generated_ids, expressions, fixture_transaction, prepare_board,
+                            refill_board, repair_design_ids, strip_design_routing, terminal_signature)
 from prepare_pcbench import transplant_design_copper
 
 
@@ -50,6 +50,57 @@ class PreparationTests(unittest.TestCase):
         self.assertIn('(polygon (pts (xy 0 0)', stripped)
         self.assertIn(r'escaped \" (via not copper)', stripped)
         self.assertEqual(stats['fixed_vias'], 1)
+
+    def test_pad_array_survives_track_contact_but_signal_vias_do_not(self):
+        pad = '(footprint "P" (at 10 20 -90) (pad "28" smd rect (at 0 -1.2 270) (size 3.4 1.1) (layers "F.Cu") (net 1)))'
+        track = '(segment (start 11.2 19) (end 15 19) (width 0.2) (layer "F.Cu") (net 1))'
+        # Three annuli are inside the rotated pad; the first has track contact.
+        text = HEADER + pad + track + via(11.2, 19) + via(11.2, 20) + via(11.2, 21)
+        text += via(15, 19) + ')'  # Ordinary routing via at the other endpoint.
+        stripped, stats = strip_design_routing(text)
+        self.assertEqual(stats['pad_array_vias'], 3)
+        self.assertEqual(stats['pad_array_track_vias'], 1)
+        self.assertEqual(stats['fixed_vias'], 3)
+        self.assertEqual(stats['vias_removed'], 1)
+        self.assertEqual(len(children(parse(stripped), 'via')), 3)
+
+    def test_array_requires_same_net_layer_full_annulus_and_distinct_members(self):
+        pad = '(footprint "P" (at 0 0) (pad "1" smd rect (at 0 0) (size 4 4) (layers "F.Cu") (net 1)))'
+        track = '(segment (start -3 0) (end 3 0) (width 0.2) (layer "F.Cu") (net 1))'
+        for other in (via(1, 0).replace('(net 1)', '(net 2)'),
+                      via(1, 0, '"In1.Cu" "B.Cu"'), via(1.9, 0), via(0, 0)):
+            with self.subTest(other=other):
+                _, stats = strip_design_routing(HEADER + pad + track + via(0, 0) + other + ')')
+                self.assertEqual(stats['pad_array_vias'], 0)
+        # A lone via-in-pad fanout is still disposable routing, not an array.
+        self.assertEqual(strip_design_routing(HEADER + pad + track + via(0, 0) + ')')[1]['fixed_vias'], 0)
+
+    def test_rounded_pad_uses_copper_not_bounding_box(self):
+        track = '(segment (start -3 0) (end 3 0) (width 0.2) (layer "F.Cu") (net 1))'
+        for shape in ('circle', 'oval', 'roundrect'):
+            pad = f'(footprint "P" (at 0 0) (pad "1" smd {shape} (at 0 0) (size 4 4) (roundrect_rratio 0.05) (layers "F.Cu") (net 1)))'
+            _, stats = strip_design_routing(HEADER + pad + track + via(-.5, 0) + via(.5, 0) + ')')
+            self.assertEqual(stats['pad_array_track_vias'], 2)
+        pad = '(footprint "P" (at 0 0) (pad "1" smd circle (at 0 0) (size 2 2) (layers "F.Cu") (net 1)))'
+        _, stats = strip_design_routing(HEADER + pad + via(.7, .7) + via(-.7, -.7) + ')')
+        self.assertEqual(stats['pad_array_vias'], 0)
+
+    def test_generated_ids_ignore_loader_randomness_and_object_order(self):
+        original = HEADER + '(dimension (pts (xy 1 2) (xy 3 4))) (dimension (pts (xy 5 6) (xy 7 8))))'
+        def converted(reverse):
+            dims = [f'(dimension (pts (xy {a} {b}) (xy {a+2} {b+2})) (uuid "{uuid.uuid4()}") (gr_text "{a}" (uuid "{uuid.uuid4()}")))'
+                    for a, b in ((1, 2), (5, 6))]
+            return HEADER + ' '.join(reversed(dims) if reverse else dims) + ')'
+        a, count = canonicalize_generated_ids(converted(False), original, 'board')
+        b, _ = canonicalize_generated_ids(converted(True), original, 'board')
+        self.assertEqual(count, 4)
+        self.assertEqual(sorted(children(parse(a), 'dimension')), sorted(children(parse(b), 'dimension')))
+        native = str(uuid.uuid4())
+        source = HEADER + f'(zone (uuid "{native}")))'
+        fixed, count = canonicalize_generated_ids(source, source, 'board')
+        self.assertEqual((fixed, count), (source, 0))
+        legacy_native = source.replace('(uuid ', '(tstamp ')
+        self.assertEqual(canonicalize_generated_ids(source, legacy_native, 'board'), (source, 0))
 
     def test_terminal_signature_across_kicad_versions(self):
         old = '(kicad_pcb (net 1 "GND") (module "Pkg" (fp_text reference "U1") (pad "1" smd rect (net 1 "GND"))))'
@@ -147,10 +198,40 @@ class PreparationTests(unittest.TestCase):
                 stats = refill_board(source, target, report, board_name='fixture')
             self.assertEqual(len(calls), 2)
             self.assertEqual(source.read_text(), original)
-            self.assertEqual(stats['identity_repairs'], {'zero': 2, 'duplicate': 1})
+            self.assertEqual(stats['identity_repairs'], {'duplicate': 1})
+            self.assertEqual(stats['generated_identity_repairs'], 2)
             self.assertEqual(stats['post_save_identity_repairs'], {'duplicate': 1})
             self.assertEqual(repair_design_ids(target.read_text(), 'fixture')[1], {})
             self.assertEqual(json.loads(report.read_text()), {'pass': 2})
+
+    def test_refill_report_canonicalization_and_first_fill_discard(self):
+        original = HEADER + '(zone (net 1) (layer "F.Cu")) )'
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            source = root / 'raw.kicad_pcb'
+            source.write_text(original)
+            calls = []
+
+            def run(command, **kwargs):
+                work = pathlib.Path(command[-1])
+                calls.append(work.read_text())
+                if len(calls) == 1:
+                    work.write_text(HEADER + f'(zone (uuid "{uuid.uuid4()}") (filled_polygon (pts (xy 999 999)))))')
+                else:
+                    self.assertNotIn('filled_polygon', work.read_text())
+                pathlib.Path(command[command.index('-o') + 1]).write_text(json.dumps({
+                    'date': 'changing wall clock', 'violations': [
+                        {'type': 'z', 'items': [{'uuid': 'b'}, {'uuid': 'a'}]},
+                        {'type': 'a', 'items': []}]}))
+                return subprocess.CompletedProcess(command, 0)
+
+            target, report = root / 'saved.kicad_pcb', root / 'report.json'
+            with patch('prepare_inputs.subprocess.run', side_effect=run):
+                refill_board(source, target, report)
+            data = json.loads(report.read_text())
+            self.assertNotIn('date', data)
+            self.assertEqual([issue['type'] for issue in data['violations']], ['a', 'z'])
+            self.assertEqual(data['violations'][1]['items'], [{'uuid': 'a'}, {'uuid': 'b'}])
 
     def test_refill_repair_failure_does_not_publish_conversion(self):
         with tempfile.TemporaryDirectory() as directory:

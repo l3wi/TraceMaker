@@ -5,8 +5,8 @@
   python3 bench/prepare_pcbench.py --set quick --set mid
 
 The published unrouted board's references/pads/nets are authoritative (PCBench
-renames duplicate references). Transplant only raw zone definitions and no-track
-vias, mapping nets by name after checking outline/layer compatibility. Incompatible
+renames duplicate references). Transplant only raw zone definitions and fixed
+no-track/pad-array vias, mapping nets by name after checking outline/layer compatibility. Incompatible
 boards retain the published input and an explicit coverage warning; human stays raw.
 """
 import argparse

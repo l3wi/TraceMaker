@@ -29,17 +29,37 @@ The download pins were checked against upstream, not by a complete fresh-clone d
 
 ### Building unrouted fixtures
 
-The routing sets use `bench/prepare_inputs.py` (D113). It removes tracks/arcs and every via whose copper
-touches an original track on a layer in its span (including endpoint/interior/arc contact); it retains no-track
-vias as fixed design copper, including thermal arrays and stitching/fences. This is a reproducible geometric
-classification, not a claim to infer their electrical purpose. It keeps zone outlines/settings, drops old
-`filled_polygon`/legacy `fill_segments`, and refills/saves the stripped input with KiCad 10 before routing.
-After legacy conversion, missing zone/via UUIDs and every zero/duplicate UUID are replaced by deterministic
-`uuid5` identifiers keyed by board name and stable item index, preserving valid unique IDs. If any identity
-changed, a second refill/report is the authoritative result; fills and keepout judgment must see distinct rule
-areas. Native dimension/display-text UUID aliases are de-duplicated once more after saving (identity-only,
-no geometry changes). Each manifest records `identity_repairs` and `post_save_identity_repairs` by kind.
-The human original is never rewritten.
+The routing sets use `bench/prepare_inputs.py` (D113, D163–D164). Tracks/arcs and ordinary
+track-contact vias are removed (endpoint/interior/arc contact on any layer in the via span).
+No-track vias remain fixed design copper. A via touched by a track also remains fixed when
+at least two distinct via centres have their **whole annuli inside one same-net SMD pad**
+on a shared copper layer. This preserves same-pad thermal/via-in-pad arrays without retaining
+single signal fanout vias, partial pad overlaps or arbitrary nearby clusters. Supported pad
+copper is rotated rect/circle/oval/unchamfered roundrect; custom/chamfered shapes are not
+guessed. Classification uses original geometry, before tracks are removed. Manifests record
+`pad_array_vias` and the additional retained `pad_array_track_vias`; ordinary signal routing
+vias still follow the contact rule. This is a geometric design-copper convention, not
+datasheet-certified thermal intent.
+
+Zone outlines/settings are preserved and stale `filled_polygon`/legacy `fill_segments` are
+discarded. KiCad first converts a private copy to native syntax. Unique nonzero native source
+UUIDs (including KiCad 6/7 full-UUID `tstamp`) survive unchanged; loader-generated UUIDs use
+deterministic `uuid5` IDs keyed by source SHA256, board name, identity-free item/container
+content and identical-item occurrence rank. Converted list indices are **not** stable:
+KiCad sorts drawings/dimensions by UUID. Missing/zero/duplicate IDs are repaired before the
+authoritative refill. Whenever identities change, first-pass fills are discarded again and
+KiCad refills/saves with stable identities. This matters geometrically: changing only pad
+UUIDs on `fan_controller_fan_controller` reproduced the historical polygon differences with
+unchanged outlines, positions, rules and zone IDs. No single-thread claim is made; stable
+identity/order, rather than a thread-count workaround, fixes the observed input variation.
+
+Dimension/display-text UUID aliases are de-duplicated after saving (identity-only); the
+reported mechkeys text discrepancy was dimension-object reordering, not moved dimensions.
+Manifests record `identity_repairs`, `post_save_identity_repairs`,
+`generated_identity_repairs` and `preparation_schema: 2`. Preparation DRC JSON drops the
+wall-clock `date` and canonically orders issues/items; all physical evidence and severity
+remain. Boards, byte-copied rules, reports and manifests are reproducible for the same source
+and KiCad version, with no timestamp exception. The human original is never rewritten.
 `<fixtures>/<name>/` contains `unrouted.kicad_pcb`, byte-original `routed.kicad_pcb`, matching project/custom rules
 beside both, and `preparation.json` (source/input hashes, removed tracks/vias, fixed vias, zones) plus preparation DRC.
 
@@ -65,6 +85,18 @@ new `boards.jsonl` rows carry that manifest in `preparation`. True preparation f
 Ref-based human comparisons must account for PCBench's renamed refs.
 Legacy DAC2020 and place-and-route preparation keep their existing all-vias-stripped convention; they are not
 the D113 routing sets.
+
+Prepare independent v2 sets in **new** directories, leaving earlier benchmark inputs immutable:
+
+```sh
+python3 bench/prepare_pcbench.py --set quick --set mid --out build/fixtures-v2/pcbench
+python3 bench/prepare_modern.py --out build/fixtures-v2/modern-planes
+```
+
+Repeat into another fresh root and compare every file, not just UUID-stripped geometry.
+Pass `--fixtures build/fixtures-v2/pcbench` (or `modern-planes`) explicitly to `run.py`;
+its existing preflight validates every manifest file hash. Changing the fixture revision
+requires a new router baseline; legacy and v2 run results are not interchangeable.
 
 ## 2. Metrics per board
 

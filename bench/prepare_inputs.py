@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Shared benchmark preparation: remove routing, preserve design copper, refill.
 
-Via classification uses physical copper contact with any original track on a
-layer in its span, not net names or proximity to a pad. No-track vias are fixed
-thermal/stitching design copper; their intent is not inferred from a package.
+Via classification uses physical copper contact with original tracks. No-track
+vias and multi-via groups fully contained in one same-net SMD pad are fixed
+design copper; a track endpoint cannot make one array member disposable.
 """
 import hashlib
 import json
@@ -106,6 +106,65 @@ def track_distance(p, node):
     return min(math.dist(p, a) for a in ends)
 
 
+def pad_via_groups(board, vias, layers):
+    """Retain arrays, not single signal fanout vias or proximity-based clusters.
+
+    Require at least two distinct via centres with their complete annuli inside
+    the same supported SMD pad. Unsupported/custom pads are not guessed.
+    """
+    retained = set()
+    for fp in children(board, 'footprint') + children(board, 'module'):
+        at = child(fp, 'at', ['', '0', '0'])
+        fx, fy = float(at[1]), float(at[2])
+        angle = math.radians(-float(at[3]) if len(at) > 3 else 0)
+        c, s = math.cos(angle), math.sin(angle)
+        for pad in children(fp, 'pad'):
+            if len(pad) < 4 or pad[2] != 'smd' or pad[3] not in ('rect', 'roundrect', 'circle', 'oval'):
+                continue
+            net = child(pad, 'net', ['', '0'])[1]
+            if net in ('0', ''):
+                continue
+            pa, size = child(pad, 'at'), child(pad, 'size')
+            if pa is None or size is None:
+                continue
+            px, py = float(pa[1]), float(pa[2])
+            x, y = fx + px * c - py * s, fy + px * s + py * c
+            # KiCad stores the pad's absolute angle, but its position is local.
+            rotation = math.radians(float(pa[3]) if len(pa) > 3 else 0)
+            pc, ps = math.cos(rotation), math.sin(rotation)
+            hw, hh = float(size[1]) / 2, float(size[2]) / 2
+            shape = pad[3]
+            corner = (min(hw, hh) if shape in ('circle', 'oval') else
+                      2 * min(hw, hh) * float(child(pad, 'roundrect_rratio', ['', '0'])[1])
+                      if shape == 'roundrect' else 0)
+            # Chamfered roundrect pads need their actual polygon, not this core.
+            if child(pad, 'chamfer') is not None:
+                continue
+            pad_layers = child(pad, 'layers', [''])[1:]
+            members = []
+            for index, via in enumerate(vias):
+                if child(via, 'net', ['', '0'])[1] != net:
+                    continue
+                span = child(via, 'layers')[1:]
+                via_layers = layers if '*.Cu' in span else layers[
+                    min(layers.index(layer) for layer in span):max(layers.index(layer) for layer in span) + 1]
+                if '*.Cu' not in pad_layers and not set(via_layers).intersection(pad_layers):
+                    continue
+                vx, vy = point(via, 'at')
+                u, v = abs((vx - x) * pc - (vy - y) * ps), abs((vx - x) * ps + (vy - y) * pc)
+                radius = float(child(via, 'size')[1]) / 2
+                if u + radius > hw + 1e-7 or v + radius > hh + 1e-7:
+                    continue
+                du, dv = u - hw + corner, v - hh + corner
+                clearance = corner - math.hypot(max(0, du), max(0, dv)) - min(max(du, dv), 0)
+                if corner and radius > clearance + 1e-7:
+                    continue
+                members.append(index)
+            if len({point(vias[index], 'at') for index in members}) >= 2:
+                retained.update(members)
+    return retained
+
+
 def strip_design_routing(text):
     board = parse(text)
     tracks = children(board, 'segment') + children(board, 'arc')
@@ -127,9 +186,11 @@ def strip_design_routing(text):
             for y in range(math.floor(lo[1] / pitch), math.floor(hi[1] / pitch) + 1):
                 cells[child(track, 'layer')[1], x, y].append(track)
     via_spans = sorted((s, e) for s, e, depth, head in expressions(text) if depth == 1 and head == 'via')
-    removed, kept = [], 0
-    for start, stop in via_spans:
-        via = parse(text[start:stop])
+    vias = [parse(text[start:stop]) for start, stop in via_spans]
+    pad_arrays = pad_via_groups(board, vias, layers)
+    removed, kept, array_contacts = [], 0, 0
+    for index, (start, stop) in enumerate(via_spans):
+        via = vias[index]
         p, radius = point(via, 'at'), float(child(via, 'size')[1]) / 2
         span = child(via, 'layers')[1:]
         if '*.Cu' in span:
@@ -149,17 +210,19 @@ def strip_design_routing(text):
                     break
             if touches:
                 break
-        if touches:
+        if touches and index not in pad_arrays:
             removed.append((start, stop))
         else:
             kept += 1
+            array_contacts += int(touches and index in pad_arrays)
     zones = [(s, e) for s, e, depth, head in expressions(text) if depth == 1 and head == 'zone']
     for start, stop in zones:
         removed.extend((start + s, start + e) for s, e, depth, head in expressions(text[start:stop])
                        if depth == 1 and head in ('filled_polygon', 'fill_segments'))
     removed.extend((s, e) for s, e, depth, head in expressions(text) if depth == 1 and head in ('segment', 'arc'))
     return without_spans(text, removed), {'tracks_removed': len(tracks), 'vias_removed': len(via_spans) - kept,
-                                        'fixed_vias': kept, 'zones': len(zones)}
+                                        'fixed_vias': kept, 'pad_array_vias': len(pad_arrays),
+                                        'pad_array_track_vias': array_contacts, 'zones': len(zones)}
 
 
 def copy_rules(source, target, fallback=None):
@@ -175,10 +238,70 @@ def copy_rules(source, target, fallback=None):
             dst.unlink()  # Do not reuse rules from an earlier fixture revision.
 
 
+def canonicalize_generated_ids(text, original, board_name):
+    """Replace loader-generated IDs, preserving unique native source IDs.
+
+    KiCad sorts drawings/zones by UUID when saving. A converted list index is
+    not stable: hash identity-free item content and its top-level container.
+    """
+    def semantic(node):
+        if not isinstance(node, list):
+            return node
+        return [semantic(n) for n in node if not isinstance(n, list)
+                or n[0] not in ('uuid', 'tstamp', 'filled_polygon', 'fill_segments')]
+
+    def fingerprint(node):
+        return hashlib.sha256(json.dumps(semantic(node), separators=(',', ':')).encode()).hexdigest()
+
+    native = Counter()
+    for start, stop, _, head in expressions(original):
+        if head not in ('uuid', 'tstamp'):
+            continue
+        value = parse(original[start:stop])[1]
+        # KiCad 6/7 calls full UUIDs tstamp; legacy eight-hex timestamps
+        # are not globally unique native identities.
+        if len(value) == 36:
+            native[str(uuid.UUID(value))] += 1
+    preserved = {value for value, count in native.items() if count == 1 and uuid.UUID(value).int}
+    seed = hashlib.sha256(original.encode()).hexdigest()
+    spans = sorted(expressions(text))
+    stack, changes, occurrences = [], [], Counter()
+    used = set(preserved)
+    fingerprints = {}
+    for start, stop, depth, head in spans:
+        while stack and stack[-1][1] <= start:
+            stack.pop()
+        if head == 'uuid':
+            value = str(uuid.UUID(parse(text[start:stop])[1]))
+            if value not in preserved:
+                owner = stack[-1]
+                container = stack[1] if len(stack) > 1 else owner
+                for span in (container, owner):
+                    if span not in fingerprints:
+                        fingerprints[span] = fingerprint(parse(text[span[0]:span[1]]))
+                key = (fingerprints[container], fingerprints[owner])
+                rank = occurrences[key]
+                occurrences[key] += 1
+                attempt = 0
+                while True:
+                    value = str(uuid.uuid5(uuid.NAMESPACE_URL,
+                                          f'tracemaker-prepared-v2:{board_name}:{seed}:{key}:{rank}:{attempt}'))
+                    if value not in used:
+                        break
+                    attempt += 1
+                used.add(value)
+                changes.append((start, stop, f'(uuid "{value}")'))
+        stack.append((start, stop))
+    for start, stop, replacement in reversed(changes):
+        text = text[:start] + replacement + text[stop:]
+    return text, len(changes)
+
+
 def refill_board(source, target, report, timeout=600, board_name=None):
     """Convert, repair identities and refill a private copy, leaving the source untouched."""
     target.parent.mkdir(parents=True, exist_ok=True)
     report.parent.mkdir(parents=True, exist_ok=True)
+    original = source.read_text()
     board_name = board_name or source.parent.name
     with tempfile.TemporaryDirectory(prefix='.refill-', dir=target.parent) as tmp:
         work = pathlib.Path(tmp) / target.name
@@ -195,20 +318,36 @@ def refill_board(source, target, report, timeout=600, board_name=None):
                 raise RuntimeError(f'KiCad refill failed for {source}: {result.stderr or result.stdout}')
             json.loads(private_report.read_text())
 
-        refill()  # Legacy conversion must precede native UUID repair.
-        corrected, repairs = repair_design_ids(work.read_text(), board_name)
-        if repairs:
+        refill()  # Convert legacy syntax before assigning generated identities.
+        corrected, generated = canonicalize_generated_ids(work.read_text(), original, board_name)
+        corrected, repairs = repair_design_ids(corrected, board_name)
+        if repairs or generated:
+            # No random-ID first-pass fill may feed the authoritative fill.
+            corrected = without_spans(corrected, [(s, e) for s, e, _, head in expressions(corrected)
+                                                  if head in ('filled_polygon', 'fill_segments')])
             work.write_text(corrected)
             refill()
         # KiCad aliases dimension display-text UUIDs to their parent on save.
         corrected, post_save_repairs = repair_design_ids(work.read_text(), board_name)
         if post_save_repairs:
             work.write_text(corrected)
+        # Manifests hash reports too: wall dates and issue order are not design
+        # information. Keep physical evidence and item identities intact.
+        data = json.loads(private_report.read_text())
+        data.pop('date', None)
+        for key in ('violations', 'unconnected_items', 'schematic_parity'):
+            for issue in data.get(key, []):
+                if 'items' in issue:
+                    issue['items'].sort(key=lambda item: json.dumps(item, sort_keys=True))
+            if key in data:
+                data[key].sort(key=lambda issue: json.dumps(issue, sort_keys=True))
+        private_report.write_text(json.dumps(data, sort_keys=True, indent=2) + '\n')
         copy_rules(source, target)
         os.replace(work, target)
         os.replace(private_report, report)
         return {'identity_repairs': dict(Counter(repairs) + Counter(post_save_repairs)),
-                'post_save_identity_repairs': post_save_repairs}
+                'post_save_identity_repairs': post_save_repairs,
+                'generated_identity_repairs': generated, 'preparation_schema': 2}
 
 def canonical_net_name(name):
     # KiCad upgrades legacy overbar syntax without changing electrical identity.
