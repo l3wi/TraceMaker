@@ -77,6 +77,7 @@ void add_route_options(CLI::App& app, RouteJob& job, bool require_paths) {
   route->add_option("--pair-max-expansions", ropt.pair_max_expansions, "Local coupled-pair state cap (0 = length-scaled 40k-250k; ablation only)")
       ->check(CLI::NonNegativeNumber)->group("");
   route->add_flag("!--no-pair-leg-cache", ropt.pair_leg_cache, "Disable local exact-leg reuse (reference/ablation only)")->group("");
+  route->add_flag("!--no-pair-exit-index", ropt.pair_exit_index, "Disable exit-guidance index and memo (reference/ablation only)")->group("");
   route->add_option("--pair-skew-mm", r_pair_skew_mm, "Intra-pair skew limit for coupled pairs: meanders on the shorter half (0 = custom skew rules only)");
   route->add_flag("--global", ropt.global_route, "Global routing first: detailed search follows coarse corridors");
   route->add_flag("--global-confine", ropt.global_confine, "With --global: confine each connection's first search to its corridor (experimental)")->group("");

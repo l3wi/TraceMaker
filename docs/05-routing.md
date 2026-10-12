@@ -442,6 +442,20 @@ cache never survives the selection call, and committing a pair still rechecks bo
 against current copper. `--no-pair-leg-cache` runs the uncached reference; mirrored three-lane tests
 compare every output track and via against it. No local state cap or job budget is raised.
 
+**Exit-guidance acceleration (D160).** The immutable guide multiset has a median-split AABB
+tree. Guide boxes use ceil(width/2); probes use ceil(width/2) plus clearance, conservatively
+bounding the original floor((probe-width + guide-width)/2) distance threshold. Every candidate
+still passes the original layer/self/partner eligibility filter and exact segment-distance predicate.
+A 4,096-entry direct-mapped memo keys directed endpoints, layer, net, width, clearance and pitch;
+rebuilding guides invalidates every entry. Eligibility stays fixed within each guide generation.
+Duplicate guides contribute separately. Traversal counts hits, then repeats the original identical
+floating-point addition once per hit (not hit-count multiplication), preserving its rounding sequence
+even outside the exact-double integer range. Queries allocate no heap memory.
+`--no-pair-exit-index` disables both index and memo for the linear reference. The mirrored
+three-lane test checks identical copper and charged work; randomized/edge tests compare bitwise costs,
+including odd widths, degenerate/reversed segments, collisions and rebuilds. Work charging,
+polling, routing caps and USB integration budgets are unchanged.
+
 **Bounded upfront pair probes (D127).** Coupling cannot spend the work needed to complete other nets.
 With a fixed-work job, all upfront pair passes share `max(1, work / 10)` charged work units
 across restarts: 10%, or 10 M / 20 M at the everyday 100 M / 200 M budgets.

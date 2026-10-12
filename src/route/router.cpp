@@ -6,6 +6,7 @@
 #include "route/escape_flow.hpp"
 #include "route/heat_grid.hpp"
 #include "route/global_router.hpp"
+#include "route/pair_exit_guidance.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -2299,16 +2300,10 @@ struct Router::Impl {
   std::string pair_why;
   std::string pair_tag;  // TM_DEBUG_PAIRS: which unhandled situation the last pair was in
   std::vector<std::uint8_t> pad_routed_here;  // board pad -> an end of some connection (filled on first use)
-  struct PairExitGuide { Point a, e; model::LayerMask layers; NetId net; Coord width; };
-  std::vector<PairExitGuide> pair_exit_guides;
+  PairExitGuidance pair_exit_guidance;
   double pair_exit_cost(Point p, Point q, int layer, NetId net, Coord width) const {
-    double cost = 0;
-    for (const auto& guide : pair_exit_guides) {
-      if (!(guide.layers & model::layer_bit(layer)) || guide.net == net || pair_wanted(net, guide.net)) continue;
-      if (geom::seg_seg_closer(p, q, guide.a, guide.e, (width + guide.width) / 2 + netclass(net).clearance))
-        cost += 8.0 * static_cast<double>(pitch);
-    }
-    return cost;
+    return pair_exit_guidance.cost(p, q, layer, net, width, netclass(net).clearance, pitch,
+                                   opt.pair_exit_index, [&](NetId other) { return !pair_wanted(net, other); });
   }
   // Is the first unrouted connection at `pad` boxed in? A strict search from the pad (60k expansions at most) that
   // exhausts its open list inside the window proves it; any path, or a search cut short, says no.
@@ -3230,7 +3225,7 @@ struct Router::Impl {
     }
     std::sort(jobs.begin(), jobs.end(), [](const auto& a, const auto& c) { return a.order < c.order; });
     if (!recouple) {
-      pair_exit_guides.clear();
+      std::vector<PairExitGuide> pair_exit_guides;
       // A coupled endpoint must also respect the forward escapes of ordinary
       // unrouted nets, not just adjacent differential lanes. This stays a soft
       // cost: a necessary crossing is legal and still checked exactly.
@@ -3251,6 +3246,7 @@ struct Router::Impl {
           if (!(exit == p.pos)) pair_exit_guides.push_back({p.pos, exit, p.copper, c.net, width});
         }
       }
+      pair_exit_guidance.rebuild(std::move(pair_exit_guides), opt.pair_exit_index);
     }
     // Upfront coupling gets at most 10% of fixed work, shared across restarts.
     // A local ceiling must not mark the whole job stopped.

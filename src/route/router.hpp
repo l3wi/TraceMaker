@@ -82,6 +82,7 @@ struct RouterOptions {
   bool pair_twists = true;
   long pair_max_expansions = 0;  // 0: length-scaled 40k–250k local cap; explicit cap for controlled ablations
   bool pair_leg_cache = true;   // reuse invariant endpoint checks locally; false is the exact reference path
+  bool pair_exit_index = true;  // conservative exit-guide index + memo; false is the linear reference
   Coord pair_skew = 0;
   // Per-pair limits for RouterOptions::pair_nets (same index; 0 or missing = pair_skew): component rules give each
   // interface its own limit (USB 2.0 1.27 mm, doc 15 USB2-02).

@@ -383,27 +383,34 @@ TEST_CASE("pair search couples adjacent fine-pitch rows with exact legal widths 
       }
     }
     const auto result = route::Router(b, r, o).run();
-    auto reference_options = o;
-    reference_options.pair_leg_cache = false;
-    const auto reference = route::Router(b, r, reference_options).run();
-    REQUIRE(result.tracks.size() == reference.tracks.size());
-    REQUIRE(result.vias.size() == reference.vias.size());
-    CHECK(result.pair_work <= reference.pair_work);
-    for (std::size_t i = 0; i < result.tracks.size(); ++i) {
-      CHECK(result.tracks[i].a == reference.tracks[i].a);
-      CHECK(result.tracks[i].b == reference.tracks[i].b);
-      CHECK(result.tracks[i].width == reference.tracks[i].width);
-      CHECK(result.tracks[i].layer == reference.tracks[i].layer);
-      CHECK(result.tracks[i].net == reference.tracks[i].net);
-    }
-    for (std::size_t i = 0; i < result.vias.size(); ++i) {
-      CHECK(result.vias[i].pos == reference.vias[i].pos);
-      CHECK(result.vias[i].size == reference.vias[i].size);
-      CHECK(result.vias[i].drill == reference.vias[i].drill);
-      CHECK(result.vias[i].net == reference.vias[i].net);
-      CHECK(result.vias[i].layer_top == reference.vias[i].layer_top);
-      CHECK(result.vias[i].layer_bottom == reference.vias[i].layer_bottom);
-      CHECK(result.vias[i].type == reference.vias[i].type);
+    for (const bool exit_reference : {false, true}) {
+      auto reference_options = o;
+      reference_options.pair_leg_cache = exit_reference;
+      reference_options.pair_exit_index = !exit_reference;
+      const auto reference = route::Router(b, r, reference_options).run();
+      REQUIRE(result.tracks.size() == reference.tracks.size());
+      REQUIRE(result.vias.size() == reference.vias.size());
+      CHECK(result.pair_work <= reference.pair_work);
+      if (exit_reference) {
+        CHECK(result.pair_work == reference.pair_work);
+        CHECK(result.expansions == reference.expansions);
+      }
+      for (std::size_t i = 0; i < result.tracks.size(); ++i) {
+        CHECK(result.tracks[i].a == reference.tracks[i].a);
+        CHECK(result.tracks[i].b == reference.tracks[i].b);
+        CHECK(result.tracks[i].width == reference.tracks[i].width);
+        CHECK(result.tracks[i].layer == reference.tracks[i].layer);
+        CHECK(result.tracks[i].net == reference.tracks[i].net);
+      }
+      for (std::size_t i = 0; i < result.vias.size(); ++i) {
+        CHECK(result.vias[i].pos == reference.vias[i].pos);
+        CHECK(result.vias[i].size == reference.vias[i].size);
+        CHECK(result.vias[i].drill == reference.vias[i].drill);
+        CHECK(result.vias[i].net == reference.vias[i].net);
+        CHECK(result.vias[i].layer_top == reference.vias[i].layer_top);
+        CHECK(result.vias[i].layer_bottom == reference.vias[i].layer_bottom);
+        CHECK(result.vias[i].type == reference.vias[i].type);
+      }
     }
     REQUIRE(result.pairs >= 3);
     for (const auto& [a, partner] : {std::pair{1, 2}, std::pair{4, 5}, std::pair{6, 7}}) {
