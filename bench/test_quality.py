@@ -236,6 +236,8 @@ class QualityTests(unittest.TestCase):
                     self.assertEqual(judged['error_gate'],'unknown')
                     self.assertIn(kind,judged['capped_types'])
                     self.assertNotIn(kind,judged['added_errors'])
+            warnings=dict(report,violations=[dict(v,severity='warning') for v in report['violations']])
+            self.assertIsNone(io.judge(empty,warnings)['drc_pass'])
 
     def test_exact_per_net_data_removes_censored_ground_na(self):
         data=dict(nets=['GND'],pads=[],tracks=[],arcs=[],vias=[],copper_layers=[])
