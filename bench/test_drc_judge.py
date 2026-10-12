@@ -46,12 +46,21 @@ class InstanceJudgeTests(unittest.TestCase):
         for typ in ('solder_mask_bridge', 'clearance'):
             with self.subTest(typ=typ):
                 v = violation(kind='Pad', typ=typ)
-                v['items'].append(dict(description='Graphic on F.Cu', pos={'x': 0, 'y': 0}))
                 result = judge.added_errors({}, {'violations': [v]})
                 self.assertEqual(result['error_gate'], 'pass')
                 self.assertEqual(result['added_errors'], {})
                 self.assertEqual(result['added_any'], {typ: 1})
                 self.assertEqual(judge.added_errors({}, {'violations': [violation(typ=typ)]})['error_gate'], 'fail')
+
+    def test_refill_gate_depends_on_type_and_severity_not_item_kinds(self):
+        for typ in sorted(judge.REFILL_ROUTING_TYPES):
+            for kind in ('Pad', 'Zone', 'Track'):
+                for severity in ('error', 'warning'):
+                    with self.subTest(typ=typ, kind=kind, severity=severity):
+                        result = judge.added_errors({}, {
+                            'violations': [violation(kind=kind, typ=typ, severity=severity)]})
+                        self.assertEqual(result['error_gate'], 'fail' if severity == 'error' else 'pass')
+                        self.assertEqual(result['added_errors'], {typ: 1} if severity == 'error' else {})
 
     def test_refill_error_caps_remain_unknown_across_severities(self):
         for typ in sorted(judge.REFILL_ROUTING_TYPES):

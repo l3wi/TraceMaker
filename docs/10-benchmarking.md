@@ -187,6 +187,11 @@ coverage threshold, keepout/teardrop exclusions and outline clipping are unchang
 Exact per-net connectivity and DRC-list fallback partition against these same
 resolved names. Rejudgment recomputes plane ownership and copper totals from the
 preserved input/output, rather than inheriting stale plane metrics.
+On the preserved `build/modern-planes/gsg-cynthion/unrouted.kicad_pcb`, the
+numeric-table-only parser returned no plane nets. D162 resolves `GND` on F.Cu,
+B.Cu, In1.Cu, In2.Cu and In4.Cu (100% boundary coverage each), and `+3V3` on
+In2.Cu (63.4528%). These are zone-boundary measurements, not a claim that every
+pad has a filled-copper connection.
 
 Every violation type at its KiCad report cap is published in `capped` and excluded
 from exact added-instance arithmetic. Clearance caps at 499; other violation types
