@@ -22,9 +22,49 @@ class InstanceJudgeTests(unittest.TestCase):
     def test_multiset_and_nonrouting_errors_are_not_silenced(self):
         v = violation(kind='Pad', typ='starved_thermal')
         result = judge.added_errors({'violations': [v]}, {'violations': [v, v, v]})
-        self.assertEqual(result['added_errors'], {})
+        self.assertEqual(result['added_errors'], {'starved_thermal': 2})
         self.assertEqual(result['added_nonrouting'], {'starved_thermal': 2})
         self.assertEqual(result['added_any'], {'starved_thermal': 2})
+        self.assertEqual(result['error_gate'], 'fail')
+
+    def test_refill_errors_without_routed_items_gate_physical_additions(self):
+        for typ in sorted(judge.REFILL_ROUTING_TYPES):
+            with self.subTest(typ=typ):
+                v = violation(kind='Pad', typ=typ)
+                v['items'].append(dict(description='Zone [GND] on F.Cu', pos={'x': 0, 'y': 0}))
+                before, after = {'violations': []}, {'violations': [v]}
+                result = judge.added_errors(before, after)
+                self.assertEqual(result['error_gate'], 'fail')
+                self.assertEqual(result['added_errors'], {typ: 1})
+                self.assertEqual(result['added_nonrouting'], {typ: 1})
+                self.assertEqual(judge.added_errors(after, after)['error_gate'], 'pass')
+                moved = violation(kind='Pad', typ=typ, x=3)
+                moved['items'].append(v['items'][1])
+                self.assertEqual(judge.added_errors(after, {'violations': [moved]})['error_gate'], 'fail')
+
+    def test_pad_only_refill_noise_and_net_propagation_remain_diagnostic(self):
+        for typ in ('solder_mask_bridge', 'clearance'):
+            with self.subTest(typ=typ):
+                v = violation(kind='Pad', typ=typ)
+                v['items'].append(dict(description='Graphic on F.Cu', pos={'x': 0, 'y': 0}))
+                result = judge.added_errors({}, {'violations': [v]})
+                self.assertEqual(result['error_gate'], 'pass')
+                self.assertEqual(result['added_errors'], {})
+                self.assertEqual(result['added_any'], {typ: 1})
+                self.assertEqual(judge.added_errors({}, {'violations': [violation(typ=typ)]})['error_gate'], 'fail')
+
+    def test_refill_error_caps_remain_unknown_across_severities(self):
+        for typ in sorted(judge.REFILL_ROUTING_TYPES):
+            for severity in ('error', 'warning'):
+                capped = {'violations': [violation(kind='Pad', typ=typ, severity=severity)] * 199}
+                error = {'violations': [violation(kind='Pad', typ=typ)]}
+                for before, after in ((capped, error), (error, capped)):
+                    with self.subTest(typ=typ, severity=severity):
+                        result = judge.added_errors(before, after)
+                        self.assertEqual(result['error_gate'], 'unknown')
+                        self.assertEqual(result['capped_evaluated_types'], [typ])
+                        self.assertEqual(result['added_errors'], {})
+                        self.assertIsNone(judge.judge(before, after)['drc_pass'])
 
     def test_layers_nets_kind_position_and_fallback_uuid_are_identity(self):
         base = violation()

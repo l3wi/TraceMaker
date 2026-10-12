@@ -568,11 +568,20 @@ def rejudge_run(source, run_id=None):
             "judge_reports", "unconnected_before", "unconnected_after", "unconnected_uncapped",
             "unconnected_per_net", "connectivity_method", "kicad_python_version",
             "connectivity_unavailable", "added_errors", "added_nonrouting", "added_any",
-            "capped", "capped_types", "error_gate", "error"}}
+            "capped", "capped_types", "capped_evaluated_types", "capped_not_evaluated_types",
+            "error_gate", "error", "plane_nets", "plane_metrics_error",
+            "plane_unconnected_before", "plane_unconnected_after", "signal_unconnected_before",
+            "signal_unconnected_after", "plane_vias_added", "signal_vias_added",
+            "plane_track_mm_added", "signal_track_mm_added"}}
         row.update(metric_schema_version=METRIC_SCHEMA_VERSION, judge_input=str(src), judge_input_sha256=digest(src))
         saved_input = target / "boards" / f"{name}.input.refilled.kicad_pcb"
         saved_output = target / "boards" / f"{name}.refilled.kicad_pcb"
-        planes = row.get("plane_nets")
+        try:
+            planes = plane_nets(src)
+            row["plane_nets"] = planes
+        except ValueError as error:
+            planes = None
+            row["plane_metrics_error"] = str(error)
         before, after = drc(src, planes=planes, saved=saved_input), drc(raw, planes=planes, saved=saved_output)
         row.update(input_refilled_board=str(saved_input.relative_to(target)),
                    refilled_board=str(saved_output.relative_to(target)))
@@ -587,6 +596,11 @@ def rejudge_run(source, run_id=None):
                         row[f"{group}_unconnected_{stage}"] = (
                             sum(n for net, n in counts.items() if (net in planes) == (group == "plane"))
                             if counts is not None else j[f"{group}_unconnected"])
+                initial, final = copper_totals(src, planes), copper_totals(raw, planes)
+                row.update({f"{group}_vias_added": final[f"{group}_vias"] - initial[f"{group}_vias"]
+                            for group in ("plane", "signal")})
+                row.update({f"{group}_track_mm_added": round(final[f"{group}_track_mm"] - initial[f"{group}_track_mm"], 4)
+                            for group in ("plane", "signal")})
         judged_rows.append(row)
         ratio = f'{row["completion"]:.2%}' if row.get("completion") is not None else "unknown"
         print(f'{name}: {row.get("unconnected_uncapped", {})}; completion {ratio}; gate {row.get("error_gate", "failed")}')
@@ -605,7 +619,8 @@ def rejudge_run(source, run_id=None):
                    both_clean=sum(row["clean"] and row["fr_rc12"]["clean"] for row in fr_rows),
                    only_tracemaker_clean=sum(row["clean"] and not row["fr_rc12"]["clean"] for row in fr_rows),
                    only_freerouting_clean=sum(not row["clean"] and row["fr_rc12"]["clean"] for row in fr_rows))
-    for key in ("plane_unconnected_before", "plane_unconnected_after", "signal_unconnected_before", "signal_unconnected_after"):
+    for key in ("plane_unconnected_before", "plane_unconnected_after", "signal_unconnected_before", "signal_unconnected_after",
+                "plane_vias_added", "signal_vias_added", "plane_track_mm_added", "signal_track_mm_added"):
         summary[key] = sum(row.get(key, 0) for row in judged_rows if row["judge"] == "ok")
     feasible = [row for row in judged_rows if row["judge"] == "ok" and row.get("dead_pins") == 0]
     summary.update(feasible_boards=len(feasible),
@@ -816,7 +831,7 @@ def main() -> int:
              f"Boards with added DRC errors: {summary['boards_with_added_errors']} ({dict(added_types)})."]
     lines += [f"Scheduled / attempted / judged: {n} / {summary['attempted']} / {summary['judged']}; "
               f"judge failures: {summary['judge_failures']}; censored boards: {summary['censored_boards']}.",
-              f"New non-routing error instances (diagnostic): "
+              f"New pad/zone/other-only error instances (includes refill-derived gated types): "
               f"{dict(sum((Counter(r.get('added_nonrouting', {})) for r in rows), Counter()))}."]
     lines += [f"Unknown evaluated-error gates: {summary['error_gate_unknown_boards']}; capped types by board: "
               f"{ {r['board']: r.get('capped_evaluated_types', []) for r in rows if r.get('error_gate') == 'unknown'} }."]

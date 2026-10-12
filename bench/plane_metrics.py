@@ -170,13 +170,24 @@ def clipped_area(groups, outline):
     return area
 
 
+def net_name(item, names):
+    """Resolve numeric-table, inline numeric/name and KiCad 10 named nets."""
+    explicit = child(item, 'net_name')
+    if explicit is not None:
+        return explicit[1]
+    net = child(item, 'net')
+    if net is None or len(net) < 2:
+        return ''
+    if len(net) > 2:
+        return net[2]
+    return names.get(net[1], '') if net[1].isdigit() else net[1]
+
+
 def plane_nets(path):
     board = parse(pathlib.Path(path).read_text())
-    nets = {n[1]: n[2] for n in children(board, 'net')}
-    def zone_name(zone):
-        return child(zone, 'net_name', ['', nets.get(child(zone, 'net', ['', '0'])[1], '')])[1]
+    nets = {n[1]: n[2] for n in children(board, 'net') if len(n) > 2}
     zones = [z for z in children(board, 'zone') if child(z, 'keepout') is None
-             and zone_name(z) and not any(child(attr, 'teardrop') for attr in children(z, 'attr'))]
+             and net_name(z, nets) and not any(child(attr, 'teardrop') for attr in children(z, 'attr'))]
     if not zones:
         return {}
     outline = outline_loops(board)
@@ -194,7 +205,7 @@ def plane_nets(path):
         copper = sorted(copper_names) if '*.Cu' in copper else [name for name in copper if name in copper_names]
         polygons = [[(float(p[1]), float(p[2])) for p in children(child(poly, 'pts'), 'xy')]
                     for poly in children(zone, 'polygon')]
-        name = zone_name(zone)
+        name = net_name(zone, nets)
         for copper_layer in copper:
             grouped_zones.setdefault((name, copper_layer), []).append(polygons)
     for (name, copper_layer), groups in sorted(grouped_zones.items()):
@@ -218,13 +229,12 @@ def unconnected_split(items, planes):
 
 def copper_totals(path, planes):
     board = parse(pathlib.Path(path).read_text())
-    names = {n[1]: n[2] for n in children(board, 'net')}
+    names = {n[1]: n[2] for n in children(board, 'net') if len(n) > 2}
     totals = {'plane_vias': 0, 'signal_vias': 0, 'plane_track_mm': 0.0, 'signal_track_mm': 0.0}
     for item in board[1:]:
         if not isinstance(item, list) or item[0] not in ('segment', 'arc', 'via'):
             continue
-        net = child(item, 'net', ['', '0'])[1]
-        group = 'plane' if names.get(net) in planes else 'signal'
+        group = 'plane' if net_name(item, names) in planes else 'signal'
         if item[0] == 'via':
             totals[group + '_vias'] += 1
         else:

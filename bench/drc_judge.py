@@ -5,8 +5,8 @@ import json
 import re
 from kicad_connectivity import CAPS
 
-METRIC_SCHEMA_VERSION = 3
-JUDGE_CODE_VERSION = 'instance-v3-connectivity'
+METRIC_SCHEMA_VERSION = 4
+JUDGE_CODE_VERSION = 'instance-v4-refill-errors'
 JUDGE_FLAGS = ['--format', 'json', '--severity-all', '--all-track-errors']
 
 # Routing cannot alter these library, footprint-placement or text-only findings.
@@ -17,6 +17,11 @@ ROUTING_IMMUTABLE_TYPES = frozenset({
     'courtyards_overlap', 'missing_courtyard', 'malformed_courtyard',
     'text_height', 'text_thickness',
 })
+
+# Refill can reveal damage from routed copper without naming the blocking track.
+# Do not gate every pad/graphic-only delta: net propagation changes those reports,
+# and pad-only solder_mask_bridge is observed refill noise (doc 10, Judge noise).
+REFILL_ROUTING_TYPES = frozenset({'starved_thermal', 'isolated_copper'})
 
 
 def violations(report, *, severity='error'):
@@ -54,12 +59,14 @@ def capped_types(report):
 
 
 def added_errors(before, after):
-    """A16 gates copper errors; saturated types cannot prove an exact delta."""
+    """Gate copper and refill-derived errors; saturated deltas remain unknown."""
     capped = {'before': capped_types(before), 'after': capped_types(after)}
     excluded = set(capped['before']) | set(capped['after'])
     added = Counter({key: n for key, n in (violations(after) - violations(before)).items()
                      if key[0] not in excluded})
-    routing = instance_counts(added, routing=True)
+    routing = instance_counts({key: n for key, n in added.items()
+                               if key[0] in REFILL_ROUTING_TYPES or
+                               any(item[1].startswith(('Track', 'Via', 'Arc')) for item in key[2])})
     error_types = {v.get('type') for report in (before, after)
                    for v in report.get('violations', []) if v.get('severity') == 'error'}
     evaluated = (excluded & error_types) - ROUTING_IMMUTABLE_TYPES

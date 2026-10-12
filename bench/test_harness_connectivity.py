@@ -86,14 +86,20 @@ class ConnectivityHarnessTests(unittest.TestCase):
             root = pathlib.Path(directory)
             fixture = root / 'fixtures/b/unrouted.kicad_pcb'
             fixture.parent.mkdir(parents=True)
-            fixture.write_text('input')
+            fixture.write_text('''(kicad_pcb
+                (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+                (gr_rect (start 0 0) (end 10 10) (layer "Edge.Cuts"))
+                (zone (net "GND") (layer "B.Cu")
+                    (polygon (pts (xy 0 0) (xy 10 0) (xy 10 10) (xy 0 10)))))''')
             source = root / 'bench/results/old'
             (source / 'boards').mkdir(parents=True)
             raw = source / 'boards/b.kicad_pcb'
-            raw.write_text('raw output')
+            raw.write_text(fixture.read_text()[:-1] + '(via (net "GND")))')
             old = dict(board='b', preparation={'input_sha256': harness.digest(fixture)}, exit=3,
                        stop='exhausted', seconds=20, cpu_s=17, work={'expansions': 99},
-                       unconnected_before=499, unconnected_after=100, completion=None, clean=False)
+                       unconnected_before=499, unconnected_after=100, completion=None, clean=False,
+                       plane_nets={}, plane_vias_added=0, plane_unconnected_after=0,
+                       signal_unconnected_after=100)
             (source / 'boards.jsonl').write_text(json.dumps(old) + '\n')
             (source / 'summary.json').write_text(json.dumps({'fixtures': str(fixture.parent.parent), 'boards': 1, 'set': 'test'}))
             source_bytes = (source / 'boards.jsonl').read_bytes()
@@ -121,6 +127,11 @@ class ConnectivityHarnessTests(unittest.TestCase):
             self.assertEqual(manifest['state'], 'final')
             self.assertEqual(manifest['provenance']['kicad_python_version'], ['10.0.3'])
             self.assertEqual(summary['pooled_completion'], .9)
+            self.assertEqual(set(row['plane_nets']), {'GND'})
+            self.assertEqual((row['plane_unconnected_after'], row['signal_unconnected_after']), (100, 0))
+            self.assertEqual(row['plane_vias_added'], 1)
+            self.assertEqual(summary['plane_vias_added'], 1)
+            self.assertEqual(summary['plane_unconnected_after'], 100)
 
 
 class FeatureConsumerTests(unittest.TestCase):

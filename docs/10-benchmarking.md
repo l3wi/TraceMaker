@@ -149,8 +149,20 @@ violation-instance authority shared by the harness, scorecard and feature evalua
 Its multiset identity includes type, severity, physical item description (kind/net/layer,
 without a renamed footprint reference) and positions; UUIDs are fallback identity only
 when positions are absent. Fixing one violation cannot cancel a new one of the same type.
-A16 still gates instances involving a track/via/arc. `added_any` includes every new error;
-`added_nonrouting` publishes pad/zone/other-only instances separately, without ignored types.
+A16 gates new error instances involving a track/via/arc **or** of type
+`starved_thermal` or `isolated_copper` (D161). Refill can expose a lost thermal spoke
+or detached zone island without naming the routed copper that caused it. Compare
+against the independently refilled input under the same KiCad version and rules;
+existing instances do not fail, and a fixed instance cannot cancel a new one.
+`added_any` retains every new error; `added_nonrouting` retains the item-kind
+partition (pad/zone/other-only), including the refill-derived errors now gated.
+It is not a list of exempt types. Other pad/footprint-graphic-only deltas stay
+diagnostic: A16 originally excluded reporting changes after net propagation,
+not physical thermal damage. Pad-only `solder_mask_bridge` also has demonstrated
+refill noise (§4, Judge noise); copper-involving mask errors still gate.
+Zone-outline/net-assignment defects are not evidence that unchanged routing
+damaged a fill. Zone connection losses are assessed by the independent exact
+unconnected count and plane/signal partition, not an invented DRC type.
 
 **Uncapped harness cutover (D154–D156).** Each input/output judge pair batches its saved
 refilled analysis boards through `kicad_connectivity.count_unconnected`. Rows retain
@@ -167,6 +179,14 @@ unknown. Summary means publish known/censored coverage; `pooled_completion` is t
 ratio of exact count totals, separately from the per-board mean. Plane/signal totals
 use exact per-net counts when available. Comparisons prefer exact counts, explicitly
 label mixed uncapped/legacy-list observations, and retain D129/D143 stop rules.
+
+Plane ownership and copper accounting (D162) resolve legacy numeric root net
+tables, inline numeric/name declarations, `net_name` overrides and KiCad 10
+`(net "GND")` items without a root table. The existing ≥60% per-layer boundary
+coverage threshold, keepout/teardrop exclusions and outline clipping are unchanged.
+Exact per-net connectivity and DRC-list fallback partition against these same
+resolved names. Rejudgment recomputes plane ownership and copper totals from the
+preserved input/output, rather than inheriting stale plane metrics.
 
 Every violation type at its KiCad report cap is published in `capped` and excluded
 from exact added-instance arithmetic. Clearance caps at 499; other violation types
@@ -334,8 +354,11 @@ quieter machine, a second run of one binary can. All of it is a pointer for gate
 provides paired-board bootstrap intervals (§9). Seeds: best-of-1 is the headline; best-of-5 is reported separately
 where a comparison needs it (PCBWorld reports baselines as best of 5).
 
-**Judge noise.** KiCad's `solder_mask_bridge` count can differ between runs on byte-identical boards when zones
-are refilled (StickHub: 17, 15 and 13); read a change in that type alone as noise.
+**Judge noise.** KiCad's pad-only `solder_mask_bridge` count can differ between runs on
+byte-identical boards when zones are refilled (StickHub: 17, 15 and 13); those additions
+remain diagnostic, not A16 failures (D161). This is not an exemption for thermal or
+isolated-copper errors. Both judge arms use independently refilled copies under the
+same KiCad/rules; no known pure-refill-noise thermal/island type is excluded.
 
 ## 5. Gates (used by the roadmap)
 
@@ -347,9 +370,10 @@ are refilled (StickHub: 17, 15 and 13); read a change in that type alone as nois
    retain the legacy regression rule, explicitly labelled; no stop is invented from exit code.
    Human runs are references, not router-regression baselines: parity deficits are visible,
    not called finished-before regressions (D129).
-2. Zero added A16 KiCad DRC error instances on **every board**, finished or not. New
-   non-routing instances remain separate diagnostics, not silently dropped. A capped
-   gate-evaluated error type makes absolute sign-off unknown. In a **paired regression**
+2. Zero added A16 KiCad DRC error instances on **every board**, finished or not:
+   routed-copper instances plus `starved_thermal`/`isolated_copper` even when the
+   report names only pads/zones (D161). All other additions remain diagnostics.
+   A capped gate-evaluated error type makes absolute sign-off unknown. In a **paired regression**
    comparison, matching unknown evaluated-type sets on both runs, or types already
    capped in the input report, are listed as “error gate cannot be judged on either
    run” rather than failures; they are not DRC passes. A known baseline becoming
@@ -416,7 +440,8 @@ The mid 100% is **only three uncapped ratios**, not a claim of all-board complet
 Saved mnt-pocket-reform-wifi DRC reports in
 `pairreg-single10-all-exits-modern-planes-T` expose two **new starved-thermal instances**
 despite six total thermals before and after: `added_any`/`added_nonrouting` now report 2,
-where the old harness reported 0. A16's routed-copper gate remains 0 for these pad/zone reports.
+where the old harness reported 0. That historical A16 copper-only gate missed these
+pad/zone reports; D161 now gates them. The comparisons below predate D161.
 
 The three requested saved-result comparisons exit 0, with explicit legacy-provenance
 warnings (not new claims of verified experimental compatibility). Corrected paired
@@ -437,8 +462,9 @@ quality-gated. No routing outputs were changed for these comparisons.
 - `bench/run.py` samples PCBench boards per Freerouting tier, routes each with a binary snapshot, judges with
   `kicad-cli pcb drc`, and compares with Freerouting's published per-board results (`benchmarks.json`).
 - Samples: tier A 40 of 453 boards, tier B 40 of 560, tier C 30 of 122, tier D all 22 (seed 1).
-- Added errors compare violation-instance multisets; A16 gates only instances involving a
-  track, via or arc, and every other new instance is retained in diagnostics (D137).
+- Added errors compare violation-instance multisets; A16 gates track/via/arc instances
+  and refill-derived thermal/island errors (D161); every other new instance remains
+  visible in diagnostics. Historical D137 copper-only results require rejudgment.
 - Results go to `bench/results/<run>/` and the progress site's benchmark panel.
 - Latest (`final8`): tier A 100% clean, B 65.0%, C 56.7%, D 50.0% (Freerouting 2.5.0-RC12: 100%, 50.0%, 46.7%,
   36.4%); no router-introduced DRC errors on any board.
