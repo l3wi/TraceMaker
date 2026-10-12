@@ -6,6 +6,7 @@ import math
 import pathlib
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import quality_compare as compare
 import quality_io as io
@@ -92,7 +93,9 @@ class QualityTests(unittest.TestCase):
             (cache/'provenance.json').write_text(json.dumps(dict(
                 source=str(original),source_sha256=source_hash,analysis_board=str(analysis),
                 identity_repair_code_sha256=io.digest(io.ROOT/'bench/prepare_inputs.py'))))
-            target,_,provenance=io.prepare(human,run,'quality-synthetic','unit-version')
+            with patch.object(io.connectivity, 'count_unconnected',
+                              side_effect=io.connectivity.ConnectivityUnavailable('synthetic unavailable')):
+                target,_,provenance=io.prepare(human,run,'quality-synthetic','unit-version')
             self.assertEqual(target,analysis)
             self.assertTrue(target.exists())
             self.assertEqual(provenance['source'],str(human))
@@ -109,6 +112,130 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(rows['unknown']['all_obligations']['missing'],0)
         self.assertEqual(rows['unknown']['all_obligations']['eligible'],0)
         self.assertEqual(rows['broken']['all_obligations']['loss'],1)
+
+    @staticmethod
+    def saved_report(run, report, version='10.0.3'):
+        board=run/'synthetic.kicad_pcb'
+        board.write_text('(kicad_pcb)')
+        source_hash=io.digest(board)
+        key=hashlib.sha256((source_hash+version).encode()).hexdigest()
+        cache=run/'quality_cache'/key
+        cache.mkdir(parents=True,exist_ok=True)
+        analysis=cache/board.name
+        analysis.write_bytes(board.read_bytes())
+        (cache/'drc.json').write_text(json.dumps(report))
+        (cache/'provenance.json').write_text(json.dumps(dict(
+            source=str(board),source_sha256=source_hash,analysis_board=str(analysis),
+            identity_repair_code_sha256=io.digest(io.ROOT/'bench/prepare_inputs.py'))))
+        return board,analysis
+
+    def test_uncapped_connectivity_cached_after_saved_refill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run=pathlib.Path(directory)
+            report=dict(unconnected_items=[{}]*499,violations=[])
+            board,analysis=self.saved_report(run,report)
+            counts=dict(unconnected=708,per_net={'listed':5,'hidden':703},
+                        kicad_version='10.0.3',method='pcbnew-connectivity')
+            with patch.object(io.connectivity,'count_unconnected',return_value={str(analysis):counts}) as counter:
+                target,before,provenance=io.prepare(board,run,'synthetic','10.0.3')
+                _,cached,_=io.prepare(board,run,'synthetic','10.0.3')
+                counter.assert_called_once_with([target],kicad_cli=io.KICAD)
+                self.assertEqual(cached['connectivity'],counts)
+                self.assertEqual(provenance['connectivity']['unconnected'],708)
+            after=dict(unconnected_items=[{}],violations=[],connectivity=dict(
+                counts,unconnected=1,per_net={'hidden':1}))
+            judged=io.judge(before,after)
+            self.assertEqual(judged['common_denominator'],708)
+            self.assertAlmostEqual(judged['completion'],1-1/708)
+            self.assertEqual(judged['unconnected'],1)
+            self.assertFalse(judged['output_unconnected_censored'])
+            states=scorecard.net_complete(dict(nets=['listed','hidden','other']),['listed'],
+                censored=True,per_net=judged['unconnected_per_net']['after'])
+            self.assertEqual(states,dict(listed=True,hidden=False,other=True))
+            human={'board':{'power':{'listed':dict(connected=True,median_width_mm=.2)}}}
+            arms={'exact':{'board':{'power':{'listed':dict(connected=states['listed'],median_width_mm=.2)}}}}
+            result=compare.summarize(human,arms)['power']['median_width_mm']['arms']['exact']['all_obligations']
+            self.assertEqual(result['not_assessable'],0)
+            self.assertEqual(result['tie'],1)
+            capped=dict(unconnected_items=[{}]*499,violations=[],connectivity=dict(
+                counts,unconnected=600,per_net={'hidden':600}))
+            judged=io.judge(before,capped)
+            self.assertAlmostEqual(judged['completion'],1-600/708)
+            self.assertFalse(judged['electrical_pass'])
+            self.assertFalse(judged['output_unconnected_censored'])
+            self.assertEqual(scorecard.net_complete(dict(nets=['hidden','other']),[],
+                censored=True,per_net=judged['unconnected_per_net']['after']),dict(hidden=False,other=True))
+
+    def test_connectivity_cache_includes_judge_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run=pathlib.Path(directory)
+            report=dict(unconnected_items=[],violations=[])
+            first,first_analysis=self.saved_report(run,report,'10.0.3')
+            second,second_analysis=self.saved_report(run,report,'10.0.6')
+            counts=dict(unconnected=0,per_net={},kicad_version='10.0.3',method='pcbnew-connectivity')
+            with patch.object(io.connectivity,'count_unconnected',side_effect=[
+                    {str(first_analysis):counts},{str(second_analysis):dict(counts,kicad_version='10.0.6')}]) as counter:
+                io.prepare(first,run,'synthetic','10.0.3')
+                io.prepare(second,run,'synthetic','10.0.6')
+                self.assertEqual(counter.call_count,2)
+
+    def test_connectivity_unavailable_keeps_censored_fallback(self):
+        for error in (io.connectivity.ConnectivityUnavailable('not installed'),
+                      io.connectivity.ConnectivityVersionMismatch('10.0.6 != 10.0.3')):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as directory:
+                run=pathlib.Path(directory)
+                board,_=self.saved_report(run,dict(unconnected_items=[{}]*499,violations=[]))
+                with patch.object(io.connectivity,'count_unconnected',side_effect=error):
+                    _,report,provenance=io.prepare(board,run,'synthetic','10.0.3')
+                self.assertNotIn('connectivity',report)
+                self.assertEqual(provenance['connectivity_unavailable'],str(error))
+                judged=io.judge(report,report)
+                self.assertIsNone(judged['completion'])
+                self.assertTrue(judged['output_unconnected_censored'])
+                self.assertTrue(judged['connectivity_unavailable'])
+                self.assertIsNone(scorecard.net_complete(dict(nets=['hidden']),[],
+                    judged['output_unconnected_censored'])['hidden'])
+
+    def test_uncapped_connectivity_mismatch_invalidates_judgment(self):
+        valid=dict(unconnected_items=[],violations=[],connectivity=dict(
+            unconnected=0,per_net={},kicad_version='10.0.3',method='pcbnew-connectivity'))
+        wrong=dict(valid,connectivity=dict(valid['connectivity'],unconnected=1,per_net={'GND':1}))
+        for before,after in ((valid,wrong),(wrong,valid),(None,wrong)):
+            with self.subTest(before=before,after=after), self.assertRaises(ValueError):
+                io.judge(before,after)
+
+    def test_connectivity_mismatch_records_arm_evaluation_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            reference=pathlib.Path(directory)
+            (reference/'boards').mkdir()
+            source=reference/'boards/synthetic.kicad_pcb'
+            source.write_text('(kicad_pcb)')
+            data=dict(pads=[],nets=[])
+            report=dict(unconnected_items=[],violations=[],connectivity=dict(
+                unconnected=1,per_net={'GND':1},kicad_version='10.0.3',method='pcbnew-connectivity'))
+            with patch.object(io,'fixture',return_value=None), \
+                 patch.object(io,'inspect',return_value=data), \
+                 patch.object(io,'prepare',return_value=(source,report,{})), \
+                 patch.object(scorecard.craft,'metadata',return_value={}), \
+                 patch.object(scorecard.identity,'canonical_human',return_value=(data,{})), \
+                 patch.object(scorecard.returns,'inferred_references',return_value={}), \
+                 patch.object(scorecard.qpaths,'infer_endpoints',return_value={}):
+                result=scorecard.board_job(('synthetic',[],reference,None,'10.0.3'))
+            self.assertIn(str(reference),result['errors'])
+            self.assertNotIn(str(reference),result['runs'])
+
+    def test_saturated_error_types_never_pass_new_drc_gate(self):
+        for kind,limit in (('clearance',499),('shorting_items',199)):
+            report=dict(unconnected_items=[],violations=[
+                dict(type=kind,severity='error',description='synthetic')]*limit)
+            empty=dict(unconnected_items=[],violations=[])
+            for before,after in ((report,report),(report,empty),(empty,report)):
+                with self.subTest(kind=kind,before=bool(before['violations']),after=bool(after['violations'])):
+                    judged=io.judge(before,after)
+                    self.assertIsNone(judged['drc_pass'])
+                    self.assertEqual(judged['error_gate'],'unknown')
+                    self.assertIn(kind,judged['capped_types'])
+                    self.assertNotIn(kind,judged['added_errors'])
 
     @staticmethod
     def arc(net, radius, angles, centre=(0, 0)):

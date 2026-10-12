@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import subprocess
 
+import kicad_connectivity as connectivity
+
 ROOT = Path(__file__).resolve().parent.parent
 PCBENCH = ROOT / 'bench/data/freerouting/scripts/benchmark/fixtures/PCBench'
 TM = Path(os.environ.get('TM_BINARY', ROOT / 'build/macos-metal/src/app/tracemaker'))
@@ -96,7 +98,24 @@ def prepare(board, run, name, version, *, supplied=True):
         provenance_data.update(identity_repairs=repairs,identity_repair_code_sha256=repair_code,
                                analysis_sha256=digest(target),analysis_board=str(target),drc_report=str(report))
         provenance.write_text(json.dumps(provenance_data,indent=2))
-    return target, json.loads(report.read_text()), dict(provenance_data, source=str(board), source_sha256=source_hash)
+    report_data = json.loads(report.read_text())
+    connection_key = hashlib.sha256(json.dumps(dict(
+        analysis_sha256=digest(target), rules=rule_hashes, kicad_version=version,
+        connectivity_code_sha256=digest(Path(connectivity.__file__))),
+        sort_keys=True).encode()).hexdigest()
+    connection_cache = run/'quality_cache'/('connectivity-'+connection_key+'.json')
+    try:
+        if connection_cache.exists():
+            connection_data = json.loads(connection_cache.read_text())
+        else:
+            connection_data = connectivity.count_unconnected([target], kicad_cli=KICAD)[str(target)]
+            connection_cache.write_text(json.dumps(connection_data, sort_keys=True))
+        report_data['connectivity'] = connection_data
+        provenance_data['connectivity'] = dict(connection_data, cache=str(connection_cache))
+    except connectivity.ConnectivityUnavailable as error:
+        report_data['connectivity_unavailable'] = str(error)
+        provenance_data['connectivity_unavailable'] = str(error)
+    return target, report_data, dict(provenance_data, source=str(board), source_sha256=source_hash)
 
 
 def inspect(board, run, name):
@@ -108,6 +127,15 @@ def inspect(board, run, name):
     return iq.inspect(board, cache)
 
 
-from drc_judge import bracket_nets, judge, violations
+from drc_judge import bracket_nets, judge as _judge, violations
+
+
+def judge(before, after):
+    """Validate output connectivity even when common-input evaluation failed."""
+    result = _judge(after if before is None else before, after)
+    if before is None:
+        result.update(common_denominator=None, completion=None, already_connected=False,
+                      drc_pass=None, error_gate='unknown')
+    return result
 
 

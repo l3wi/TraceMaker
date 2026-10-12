@@ -185,9 +185,10 @@ def effective_paths(d, manifest, fills, *, _return=True, _graphs=None, _leads=No
     return results
 
 
-def net_complete(d, bad, censored=False):
-    """A capped list proves listed nets incomplete, never proves unlisted nets complete."""
-    return {n: False if n in bad else None if censored else True
+def net_complete(d, bad, censored=False, *, per_net=None):
+    """Exact KiCad per-net data overrides the censored report-list fallback."""
+    return {n: per_net.get(n, 0) == 0 if per_net is not None else
+            False if n in bad else None if censored else True
             for n in d['nets'] if n and not n.startswith('unconnected')}
 
 
@@ -207,12 +208,13 @@ def _return_terminal_unconnected(item, unconnected_items):
 
 
 def measure(d, manifest, board, meta, bad, *, censored=False, interfaces=None, profile=None, intended_references=None,
-            pair_endpoints=None, unconnected_items=()):
+            pair_endpoints=None, unconnected_items=(), per_net=None):
     categories = {c:{} for c in qc.METRICS}
     ff=si.all_fills(board)
     categories['decoupling']=effective_paths(d,manifest,ff)
     manufacturing=craft.measure(d,meta)
-    complete=net_complete(d,bad,censored)
+    complete=net_complete(d,bad,censored,per_net=per_net)
+    censored = censored and per_net is None
     for item in categories['decoupling'].values():
         state=complete.get(item.get('net'),False)
         if item.get('connected') is False and state is not False:
@@ -360,12 +362,12 @@ def board_job(job):
             filled,report,provenance=io.prepare(source,run,name,version)
             raw_data=io.inspect(source,run,name)
             data,_,terminal_coverage=identity.match(raw_data,human_geometry) if run!=reference else (human_geometry,{},dict(matched=len(human_geometry['pads']),unmatched=0,ambiguous=0,tolerance_nm=identity.TOL_NM))
-            judged=io.judge(input_report,report) if input_report is not None else dict(electrical_pass=len(report.get('unconnected_items',[]))==0,
-                                                                                     drc_pass=None,completion=None,censored=None,unconnected=len(report.get('unconnected_items',[])),unconnected_nets=sorted({n for u in report.get('unconnected_items',[]) for item in u.get('items',[]) for n in io.bracket_nets(item.get('description',''))}))
+            judged=io.judge(input_report,report)
             bad_nets = judged['unconnected_nets']
             judged['judge_list_censored'] = judged.pop('censored', judged.get('judge_list_censored'))
             categories,mfg,coverage=measure(data,manifest,filled,meta,bad_nets,
-                                            censored=len(report.get('unconnected_items',[]))>=499,
+                                            censored=judged['output_unconnected_censored'],
+                                            per_net=judged.get('unconnected_per_net', {}).get('after'),
                                             unconnected_items=report.get('unconnected_items', []),
                                             interfaces=interfaces, profile=profile,
                                             intended_references=intended_references,pair_endpoints=pair_endpoints)
@@ -396,7 +398,8 @@ def board_job(job):
                 arm['provenance']['interfaces_sha256'] = arm['interfaces_sha256']
             if run==reference:
                 original,_,_=measure(data,manifest,source,meta,judged['unconnected_nets'],interfaces=interfaces,
-                                     censored=len(report.get('unconnected_items', []))>=499,
+                                     censored=judged['output_unconnected_censored'],
+                                     per_net=judged.get('unconnected_per_net', {}).get('after'),
                                      unconnected_items=report.get('unconnected_items', []),
                                      intended_references=intended_references,pair_endpoints=pair_endpoints)
                 result['original_human']=original
@@ -488,7 +491,7 @@ def markdown(result):
     for run,g in result['gates'].items():
         lines.append('| '+run+' | '+' | '.join(str(g[k]) for k in ('scheduled','judged','evaluation_valid','electrical','new_drc','small_pad_manufacturing','thermal_retained','eligible','judge_list_censored','budget_stopped'))+' |')
     for run,g in result['gates'].items():
-        lines.append(f"\nCompletion {run}: macro={fmt(g['completion_macro_pct'])}%, pooled={fmt(g['completion_pooled_pct'])}% on {g['completion_boards']} uncensored nonzero-input boards; {g['already_connected']} already-connected inputs.")
+        lines.append(f"\nCompletion {run}: macro={fmt(g['completion_macro_pct'])}%, pooled={fmt(g['completion_pooled_pct'])}% on {g['completion_boards']} known nonzero-input boards; {g['already_connected']} already-connected inputs.")
     lines += ['', '## Router stops and process screens', '',
               '| Board | Run | Router stop | Budget stopped | Equal-work valid | No new DRC | Human / router near-pad vias | Absolute screen | Human-practice gate |',
               '|---|---|---|---|---|---|---|---|---|']
@@ -496,6 +499,12 @@ def markdown(result):
         for run, arm in board['runs'].items():
             g = arm.get('gates', {})
             lines.append(f"| {board['board']} | {Path(run).name} | {arm['router_stop']} | {arm['budget_stopped']} | {arm['equal_work_valid']} | {arm['judge'].get('drc_pass')} | {g.get('near_pad_human_count')} / {g.get('near_pad_router_count')} | {g.get('absolute_small_pad_screen_pass')} | {g.get('small_pad_manufacturing')} |")
+    for board in result['boards']:
+        for run, arm in board['runs'].items():
+            if arm['judge'].get('capped_types'):
+                lines.append(f"\n{board['board']} / {Path(run).name}: capped DRC types {', '.join(arm['judge']['capped_types'])}; new-DRC gate unknown.")
+            if arm['judge'].get('connectivity_unavailable'):
+                lines.append(f"\n{board['board']} / {Path(run).name}: connectivity fallback: "+json.dumps(arm['judge']['connectivity_unavailable']))
     finished = result['common_finished']
     lines += ['', '## Common-finished regression view', '',
               'Frozen boards finished in every router arm: '+(', '.join(finished['boards']) or 'none')+'.',
@@ -581,7 +590,7 @@ def main():
         ap.error('--jobs must be between 1 and 6')
     started=time.monotonic()
     reference=resolve_run(args.reference);runs=list(dict.fromkeys(resolve_run(p) for p in args.runs))
-    version=subprocess.run([io.KICAD,'version'],check=True,capture_output=True,text=True).stdout.strip()
+    version=io.connectivity.kicad_version(io.KICAD)
     # The compared runs schedule the boards (a set without its `#slow` boards, D115); the human run is only their reference.
     names=sorted(set().union(*(set(roster(r)) for r in runs)))
     jobs=[(name,runs,reference,args.intents,version,args.interfaces,profile) for name in names]
@@ -603,8 +612,8 @@ def main():
                                completion_boards=len(judged),already_connected=sum(r['judge'].get('already_connected',False) for r in rows))
     limits=[
         'Human parity is a practical reference, not SI/current/thermal/assembly certification. Categories have no weighted total.',
-        'KiCad is the independent connectivity authority. tracemaker drc has not established uncapped plane/net-tie parity; 499-saturated lists are censored. The ratio is an interim disconnected-item denominator, not proven terminal-component rank.',
-        'DRC additions use violation-instance differences, including non-track errors. UUID/description changes and KiCad solder-mask noise can cause baseline differences; inspect reported instances before sign-off.',
+        'KiCad pcbnew connectivity on saved refills supplies uncapped total and per-net counts under the judge version; unavailable/mismatched KiCad Python falls back to censored report lists. The ratio is a disconnected-item denominator, not proven terminal-component rank.',
+        'DRC additions use violation-instance differences, including non-track errors. Any error type at its KiCad report cap makes the new-DRC gate unknown; saturated types are never compared as exact counts. Inspect reported instances before sign-off.',
         'Decoupling supply and return leads use free-plane-hop lower bounds between contacts to the same actual filled island; return hops exclude unanchored islands. Multilayer island joins and full loop impedance are not modeled. Human-invalid paths are coverage holes, not an allowed defect rate.',
         'Differential nets are name-selected, two-terminal graph-qualified candidates. Coupling uses the human modal gap, not a certified impedance target; skew excludes package/vertical-via delay. Straight parallel spans and concentric circular-arc spans use exact length; mixed line/arc and nonconcentric-arc coupling are not inferred. NetGraph approximates arcs with two chords for connectivity only.',
         'Historical returns screen adjacent broad GND fills. New fields preserve intended net/island identity using frozen manifest references or unambiguous nearest endpoint-IC ground pins on the human. Anchoring means pad connectivity, not earth grounding; power-transfer capacitors and actual return-current fields are not certified. Declared Ethernet isolation is excluded from missing-ground penalties; all-layer projected isolation gaps are not safety/creepage sign-off.',
