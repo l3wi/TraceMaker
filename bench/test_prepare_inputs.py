@@ -9,8 +9,8 @@ import uuid
 from unittest.mock import patch
 
 from plane_metrics import child, children, parse
-from prepare_inputs import (canonicalize_generated_ids, expressions, fixture_transaction, prepare_board,
-                            refill_board, repair_design_ids, strip_design_routing, terminal_signature)
+from prepare_inputs import (canonicalize_generated_ids, canonicalize_item_order, expressions, fixture_transaction,
+                            prepare_board, refill_board, repair_design_ids, strip_design_routing, terminal_signature)
 from prepare_pcbench import transplant_design_copper
 
 
@@ -94,13 +94,23 @@ class PreparationTests(unittest.TestCase):
         a, count = canonicalize_generated_ids(converted(False), original, 'board')
         b, _ = canonicalize_generated_ids(converted(True), original, 'board')
         self.assertEqual(count, 4)
-        self.assertEqual(sorted(children(parse(a), 'dimension')), sorted(children(parse(b), 'dimension')))
+        self.assertEqual(canonicalize_item_order(a), canonicalize_item_order(b))
         native = str(uuid.uuid4())
         source = HEADER + f'(zone (uuid "{native}")))'
         fixed, count = canonicalize_generated_ids(source, source, 'board')
         self.assertEqual((fixed, count), (source, 0))
         legacy_native = source.replace('(uuid ', '(tstamp ')
         self.assertEqual(canonicalize_generated_ids(source, legacy_native, 'board'), (source, 0))
+
+    def test_item_order_preserves_slots_and_sorts_nested_items(self):
+        low, high = '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002'
+        pads = [f'(pad "{n}" smd rect (uuid "{identity}"))' for n, identity in (('1', low), ('2', high))]
+        def board(reverse):
+            items = list(reversed(pads)) if reverse else pads
+            return HEADER + '(footprint "P" ' + items[0] + ' (at 2 3) ' + items[1] + '))\n'
+        expected = board(False)
+        self.assertEqual(canonicalize_item_order(board(True)), expected)
+        self.assertEqual(canonicalize_item_order(expected), expected)
 
     def test_terminal_signature_across_kicad_versions(self):
         old = '(kicad_pcb (net 1 "GND") (module "Pkg" (fp_text reference "U1") (pad "1" smd rect (net 1 "GND"))))'

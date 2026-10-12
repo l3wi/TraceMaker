@@ -46,12 +46,14 @@ discarded. KiCad first converts a private copy to native syntax. Unique nonzero 
 UUIDs (including KiCad 6/7 full-UUID `tstamp`) survive unchanged; loader-generated UUIDs use
 deterministic `uuid5` IDs keyed by source SHA256, board name, identity-free item/container
 content and identical-item occurrence rank. Converted list indices are **not** stable:
-KiCad sorts drawings/dimensions by UUID. Missing/zero/duplicate IDs are repaired before the
-authoritative refill. Whenever identities change, first-pass fills are discarded again and
-KiCad refills/saves with stable identities. This matters geometrically: changing only pad
-UUIDs on `fan_controller_fan_controller` reproduced the historical polygon differences with
-unchanged outlines, positions, rules and zone IDs. No single-thread claim is made; stable
-identity/order, rather than a thread-count workaround, fixes the observed input variation.
+KiCad sorts drawings/dimensions by UUID. Before the authoritative refill, same-kind
+UUID-bearing siblings are sorted by their stable identity, including pads/drawings inside
+footprints; non-item syntax stays in its original slots. Missing/zero/duplicate IDs are
+repaired, and first-pass fills are discarded whenever identities or item order change.
+KiCad then refills/saves with stable identities and load order. This matters geometrically:
+changing only pad UUIDs on `fan_controller_fan_controller` reproduced the historical polygon
+differences with unchanged outlines, positions, rules and zone IDs. No single-thread claim
+is made; stable identity/order, rather than a thread-count workaround, fixes the observed input variation.
 
 Dimension/display-text UUID aliases are de-duplicated after saving (identity-only); the
 reported mechkeys text discrepancy was dimension-object reordering, not moved dimensions.

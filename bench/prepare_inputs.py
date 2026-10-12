@@ -297,6 +297,44 @@ def canonicalize_generated_ids(text, original, board_name):
     return text, len(changes)
 
 
+def canonicalize_item_order(text):
+    """Sort same-kind UUID-bearing siblings before KiCad consumes their geometry.
+
+    Loader/save order can reflect the first pass's random UUIDs. Preserve all
+    non-item syntax and sort only interchangeable item slots, including pads
+    and drawings inside footprints; stable IDs alone do not fix load order.
+    """
+    spans = sorted(expressions(text))
+    stack, siblings = [], defaultdict(list)
+    for span in spans:
+        start, stop, _, head = span
+        while stack and stack[-1][1] <= start:
+            stack.pop()
+        if stack:
+            siblings[stack[-1]].append(span)
+        stack.append(span)
+    rendered = {}
+    for span in reversed(spans):
+        start, stop, _, _ = span
+        groups = defaultdict(list)
+        for item in siblings[span]:
+            identity = next((text[s:e] for s, e, _, head in siblings[item] if head == 'uuid'), None)
+            if identity is not None:
+                groups[item[3]].append((identity, item))
+        replacements = {}
+        for group in groups.values():
+            ordered = sorted(group, key=lambda pair: (pair[0], rendered[pair[1]]))
+            for (_, slot), (_, item) in zip(group, ordered):
+                replacements[slot] = rendered[item]
+        result, cursor = [], start
+        for item in siblings[span]:
+            result.extend((text[cursor:item[0]], replacements.get(item, rendered[item])))
+            cursor = item[1]
+        result.append(text[cursor:stop])
+        rendered[span] = ''.join(result)
+    return text[:spans[0][0]] + rendered[spans[0]] + text[spans[0][1]:] if spans else text
+
+
 def refill_board(source, target, report, timeout=600, board_name=None):
     """Convert, repair identities and refill a private copy, leaving the source untouched."""
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -320,8 +358,9 @@ def refill_board(source, target, report, timeout=600, board_name=None):
 
         refill()  # Convert legacy syntax before assigning generated identities.
         corrected, generated = canonicalize_generated_ids(work.read_text(), original, board_name)
+        corrected = canonicalize_item_order(corrected)
         corrected, repairs = repair_design_ids(corrected, board_name)
-        if repairs or generated:
+        if repairs or generated or corrected != work.read_text():
             # No random-ID first-pass fill may feed the authoritative fill.
             corrected = without_spans(corrected, [(s, e) for s, e, _, head in expressions(corrected)
                                                   if head in ('filled_polygon', 'fill_segments')])
