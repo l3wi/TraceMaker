@@ -112,7 +112,7 @@ gates of §5.
 | `--tier`, `--limit`, `--seed` | sample PCBench boards by Freerouting tier instead of a set |
 | `--boards NAME ...` | explicit subset, overriding the set roster for smoke/paired-cohort runs; the set name is still recorded |
 | `--intents DIR` | route with `DIR/<board>.intent.json`; draft missing manifests from the input (doc 05 §45). Freeze and review them before a matched comparison |
-| `--rejudge-human` | explicit in-place rejudgment of an existing `--human --name RUN` result, with the exact same set roster and refill policy; no router results can be reused this way |
+| `--rejudge RUN [--name NEW]` | rejudge a final saved router or human run without rerouting; independently refill input/output, verify preserved input hashes, and publish a new `RUN-rejudged` directory (or `NEW`); never mutate the source |
 
 **Independent refill and accounting (D116).** Harness `--refill` invokes KiCad, not the engine refill.
 The engine's `--soft-zones` refill/repair (doc 05 §36) informs its final connectivity and exit status, but
@@ -125,6 +125,25 @@ selected routing pass; `unconnected_after_refill` is its separate engine refill 
 charged even if its copper is rejected. No combined-revision validation is claimed by preserving either
 branch's historical measurements below.
 
+**Uncapped KiCad connectivity authority (D153).** `bench/kicad_connectivity.py` batches
+already-refilled saved boards through KiCad's bundled `pcbnew` Python, returning
+`GetUnconnectedCount(False)` (including hidden ratsnest edges), exact positive per-net
+counts, the KiCad version and `method: pcbnew-connectivity`. Per-net counts are the
+decrement in the native total when each complete net is removed from the private
+connectivity graph; KiCad 10's SWIG does not expose `RN_NET` edges. The saved board is
+never modified. Discovery uses `KICAD_PYTHON`, the resolved CLI's macOS bundle Python,
+then `scripts/kicad-python` on Linux. Python and CLI major.minor.patch must match
+(the default Docker image is 10.0.6, not macOS 10.0.3). Unavailability, malformed
+output or version mismatch preserves censored/unknown judging with a recorded reason;
+an uncapped DRC list must exactly match the native count or the judgment is invalid.
+KiCad 10 limits unconnected/clearance reports to 499 and other types to 199; a type
+reaching its cap remains a lower bound, never an exact instance comparison.
+`python3 bench/kicad_connectivity.py BOARD...` prints a human-readable count table.
+The real 10.0.3 census of all 106 prepared PCBench/modern inputs and
+`pairreg-single10-all-exits-*` saved outputs agreed on **92/92** uncapped lists;
+14 capped inputs yielded exact counts, all **106/106** per-net sums agreed, in
+**15.94 s** for one batch (no routing or DRC rerun).
+
 **Trustworthy judging and publication (D136–D145).** `drc_judge.py` is the stdlib-only
 violation-instance authority shared by the harness, scorecard and feature evaluators.
 Its multiset identity includes type, severity, physical item description (kind/net/layer,
@@ -133,11 +152,38 @@ when positions are absent. Fixing one violation cannot cancel a new one of the s
 A16 still gates instances involving a track/via/arc. `added_any` includes every new error;
 `added_nonrouting` publishes pad/zone/other-only instances separately, without ignored types.
 
-If either KiCad unconnected list contains **499 or more** records, `completion` is null
-and `censored` is true, including an output with zero unconnected items against a capped
-input. Summary means exclude those ratios and publish `completion_boards`/`censored_boards`;
-comparisons use the common known-completion cohort and list unknown boards without a
-completion gate. `clean` still requires zero output disconnects and zero added A16 errors.
+**Uncapped harness cutover (D154–D156).** Each input/output judge pair batches its saved
+refilled analysis boards through `kicad_connectivity.count_unconnected`. Rows retain
+the reported `unconnected_before/after` list lengths separately from
+`unconnected_uncapped: {before, after}`, `unconnected_per_net`, `connectivity_method`
+and `kicad_python_version`. Completion is `1 - after/before` from exact counts;
+a zero input denominator is already connected (completion 1). `judge_list_censored`
+still describes the DRC report, while `censored` describes whether completion remains
+unknown. An unsaturated list/count disagreement marks the board `judge: failed`,
+publishes the mismatch and counts as an infrastructure/judge failure.
+Unavailable or version-mismatched KiCad Python records `connectivity_unavailable`
+and falls back to D136: an uncapped list ratio is known; either list at 499 makes it
+unknown. Summary means publish known/censored coverage; `pooled_completion` is the
+ratio of exact count totals, separately from the per-board mean. Plane/signal totals
+use exact per-net counts when available. Comparisons prefer exact counts, explicitly
+label mixed uncapped/legacy-list observations, and retain D129/D143 stop rules.
+
+Every violation type at its KiCad report cap is published in `capped` and excluded
+from exact added-instance arithmetic. Clearance caps at 499; other violation types
+cap at 199, counting all severities because warnings consume the same limit.
+Only capped **gate-evaluated error types** make `error_gate: unknown`, never pass;
+warning-only and routing-immutable types remain visible as
+`capped_not_evaluated_types`, separately from `capped_evaluated_types`. The shared
+`ROUTING_IMMUTABLE_TYPES` list in `drc_judge.py` is explicit: `lib_footprint_issues`,
+`lib_footprint_mismatch`, `footprint_type_mismatch`, `duplicate_footprints`,
+`extra_footprint`, `missing_footprint`, `courtyards_overlap`, `missing_courtyard`,
+`malformed_courtyard`, `text_height`, `text_thickness`. Routing cannot change those
+library, footprint-placement or text-only findings. Every other type is evaluated
+when present at error severity, including clearance, solder mask, silk-over-copper
+and starved thermals. Independent uncapped connectivity resolves only unconnected
+censoring, not error censoring. The after-route passes gate evaluates warnings too
+and therefore treats every capped violation type as unknown under its stricter policy.
+`clean` requires zero output disconnects and a known passing A16 error gate.
 Scheduled/attempted/judged counts remain separate: all scheduled boards remain in the
 headline clean-pass denominator, routing costs include failed attempts, infrastructure
 failure makes run.py exit nonzero, and an abnormal router exit cannot be clean.
@@ -146,14 +192,16 @@ New runs refuse nonempty directories. `manifest.json` freezes the roster with st
 `running`; atomic final summary and manifest publication set `final`. Consumers refuse
 nonfinal new runs, validate their declared roster, and label old state-less results legacy.
 Run provenance records the binary SHA-256, effective arguments, board/rule/preparation
-manifest hashes, set roster, selection mode and metric schema. DRC caches are addressed
+manifest hashes, set roster, selection mode and metric schema, plus observed connectivity
+methods/KiCad Python versions and board-specific fallback reasons. DRC caches are addressed
 by board/rule **content**, KiCad version, flags, judge and identity-repair code version,
 not path/mtime/size. Placed boards receive matching sidecars before judging or routing.
 Preparation stages a complete fixture, validates it, then publishes a successful hashed
 `preparation.json`; failures including timeouts mark the fixture invalid. Normal run
-preflight requires that valid manifest and verifies every hash. The explicit historical
-human rejudge path also accepts a successful legacy refill manifest only after verifying
-its input hash and byte-original human source hash; it does not relabel that fixture valid.
+preflight requires that valid manifest and verifies every hash. Saved-run rejudgment
+accepts historical preparation input hashes as evidence, without relabelling fixtures
+valid. It preserves routing work/time/stops and raw output bytes, records source output
+and row hashes, and refuses unfinished runs, roster mismatches or unprovable inputs.
 
 
 
@@ -300,7 +348,9 @@ are refilled (StickHub: 17, 15 and 13); read a change in that type alone as nois
    Human runs are references, not router-regression baselines: parity deficits are visible,
    not called finished-before regressions (D129).
 2. Zero added A16 KiCad DRC error instances on **every board**, finished or not. New
-   non-routing instances remain separate diagnostics, not silently dropped.
+   non-routing instances remain separate diagnostics, not silently dropped. A capped
+   gate-evaluated error type makes sign-off unknown and fails, including on
+   work-stopped boards; routing-immutable/warning-only caps are diagnostic.
 3. Time within budget on every board (with `--work`, the budget is work units; wall time only stops the job).
 4. Routed boards byte-identical unless the change is meant to change results (`compare_runs.py
    --expect-identical`; then the differences are recorded).
@@ -310,6 +360,34 @@ are refilled (StickHub: 17, 15 and 13); read a change in that type alone as nois
    A claim that a change is faster or slower needs runs at equal wall time; `compare_runs.py` points at the boards.
 
 ## 6. Implementation status (2026-10-02; sets, work budgets and refill 2026-10-08, D81)
+
+**Uncapped harness smoke (D154–D156, 2026-10-12, KiCad 10.0.3).**
+`python3 bench/run.py --rejudge pairreg-single10-all-exits-mid-T --name pairreg-single10-all-exits-mid-T-rejudged-gate-policy`
+produced that new run, with no rerouting. All eight boards
+have exact total/per-net connectivity and no list/count disagreement; pooled
+completion is **89.6395%**, versus mean per-board completion **86.77%**.
+The source run remains separate. Two boards (LimeSDR and LeeChee) have an **unknown**
+error gate because **error-severity `solder_mask_bridge`** saturates. Capped library,
+placement/text-only and warning-only types are diagnostics, not routing gate failures.
+Exact connectivity does not certify hidden evaluated errors. This is not a clean
+sign-off. The earlier `...-rejudged` result preserves the initial over-conservative
+five-unknown policy; the `...-rejudged-gate-policy` run is authoritative for D155.
+
+| Board | Exact before → after | Completion | Error gate |
+|---|---:|---:|---|
+| kitspace_EEZ%20DIB%20MCU%20r1B2 | 573 → 72 | 87.43% | pass |
+| sbc_sbc | 410 → 86 | 79.02% | pass |
+| front-end-modules_LimeSDR_Sony | 410 → 60 | 85.37% | unknown |
+| CoreOne-xCORE200-Original_CoreOne | 564 → 109 | 80.67% | pass |
+| LeeChee_1800 | 888 → 21 | 97.64% | unknown |
+| MonApollo_analog-board | 923 → 59 | 93.61% | pass |
+| KiCad-Library_Teensy_test_layout | 850 → 36 | 95.76% | pass |
+| kitspace_d20_r0.1 | 237 → 60 | 74.68% | pass |
+
+Focused synthetic validation: **75** harness/comparison/connectivity tests pass,
+including warning-only and routing-immutable cap coverage, exact/mismatch/fallback
+counts, unchanged source rejudgment and the stricter all-severity feature gate.
+These runs do not claim a routing rebaseline.
 
 **Harness audit correction evidence (2026-10-12, KiCad 10.0.3).** The three saved human
 runs were explicitly rejudged **in place**, not rerouted:
@@ -553,6 +631,10 @@ Original artifacts are untouched. Existing `boards/<board>.refilled.kicad_pcb` i
 present; otherwise a copy is refilled **and saved** with `pcb drc --refill-zones --save-board` in
 `<run>/quality_cache/`. Sidecars come from the run or `build/modern-planes`, `build/demos`, then PCBench.
 Inspection and refill caches are content-addressed (binary/version and rule inputs included).
+Uncapped connectivity is cached separately by saved analysis bytes, rule hashes, judge KiCad version
+and `kicad_connectivity.py` hash (D157). It runs only after the authoritative refill/identity repair.
+Unavailable or mismatched KiCad Python is not cached as a successful count; the reason is published,
+and report-list censoring remains the conservative fallback.
 Saved native analysis copies share the preparation helper's deterministic repair of zero/duplicate UUIDs.
 If identities change, a second refill/save produces the authoritative report; repair counts and helper hash
 are published. Legacy loader zero-zone-ID keepout artefacts are not routing defects. This repair never changes
@@ -563,18 +645,29 @@ design copper non-comparable suppress resource, return and plane-aware-cap grade
 
 ### Gates, not grade components
 
-1. **Electrical completion:** zero independently judged KiCad unconnected items. Completion uses one common
-   refilled input's `1 - U_after/U_before`, never engine planned/routed counts. At 499 reported items either
-   count is censored, so completion is N/A. This is an interim item-list proxy, not exact terminal-component
-   rank; `tracemaker drc` cannot replace it until uncapped plane/net-tie consistency is established.
-   On a capped output list, listed nets are known incomplete; absent nets have unknown connectivity.
-   Unknown items are N/A coverage rather than service losses, except endpoint paths positively qualified
-   by the track/same-fill model. A KiCad-connected path outside that model is also N/A, not unroutable.
-2. **New DRC errors:** zero added error instances against the common input. Canonical type, severity and involved
+1. **Electrical completion (D157–D158):** zero independently judged KiCad unconnected items. Completion uses
+   the common refilled input's `1 - U_after/U_before`, never engine planned/routed counts. KiCad's own
+   `pcbnew` connectivity supplies uncapped totals and per-net counts, under the exact `kicad-cli` judge
+   version. On every unsaturated report, its total must equal the reported item-list length; a mismatch
+   invalidates that arm and publishes an evaluation error. Positive per-net counts prove incomplete nets;
+   all other nets are complete, even when the report list saturates at 499. Only when KiCad Python is
+   unavailable/version-mismatched do saturated lists make completion and unlisted nets unknown.
+   Unknown items remain N/A rather than service losses, except endpoint paths positively qualified by the
+   track/same-fill model. A KiCad-connected path outside that model is N/A, not unroutable. This ratio is
+   a disconnected-item proxy, not a proved terminal-component rank; `tracemaker drc` is not its authority.
+2. **New DRC errors:** zero added evaluated error instances against the common input. Routing-immutable
+   types in the shared `drc_judge.ROUTING_IMMUTABLE_TYPES` allow-list (footprint/library/courtyard/text)
+   and warning-severity reports are diagnostic, not evaluated gate errors.
+   Canonical type, severity and involved
    item kind/net/layer/location signatures prevent a resolved old defect cancelling a different new one.
    Reference labels are removed and UUIDs are fallback identities only when position is absent, so legacy
    conversion and published-reference renaming do not manufacture new defects.
    Unlike the old harness, new non-track errors are included; noisy solder-mask reports require review.
+   Every type is screened against KiCad's report caps (D159): 499 for clearance/unconnected items,
+   199 for other types. Saturated types in either baseline or output are listed as capped and excluded
+   from exact instance arithmetic. Only types evaluated under the gate's severity/type policy make the
+   new-DRC gate **unknown**; warning-only or shared routing-immutable type caps are reported as
+   **capped, not evaluated**, without altering the gate. Saturation diagnostics count all severities.
 3. **Small-pad process eligibility (D150):** retain the human small-pad via-in-pad exemption.
    Without that exemption, router via-in-pad is forbidden and the router's count of via copper within
    0.25 mm of single-layer SMD pads below 2 mm must be **no greater than the human count** (EP candidates
@@ -584,11 +677,45 @@ design copper non-comparable suppress resource, return and plane-aware-cap grade
    EP labels and inferred central large GND pads are marked by confidence. This detects lost arrays, not thermal
    sign-off; plating, dissipation and receiving-plane conductance are not inferred.
 
-The schema-2 gate table separates `judge_list_censored` (saturated KiCad lists) from `budget_stopped`
-(`stop=work`), and publishes each board's normalized router stop: complete/work/time/exhausted/unknown.
+The schema-2 gate table separates `judge_list_censored` (saturated KiCad unconnected lists, even when
+uncapped connectivity resolves completion) from `budget_stopped` (`stop=work`), and publishes each
+board's normalized router stop: complete/work/time/exhausted/unknown.
 Time/deadline observations explicitly invalidate equal-work comparisons. Human originals have no router
 stop and are not regression baselines. No category improvement compensates for a gate failure.
 The full per-board gate/coverage record is in JSON; unknown connectivity never proves a pass.
+
+#### Uncapped scorecard acceptance evidence (D157–D159; 2026-10-12)
+
+The prescribed modern comparison ran after the connectivity helper commit, with KiCad 10.0.3,
+four workers and the Toradex-2015 profile/reviewed manifests. It wrote
+`build/quality/uncapped-modern.{json,md}` in 106.4 s after the gate-policy correction:
+11 boards, 33 successful uncapped arm judgments,
+zero evaluation errors and zero connectivity fallbacks. Comparison below is against
+`build/quality/final-modern.json`; no board was rerouted.
+
+`gsg-cynthion` is the **only** previously connectivity-censored board in that scorecard. Its common
+input denominator changes from the capped 499 to exact 708. Human output remains 0 unconnected
+(completion N/A → 100%); `pairreg-single10-all-exits-modern-planes-T` remains 181
+(N/A → 74.435%); `dp-modern-200M-T` remains 189 (N/A → 73.305%).
+The other ten boards' connectivity counts/completion and every graded-category/profile aggregate
+are unchanged; all output lists were already uncapped, so the exact per-net map removes no additional
+observed N/A in this saved cohort. Synthetic regressions exercise that capped-output path.
+
+| Run | Known completion boards, old → new | Macro completion %, old → new | Pooled completion %, old → new | No-new-DRC passes, old → new |
+|---|---:|---:|---:|---:|
+| human-modern-planes | 10 → 11 | 99.889 → 99.899 | 99.944 → 99.960 | 10 → 10 |
+| pairreg-single10-all-exits-modern-planes-T | 10 → 11 | 92.745 → 91.080 | 91.991 → 87.031 | 8 → 8 |
+| dp-modern-200M-T | 10 → 11 | 90.787 → 89.198 | 90.712 → 85.794 | 7 → 7 |
+
+`antmicro-gmsl-deserializer` (`lib_footprint_issues`, 199) and `gsg-cynthion`
+(`lib_footprint_mismatch`, 199) report those types as **capped, not evaluated**.
+The former still passes the new-DRC gate on every arm; the latter still fails on actual
+evaluated error additions. No modern arm has an unknown new-DRC gate. Eligibility remains 8/1/1,
+electrical passes remain 10/1/1 and list-saturation diagnostics remain 1 each.
+An initial cap-agnostic replay took 118.1 s and incorrectly made these diagnostic caps unknown;
+the final 106.4 s replay above supersedes its gate counts. Eighteen scorecard synthetic regressions
+pass, including capped warning/excluded types leaving the gate unchanged and evaluated-error caps
+remaining unknown. These are judgment corrections, not improvements to routing or fabrication.
 
 ### Separate graded categories
 

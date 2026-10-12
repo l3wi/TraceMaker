@@ -50,8 +50,14 @@ class InstanceJudgeTests(unittest.TestCase):
         self.assertEqual(judge.completion(100, 20)['completion'], 0.8)
 
     def test_scorecard_uses_single_judge_definition(self):
+        # The scorecard adds cohort policy (missing input, already-connected boards) on top of the
+        # shared judge; every field it does not override must come from the one shared definition.
         self.assertIs(quality_io.violations, judge.violations)
-        self.assertIs(quality_io.judge, judge.judge)
+        before = dict(unconnected_items=[dict(items=[])]*5, violations=[])
+        after = dict(unconnected_items=[dict(items=[])]*2, violations=[])
+        self.assertEqual(quality_io.judge(before, after), judge.judge(before, after))
+        missing = quality_io.judge(None, after)
+        self.assertEqual((missing['completion'], missing['error_gate']), (None, 'unknown'))
 
 
 if __name__ == '__main__':

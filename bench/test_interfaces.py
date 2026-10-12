@@ -401,8 +401,12 @@ class InterfaceTests(unittest.TestCase):
             legacy=types.ModuleType('legacy_quality')
             exec(compile(legacy_source,'legacy_quality.py','exec'),legacy.__dict__)
             old=legacy.board_job(('b',[router],human,None,'test'))
-            for arm in old['runs'].values():
-                arm['judge']['judge_list_censored']=arm['judge'].pop('censored')
+            for run,arm in old['runs'].items():
+                # Renamed (D151); legacy wrote null without an input baseline, but a 0-item list
+                # cannot be capped, so the current judge states false.
+                self.assertIsNone(arm['judge'].pop('censored'))
+                self.assertIs(default['runs'][run]['judge']['judge_list_censored'],False)
+                arm['judge']['judge_list_censored']=False
             assert_preserves(self,default,old)
 
 def assert_preserves(case, new, old, path='$'):
