@@ -554,6 +554,15 @@ void same_pair_copper(const route::RouteResult& a, const route::RouteResult& b, 
     CHECK(a.tracks[i].layer == b.tracks[i].layer);
     CHECK(a.tracks[i].net == b.tracks[i].net);
   }
+  for (std::size_t i = 0; i < a.vias.size(); ++i) {
+    CHECK(a.vias[i].pos == b.vias[i].pos);
+    CHECK(a.vias[i].size == b.vias[i].size);
+    CHECK(a.vias[i].drill == b.vias[i].drill);
+    CHECK(a.vias[i].layer_top == b.vias[i].layer_top);
+    CHECK(a.vias[i].layer_bottom == b.vias[i].layer_bottom);
+    CHECK(a.vias[i].type == b.vias[i].type);
+    CHECK(a.vias[i].net == b.vias[i].net);
+  }
 }
 
 model::Board straddled_pair() {
@@ -603,6 +612,13 @@ TEST_CASE("blocked short taper falls through to a deterministic coupled search",
 
 TEST_CASE("pair search retries a geometrically legal finish that encloses a middle pin", "[diffpair][route]") {
   auto b = straddled_pair();
+  SECTION("general search candidates") {}
+  SECTION("short taper candidates") {
+    for (auto& p : b.pads) {
+      if (p.footprint == 1) p.pos.x = 6'000'000;
+      if (p.footprint == 2) p.pos.x = 5'500'000;
+    }
+  }
   b.copper.push_back(static_cast<int>(b.layers.size()));
   b.layers.push_back({31, "B.Cu", "B.Cu", "signal", "", 1});
   for (auto& p : b.pads)
@@ -620,6 +636,8 @@ TEST_CASE("pair search retries a geometrically legal finish that encloses a midd
   REQUIRE_FALSE(result.pair_attempts.empty());
   CHECK(result.pair_attempts.front().detail.find("would enclose pin") != std::string::npos);
   CHECK(result.routed == result.connections);
+  for (const auto& track : result.tracks)
+    if (track.net == 1 || track.net == 2) CHECK(track.layer == 1);
   CHECK(result.expansions <= o.work_budget + 64);
   same_pair_copper(result, route::Router(b, r, o).run());
   b.tracks.insert(b.tracks.end(), result.tracks.begin(), result.tracks.end());
