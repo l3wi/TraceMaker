@@ -392,6 +392,28 @@ named otherwise, e.g. USB DP/DM from `--component-rules soft`; D50).
 | Skew | `--pair-skew-mm X` (or a KiCad custom `skew` rule) meanders the shorter half in the clean-up with the length-tuning code until the halves differ by at most X/2 (meanders go to the free side) |
 | Measurement | `tracemaker pairs <board> [--pair A,B] [--json]`: per pair the track length, the coupled share (20 µm samples beside a parallel track of the other half on the same layer within gap + max(gap/4, 50 µm)), the gap kept (median, minimum), skew and vias. `tracemaker route` prints the same for the pairs it routed; `bench/pair_eval.py` routes boards off/on at a fixed budget and judges both with KiCad |
 
+**Physical connection correspondence (D165).** Pair jobs no longer reject endpoint separation at
+4 mm. Each endpoint correspondence is accepted on the same footprint, including wide-pitch
+MagJack pins. If either footprint contains a terminal of the opposite half, correspondence to a
+different footprint is rejected. Known separate components must have compatible library IDs, values
+and pad numbers (the same series-part role); missing metadata falls back to physical locality.
+Their separation must not exceed the nearest other terminal
+distance on **either** net. Pads without component identity use that same local-distance condition.
+Thus an unrelated remote end or a one-sided pull-up cannot impersonate a corresponding signal end.
+Distances and matching costs are L1 distances in integer nanometres. Both endpoint permutations
+are considered; eligible connection pairs are consumed in increasing `(sum, maximum, A connection
+index, B connection index)` order. This is a deterministic minimum-cost-first correspondence rule,
+not a claim of globally optimal bipartite assignment.
+
+For asymmetric trees whose fixed-copper clusters are all single pads without zones, with at least
+two corresponding terminals covering the smaller half, planning first builds a joint Prim tree
+(Prim, 1957) over the matched terminal sites using the sum of both halves' distances. It then
+adds non-cycling edges from each original per-net MST to connect unmatched local branches.
+Equal-sized trees, merged-copper/zone trees, filtered nets and reviewed routing-intent trees keep
+their existing plans. This contained rule keeps a one-sided pull-up independent instead of letting
+it divert the paired trunk. Matching changes eligibility only: every attempted route still uses
+the existing budgets, search, exact geometry and transactional acceptance gates.
+
 **Pad-axis entry and joint legs (D119).** Fine-pitch endpoint candidates additionally leave along each of the
 pad's rotated copper axes, continuing straight past its edge before converging. The two legs are selected
 jointly: a legal first half rejected by the partner runway or gap check does not discard compatible

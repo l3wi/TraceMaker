@@ -3,6 +3,7 @@
 // KiCad requires between the halves), offset/miter geometry, and the coupled-share / gap / skew measurement.
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cmath>
 
 #include "drc/copper.hpp"
@@ -552,4 +553,97 @@ TEST_CASE("explicit USB pairs remain selected with name detection enabled", "[di
   const auto ordinary = route::Router(b, r, unselected).run();
   CHECK(ordinary.pair_attempts.empty());
   CHECK(ordinary.pairs == 0);
+}
+
+TEST_CASE("pair matching uses physical sites, not a fixed connector pitch", "[diffpair][route]") {
+  for (Coord spacing : {600'000, 4'000'000, 4'570'733, 6'000'000}) {
+    auto b = fenced_pair();
+    b.tracks.clear();
+    for (auto& p : b.pads)
+      p.pos.y = 10'000'000 + (p.net == 1 ? -spacing / 2 : spacing / 2);
+    route::RouterOptions o;
+    o.diff_pairs = true;
+    o.gpu_device = -1;
+    o.optimize = false;
+    o.rip_up = false;
+    o.max_restarts = 0;
+    o.work_budget = 10'000;
+    const auto first = route::Router(b, rules_with(200'000, false, 0, 0), o).run();
+    const auto second = route::Router(b, rules_with(200'000, false, 0, 0), o).run();
+    INFO(spacing);
+    REQUIRE_FALSE(first.pair_attempts.empty());
+    CHECK(first.pair_attempts.size() == second.pair_attempts.size());
+    CHECK(first.pair_work == second.pair_work);
+    CHECK(first.pair_attempts.front().pads == second.pair_attempts.front().pads);
+  }
+}
+
+TEST_CASE("pair matching considers swapped endpoints and rejects unrelated sites", "[diffpair][route]") {
+  auto b = fenced_pair();
+  b.tracks.clear();
+  // Reverse N's pad iteration order so its independently planned edge is swapped.
+  std::swap(b.pads[1], b.pads[3]);
+  b.footprints[0].pads = {0, 3};
+  b.footprints[1].pads = {2, 1};
+  route::RouterOptions o;
+  o.diff_pairs = true;
+  o.gpu_device = -1;
+  o.optimize = false;
+  o.rip_up = false;
+  o.max_restarts = 0;
+  o.work_budget = 10'000;
+  const auto r = rules_with(200'000, false, 0, 0);
+  REQUIRE_FALSE(route::Router(b, r, o).run().pair_attempts.empty());
+  // N's second end is on an unrelated component, not U2's corresponding endpoint site.
+  auto extra = b.pads[1];
+  extra.pos = {35'000'000, 18'000'000};
+  extra.footprint = 2;
+  model::Footprint fp;
+  fp.lib_id = "Other";
+  fp.value = "unrelated";
+  fp.pads = {1};
+  b.footprints.push_back(fp);
+  b.pads[1] = extra;
+  b.footprints[1].pads = {2};
+  CHECK(route::Router(b, r, o).run().pair_attempts.empty());
+  // No semantic package information: a far end still cannot be a local correspondence.
+  for (auto& p : b.pads) p.footprint = -1;
+  b.pads[1].pos = {35'000'000, 100'000'000};
+  CHECK(route::Router(b, r, o).run().pair_attempts.empty());
+}
+
+TEST_CASE("asymmetric pair planning leaves a one-sided pull-up as a local branch", "[diffpair][route]") {
+  auto b = fenced_pair();
+  b.tracks.clear();
+  // Shared IC at x=35; separate equal series resistors at x=5 and x=7.54.
+  b.pads[0].pos = {5'000'000, 10'000'000};
+  b.pads[1].pos = {7'540'000, 10'000'000};
+  b.pads[0].number = b.pads[1].number = "1";
+  b.pads[1].footprint = 2;
+  b.footprints[0].pads = {0};
+  b.footprints[0].lib_id = "R";
+  b.footprints[0].value = "33R";
+  model::Footprint resistor = b.footprints[0];
+  resistor.pads = {1};
+  b.footprints.push_back(resistor);
+  auto pullup = b.pads[0];
+  pullup.pos = {9'000'000, 10'000'000};  // closer to the IC than the correct P series resistor
+  pullup.footprint = 3;
+  b.pads.push_back(pullup);
+  resistor.value = "1.5k";
+  resistor.pads = {4};
+  b.footprints.push_back(resistor);
+  route::RouterOptions o;
+  o.diff_pairs = true;
+  o.gpu_device = -1;
+  o.optimize = false;
+  o.rip_up = false;
+  o.max_restarts = 0;
+  o.work_budget = 10'000;
+  const auto result = route::Router(b, rules_with(200'000, false, 0, 0), o).run();
+  REQUIRE_FALSE(result.pair_attempts.empty());
+  const auto& pads = result.pair_attempts.front().pads;
+  CHECK(std::find(pads.begin(), pads.end(), b.pads[0].pos) != pads.end());
+  CHECK(std::find(pads.begin(), pads.end(), pullup.pos) == pads.end());
+  CHECK(result.connections == 3);
 }

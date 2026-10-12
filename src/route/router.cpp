@@ -397,6 +397,45 @@ struct Router::Impl {
     return false;
   }
 
+  static Coord correspondence_distance(Point a, Point c) {
+    return std::abs(a.x - c.x) + std::abs(a.y - c.y);
+  }
+
+  std::optional<Coord> corresponding_end(int pa, int pc) const {
+    const auto& a = b.pads[static_cast<std::size_t>(pa)];
+    const auto& c = b.pads[static_cast<std::size_t>(pc)];
+    const Coord distance = correspondence_distance(a.pos, c.pos);
+    // A common footprint is an endpoint site, regardless of its pin pitch (e.g. MagJack).
+    // If that site contains the partner net, an end on another component cannot stand in for it.
+    if (a.footprint >= 0 && a.footprint == c.footprint) return distance;
+    auto has_partner = [&](const model::Pad& p, NetId partner) {
+      if (p.footprint < 0) return false;
+      for (int qi : b.footprints[static_cast<std::size_t>(p.footprint)].pads)
+        if (b.pads[static_cast<std::size_t>(qi)].net == partner) return true;
+      return false;
+    };
+    if (has_partner(a, c.net) || has_partner(c, a.net)) return {};
+    if (a.footprint >= 0 && c.footprint >= 0) {
+      const auto& fa = b.footprints[static_cast<std::size_t>(a.footprint)];
+      const auto& fc = b.footprints[static_cast<std::size_t>(c.footprint)];
+      // Known separate series parts must represent the same pad role, not a one-sided pull-up.
+      // Missing package metadata is not evidence of a mismatch: use the physical locality rule.
+      if ((!fa.lib_id.empty() && !fc.lib_id.empty() && fa.lib_id != fc.lib_id) ||
+          (!fa.value.empty() && !fc.value.empty() && fa.value != fc.value) ||
+          (!fa.lib_id.empty() && !fc.lib_id.empty() && !fa.value.empty() && !fc.value.empty() && a.number != c.number)) return {};
+    }
+    // Without a shared package, correspondence must be local on BOTH halves: the partner
+    // is no farther away than the next terminal of the same net. No absolute mm cutoff.
+    auto local = [&](const model::Pad& p) {
+      Coord nearest = INT64_MAX;
+      for (const auto& q : b.pads)
+        if (q.net == p.net && &q != &p) nearest = std::min(nearest, correspondence_distance(p.pos, q.pos));
+      return distance <= nearest;
+    };
+    if (!local(a) || !local(c)) return {};
+    return distance;
+  }
+
   std::vector<Connection> plan(drc::UnionFind& uf) {
     const auto& cm = obs->copper();
     struct Cluster { std::vector<int> pads, zones; };
@@ -487,6 +526,89 @@ struct Router::Impl {
         upd(nxt);
       }
     }
+    // Prim (1957) on corresponding terminals first for asymmetric, pad-only trees.
+    // Keep unmatched branches independent; otherwise a nearby pull-up can replace the signal trunk.
+    for (const auto& [na, cla] : net_clusters)
+      for (const auto& [nb, clb] : net_clusters) {
+        if (na >= nb || cla.size() == clb.size() || !pair_wanted(na, nb)) continue;
+        auto terminals = [](const auto& cl) {
+          std::vector<int> pads;
+          for (const auto& [root, group] : cl) {
+            (void)root;
+            if (group.pads.size() != 1 || !group.zones.empty()) return std::vector<int>{};
+            pads.push_back(group.pads[0]);
+          }
+          return pads;
+        };
+        const auto la = terminals(cla), lb = terminals(clb);
+        if (la.size() < 2 || lb.size() < 2) continue;
+        std::vector<std::tuple<Coord, int, int>> candidates;
+        // A filtered net, plane target or reviewed intent is not an ordinary pad-only MST.
+        auto ordinary_tree = [&](NetId net, std::size_t count) {
+          for (const auto& [pa, pc] : opt.intent_pairs)
+            if (b.pads[static_cast<std::size_t>(pa)].net == net || b.pads[static_cast<std::size_t>(pc)].net == net) return false;
+          for (int pa : opt.intent_plane_pads)
+            if (b.pads[static_cast<std::size_t>(pa)].net == net) return false;
+          std::size_t edges = 0;
+          for (const auto& c : out)
+            if (c.net == net) {
+              if (c.pad_b < 0) return false;
+              ++edges;
+            }
+          return edges + 1 == count;
+        };
+        if (!ordinary_tree(na, la.size()) || !ordinary_tree(nb, lb.size())) continue;
+        for (int pa : la)
+          for (int pc : lb)
+            if (const auto cost = corresponding_end(pa, pc)) candidates.emplace_back(*cost, pa, pc);
+        std::sort(candidates.begin(), candidates.end());
+        std::set<int> used;
+        std::vector<std::pair<int, int>> matched;
+        for (const auto& [cost, pa, pc] : candidates) {
+          (void)cost;
+          if (used.count(pa) || used.count(pc)) continue;
+          used.insert(pa);
+          used.insert(pc);
+          matched.emplace_back(pa, pc);
+        }
+        if (matched.size() < 2 || matched.size() != std::min(la.size(), lb.size())) continue;
+        std::vector<Connection> backbone;
+        std::vector<bool> in(matched.size(), false);
+        in[0] = true;
+        for (std::size_t step = 1; step < matched.size(); ++step) {
+          std::tuple<Coord, std::size_t, std::size_t> best{INT64_MAX, 0, 0};
+          for (std::size_t i = 0; i < matched.size(); ++i) {
+            if (!in[i]) continue;
+            for (std::size_t j = 0; j < matched.size(); ++j) {
+              if (in[j]) continue;
+              const auto [pa, pc] = matched[i];
+              const auto [qa, qc] = matched[j];
+              const Coord cost = correspondence_distance(b.pads[static_cast<std::size_t>(pa)].pos, b.pads[static_cast<std::size_t>(qa)].pos) +
+                                 correspondence_distance(b.pads[static_cast<std::size_t>(pc)].pos, b.pads[static_cast<std::size_t>(qc)].pos);
+              best = std::min(best, std::tuple{cost, i, j});
+            }
+          }
+          const auto [cost, from, to] = best;
+          (void)cost;
+          in[to] = true;
+          for (const auto& [net, pa, qa] : {std::tuple{na, matched[from].first, matched[to].first},
+                                          std::tuple{nb, matched[from].second, matched[to].second}})
+            backbone.push_back({net, pa, qa, -1, correspondence_distance(b.pads[static_cast<std::size_t>(pa)].pos, b.pads[static_cast<std::size_t>(qa)].pos)});
+        }
+        drc::UnionFind tree(b.pads.size());
+        std::vector<Connection> replacement;
+        auto add = [&](const Connection& c) {
+          if (tree.find(c.pad_a) == tree.find(c.pad_b)) return;
+          tree.unite(c.pad_a, c.pad_b);
+          replacement.push_back(c);
+        };
+        for (const auto& c : backbone) add(c);
+        // The original MST still connects every unmatched terminal, without creating cycles.
+        for (const auto& c : out)
+          if ((c.net == na || c.net == nb) && c.pad_b >= 0) add(c);
+        std::erase_if(out, [&](const Connection& c) { return c.net == na || c.net == nb; });
+        out.insert(out.end(), replacement.begin(), replacement.end());
+      }
     if (opt.order == 3) {
       // Deep pins of dense packages first (doc 16): a ball in the third ring needs the channels that outer balls'
       // escapes would otherwise take. Depth = distance of the pad centre to the edge of its footprint's pad cloud,
@@ -3183,23 +3305,31 @@ struct Router::Impl {
     for (const auto& [na, la] : by_net)
       for (const auto& [nb, lb] : by_net) {
         if (na >= nb || !pair_wanted(na, nb)) continue;
-        // Pair up connections whose two ends lie close to each other (each half may have several connections).
-        std::vector<char> used(lb.size(), 0);
-        for (int ca : la) {
-          const auto& A = cs[static_cast<std::size_t>(ca)].c;
-          int best = -1;
-          double bd = 4e6;
-          for (std::size_t k = 0; k < lb.size(); ++k) {
-            if (used[k]) continue;
-            const auto& B = cs[static_cast<std::size_t>(lb[k])].c;
-            const double d1 = std::max(dist(pos(A.pad_a), pos(B.pad_a)), dist(pos(A.pad_b), pos(B.pad_b)));
-            const double d2 = std::max(dist(pos(A.pad_a), pos(B.pad_b)), dist(pos(A.pad_b), pos(B.pad_a)));
-            const double dd = std::min(d1, d2);
-            if (dd < bd) { bd = dd; best = static_cast<int>(k); }
+        // Globally cheapest physical correspondence first; both endpoint permutations are considered.
+        // Costs are integer nm (L1), with stable connection-index ties, not a floating 4 mm veto.
+        std::vector<std::tuple<Coord, Coord, int, int>> candidates;
+        for (int ca : la)
+          for (int cb : lb) {
+            const auto& A = cs[static_cast<std::size_t>(ca)].c;
+            const auto& B = cs[static_cast<std::size_t>(cb)].c;
+            std::optional<std::pair<Coord, Coord>> best;
+            for (const auto& [p, q] : {std::pair{B.pad_a, B.pad_b}, std::pair{B.pad_b, B.pad_a}}) {
+              const auto first = corresponding_end(A.pad_a, p), last = corresponding_end(A.pad_b, q);
+              if (!first || !last) continue;
+              const std::pair cost{*first + *last, std::max(*first, *last)};
+              if (!best || cost < *best) best = cost;
+            }
+            if (best) candidates.emplace_back(best->first, best->second, ca, cb);
           }
-          if (best < 0) continue;
-          used[static_cast<std::size_t>(best)] = 1;
-          jobs.push_back({ca, lb[static_cast<std::size_t>(best)], {}});
+        std::sort(candidates.begin(), candidates.end());
+        std::set<int> used;
+        for (const auto& [sum, maximum, ca, cb] : candidates) {
+          (void)sum;
+          (void)maximum;
+          if (used.count(ca) || used.count(cb)) continue;
+          used.insert(ca);
+          used.insert(cb);
+          jobs.push_back({ca, cb, {}});
         }
       }
     // Tight escapes first, then physical connector pin order, not arbitrary net IDs.
