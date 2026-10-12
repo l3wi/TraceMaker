@@ -158,7 +158,7 @@ class HarnessTests(unittest.TestCase):
                 return subprocess.CompletedProcess(cmd, 0)
             def judge(path):
                 self.assertEqual(path.with_suffix('.kicad_dru').read_text(), 'custom')
-                return dict(cross_report={})
+                return dict(cross_report={}, report={})
             with patch.object(harness, 'FIX', root / 'missing'), \
                     patch.object(harness.subprocess, 'run', side_effect=place), patch.object(harness, 'drc', side_effect=judge):
                 placed = harness.place_board('b', board, outdir, {})
@@ -215,6 +215,17 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(summary['completion'], 1)
         self.assertEqual(summary['completion_boards'], 1)
         self.assertEqual(summary['censored_boards'], 1)
+
+    def test_uncapped_rows_keep_report_censoring_out_of_unknown_coverage(self):
+        rows = [dict(judge='ok', exit=3, clean=False, completion=.9, censored=False,
+                     judge_list_censored=True, error_gate='unknown',
+                     unconnected_uncapped={'before': 1000, 'after': 100})]
+        summary = harness.headline(rows, 1)
+        self.assertEqual(summary['completion_boards'], 1)
+        self.assertEqual(summary['censored_boards'], 0)
+        self.assertEqual(summary['judge_list_censored_boards'], 1)
+        self.assertEqual(summary['error_gate_unknown_boards'], 1)
+        self.assertEqual(summary['pooled_completion'], .9)
 
     def test_cache_content_and_judge_version_not_metadata(self):
         with tempfile.TemporaryDirectory() as directory:

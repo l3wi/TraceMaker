@@ -15,6 +15,7 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -22,6 +23,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 STATIC = pathlib.Path(__file__).resolve().parent / "static"
+sys.path.insert(0, str(ROOT / "bench"))
+from compare_runs import completion_value
 CODE_DIRS = ["src", "tests", "bench", "scripts", "devsite", "viewer", "kicad_plugin", "bindings"]
 CODE_EXT = {".cpp": "C++", ".hpp": "C++", ".h": "C++", ".cu": "CUDA", ".cuh": "CUDA", ".py": "Python",
             ".ts": "TypeScript", ".js": "JavaScript", ".html": "HTML", ".css": "CSS", ".fbs": "FlatBuffers",
@@ -231,6 +234,19 @@ def benchmarks() -> list[dict]:
                 continue
         else:
             s["state_note"] = "Legacy: final state and scheduled roster not recorded; coverage unverified."
+        board_rows = f.parent / "boards.jsonl"
+        if board_rows.exists():
+            try:
+                rows = [json.loads(line) for line in board_rows.read_text().splitlines() if line.strip()]
+                known = [value for row in rows if (value := completion_value(row)) is not None
+                         and row.get("judge", "ok") == "ok"]
+                s["completion"] = sum(known) / len(known) if known else None
+                s["completion_boards"] = len(known)
+                s["censored_boards"] = sum(completion_value(row) is None for row in rows)
+                s["error_gate_unknown_boards"] = sum(row.get("error_gate") == "unknown" for row in rows)
+            except (OSError, ValueError, KeyError, TypeError):
+                s["completion"] = None
+                s["state_note"] = "Board metrics unreadable; completion unknown."
         s.setdefault("run", f.parent.name)
         s["finished"] = f.stat().st_mtime
         out.append(s)

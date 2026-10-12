@@ -45,6 +45,12 @@ def read_json(path: pathlib.Path) -> dict:
 
 def completion_value(row: dict) -> float | None:
     """Recompute legacy ratios too: a stored percentage cannot undo KiCad's list cap."""
+    if row.get("judge") == "failed":
+        return None
+    exact = row.get("unconnected_uncapped")
+    if exact is not None:
+        before, after = exact["before"], exact["after"]
+        return 1.0 if before == 0 else max(0, 1-after/before)
     if row.get("unconnected_before") is not None and row.get("unconnected_after") is not None:
         return count_completion(row["unconnected_before"], row["unconnected_after"])["completion"]
     if row.get("censored") or row.get("judge_list_censored"):
@@ -237,12 +243,17 @@ def main() -> int:
         same = db is not None and db == df
         identical += same
         cb, cf = completion_value(b), completion_value(f)
+        if bool(b.get("unconnected_uncapped")) != bool(f.get("unconnected_uncapped")):
+            metadata_notes.append(f"{name}: mixed connectivity methods (uncapped versus legacy DRC-list"
+                                  f"{'; legacy censored' if cb is None or cf is None else ''}); "
+                                  "completion gated only when both are known")
         sb, sf = stop_reason(bdir, name, b), stop_reason(adir, name, f)
         if sf == "work":
             status = "finished baseline lost; gated" if sb in FINISHED_STOPS and not human_reference else "not gated"
             unfinished.append(f"{name}: completion {completion_text(cb)} -> {completion_text(cf)} (stop {sb} -> {sf}; {status})")
-        if "clean" not in b or "clean" not in f:
-            failures.append(f"{name}: judge failed ({'before' if 'clean' not in b else 'after'})")
+        if "clean" not in b or "clean" not in f or b.get("judge") == "failed" or f.get("judge") == "failed":
+            side = 'before' if "clean" not in b or b.get("judge") == "failed" else 'after'
+            failures.append(f"{name}: judge failed ({side})")
             continue
         worse = (b["clean"] and not f["clean"]) or (cb is not None and cf is not None and cf < cb)
         added = f.get("added_errors", {})
@@ -256,6 +267,8 @@ def main() -> int:
                 failures.append(f"{name}: worse (clean {b['clean']} -> {f['clean']}, completion {completion_text(cb)} -> {completion_text(cf)})")
         if added:
             failures.append(f"{name}: added DRC errors: {added}")
+        if f.get("error_gate") == "unknown":
+            failures.append(f"{name}: DRC error gate unknown; capped types {f.get('capped_types', [])}")
         if not same and a.expect_identical:
             failures.append(f"{name}: routed board differs")
         dc = cpu_change(b, f)

@@ -385,7 +385,7 @@ function renderBench(s) {
   const count = (v) => v == null ? "–" : String(v);
   const failed = s.benchmarks.filter((b) => b.judge_failures > 0);
   replace("bench",
-    el("div", { class: "sub", style: "margin-bottom:8px", text: "Fixtures judged by kicad-cli DRC (clean = fully routed and zero added errors). New-run clean pass uses every scheduled board; completion may be unknown. Freerouting columns: published results on matched boards." }),
+    el("div", { class: "sub", style: "margin-bottom:8px", text: "Fixtures judged by KiCad DRC and uncapped pcbnew connectivity when available (clean = fully connected and a known zero-added-error gate). Clean pass uses every scheduled board; completion excludes unknown/censored ratios. Freerouting columns: published results on matched boards." }),
     ...failed.map((b) => el("div", { class: "s-fail", role: "alert", style: "font-weight:600;margin-bottom:8px",
       text: `${b.run}: ${b.judge_failures} judge failure(s) — scheduled ${count(b.scheduled)}, attempted ${count(b.attempted)}, judged ${count(b.judged)}. Failed judgments are not passes.` })),
     el("div", { style: "overflow-x:auto" }, el("table", {},
@@ -401,7 +401,8 @@ function renderBench(s) {
         el("td", { class: "r num" }, el("b", { text: pct(b.clean_pass) })),
         el("td", { class: "r num", text: pct(b.fr_rc12_clean_pass) }),
         el("td", { class: "r num", text: pct(b.fr_241_clean_pass) }),
-        el("td", { class: "r num", text: pct(b.completion) }),
+        el("td", { class: "r num" }, el("span", { text: pct(b.completion) }),
+          el("div", { class: "sub", text: `${count(b.completion_boards)} known; ${count(b.censored_boards)} unknown` })),
         el("td", { class: "r num", text: count(b.boards_with_added_errors) })))))));
 }
 

@@ -19,7 +19,8 @@ import pathlib
 import shutil
 import subprocess
 import sys
-from drc_judge import instance_counts, violations
+from drc_judge import capped_types, instance_counts, violations
+import run as bench_run
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PCBENCH = ROOT / "bench/data/freerouting/scripts/benchmark/fixtures/PCBench"
@@ -30,15 +31,16 @@ def run(cmd: list[str], timeout: int) -> subprocess.CompletedProcess:
 
 
 def judge(board: pathlib.Path, refill: bool) -> dict | None:
-    out = board.with_suffix(".drc.json")
-    run(["kicad-cli", "pcb", "drc", "--format", "json", "--severity-all", "--all-track-errors"] + (["--refill-zones"] if refill else []) +
-        ["-o", str(out), str(board)], 1800)
-    if not out.exists():
+    bench_run.REFILL = refill
+    saved = board.with_name(board.stem + ".refilled.kicad_pcb") if refill else None
+    result = bench_run.drc(board, saved=saved)
+    if result is None:
         return None
-    d = json.loads(out.read_text())
-    types = instance_counts(violations(d, severity=None), severity_labels=True)
-    return {"violations": types, "report": d, "unconnected": len(d.get("unconnected_items", [])),
-            "via_dangling": sum(1 for v in d.get("violations", []) if v["type"] == "via_dangling")}
+    d = result["report"]
+    result.update(violations=instance_counts(violations(d, severity=None), severity_labels=True),
+                  capped=capped_types(d),
+                  via_dangling=sum(1 for v in d.get("violations", []) if v["type"] == "via_dangling"))
+    return result
 
 
 def one(name: str, a: argparse.Namespace, outdir: pathlib.Path) -> dict:
@@ -62,10 +64,22 @@ def one(name: str, a: argparse.Namespace, outdir: pathlib.Path) -> dict:
             res["error"] = f"kicad-cli failed on the {tag} board"
             return res
     off, on = res["off"]["judge"], res["on"]["judge"]
+    metrics = {"exit": 0}
+    bench_run.apply_judgment(metrics, off, on)
+    res.update({key: value for key, value in metrics.items() if key != "exit"})
+    if metrics["judge"] != "ok":
+        return res
+    excluded = set(capped_types(off["report"])) | set(capped_types(on["report"]))
     off_instances, on_instances = violations(off["report"], severity=None), violations(on["report"], severity=None)
-    res["added"] = instance_counts(on_instances-off_instances, severity_labels=True)
-    res["removed"] = instance_counts(off_instances-on_instances, severity_labels=True)
-    res["pass"] = not res["added"] and on["unconnected"] <= off["unconnected"] and res["on"]["routed"] == res["off"]["routed"]
+    res["added"] = instance_counts({key: n for key, n in (on_instances-off_instances).items()
+                                   if key[0] not in excluded}, severity_labels=True)
+    res["removed"] = instance_counts({key: n for key, n in (off_instances-on_instances).items()
+                                     if key[0] not in excluded}, severity_labels=True)
+    for stage, judgment in (("before", off), ("after", on)):
+        judgment["unconnected"] = metrics.get("unconnected_uncapped", {}).get(stage, judgment["unconnected"])
+    unknown_connectivity = metrics["censored"]
+    res["pass"] = (not res["added"] and not (excluded - {"unconnected_items"}) and not unknown_connectivity
+                   and on["unconnected"] <= off["unconnected"] and res["on"]["routed"] == res["off"]["routed"])
     return res
 
 
@@ -96,7 +110,8 @@ def main() -> int:
         ok = ok and r["pass"]
         line = (f"{'pass' if r['pass'] else 'FAIL'} {r['board'][:40]:40} routed {off['routed']}/{off['connections']} -> {on['routed']}/{on['connections']}  "
                 f"unconnected {off['judge']['unconnected']} -> {on['judge']['unconnected']}  via_dangling {off['judge']['via_dangling']} -> "
-                f"{on['judge']['via_dangling']}  added {r['added'] or '-'}  removed {r['removed'] or '-'}")
+                f"{on['judge']['via_dangling']}  added {r['added'] or '-'}  removed {r['removed'] or '-'} "
+                f"capped {r['capped_types']} error gate {r['error_gate']} connectivity {'unknown' if r['censored'] else 'known'}")
         if "widen" in on:
             w = on["widen"]
             line += f"  | widened {w['tracks_widened']} tracks, {w['widened_mm']:.1f} mm, {sum(1 for n in w['nets'] if n['tracks_widened'])} nets"

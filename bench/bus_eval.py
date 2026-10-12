@@ -104,9 +104,11 @@ def main() -> int:
         res = dict(zip([(j[0], j[1]) for j in jobs], ex.map(lambda j: route(j[2], j[3], a.work, j[4]), jobs)))
     drcs = {}
     if not a.no_drc and shutil.which("kicad-cli"):
+        bench_run.REFILL = True
         files = sorted({j[2] for j in jobs}) + [j[3] for j in jobs if j[3].exists()]
         with cf.ThreadPoolExecutor(a.drc_jobs) as ex:
             drcs = dict(zip(files, ex.map(bench_run.drc, files)))
+        bench_run.attach_connectivity([j for j in drcs.values() if j is not None])
     rows = []
     for tag, src, bus_args, gated in cases:
         for mode in ("off", "on"):
@@ -116,8 +118,11 @@ def main() -> int:
                    "vias": r.get("vias"), "expansions": r.get("expansions"), "buses": measure(dst, bus_args) if dst.exists() else []}
             before, after = drcs.get(out / tag / f"{tag}.kicad_pcb"), drcs.get(dst)
             if before and after:
-                row["unconnected"] = after["unconnected"]
-                row.update(bench_run.added_errors(before, after))
+                row["exit"] = r.get("exit", 0)
+                bench_run.apply_judgment(row, before, after)
+                row["unconnected"] = row.get("unconnected_uncapped", {}).get("after", after["unconnected"])
+            elif not a.no_drc:
+                row.update(judge="failed", clean=False, completion=None, error="KiCad DRC unavailable")
             rows.append(row)
     print(f"{'board':10} {'mode':4} {'routed':>9} {'vias':>4} {'added':>5}  group: routed, vias per member min-max, left the bus, skew / limit")
     for r in rows:
@@ -126,7 +131,8 @@ def main() -> int:
             + (f" / {g['skew_limit_mm']:.3f} {'ok' if g['within_skew'] else 'OVER'}" if g["skew_limit_mm"] is not None else " / none")
             for g in r["buses"])
         add = sum(r["added_errors"].values()) if "added_errors" in r else "?"
-        print(f"{r['board'][:10]:10} {r['mode']:4} {r['routed']}/{r['connections']:<4} {r['vias']:>4} {add:>5}  {gs}")
+        print(f"{r['board'][:10]:10} {r['mode']:4} {r['routed']}/{r['connections']:<4} {r['vias']:>4} {add:>5}  {gs} "
+              f"completion={r.get('completion')} error_gate={r.get('error_gate', 'unknown')} capped={r.get('capped_types', [])}")
     # Gate (doc 05 §38): on the gated boards with the feature on.
     fails = []
     by = {(r["board"], r["mode"]): r for r in rows}
@@ -135,9 +141,13 @@ def main() -> int:
             continue
         on, off = by[(tag, "on")], by[(tag, "off")]
         if on["routed"] is None or off["routed"] is None or on["routed"] < off["routed"]:
-            fails.append(f"{tag}: completion {on['routed']} below {off['routed']} without buses")
+            fails.append(f"{tag}: planned routes {on['routed']} below {off['routed']} without buses")
         if "added_errors" in on and on["added_errors"]:
             fails.append(f"{tag}: KiCad errors added: {on['added_errors']}")
+        if not a.no_drc and (on.get("judge") != "ok" or on.get("error_gate") == "unknown"):
+            fails.append(f"{tag}: KiCad error gate unknown or failed: {on.get('capped_types', on.get('error'))}")
+        if on.get("completion") is not None and off.get("completion") is not None and on["completion"] < off["completion"]:
+            fails.append(f"{tag}: KiCad completion {on['completion']:.2%} below {off['completion']:.2%} without buses")
         for g in on["buses"]:
             if g["skew_limit_mm"] is not None and not g["within_skew"]:
                 fails.append(f"{tag}: bus {g['name']} skew {g['skew_mm']:.3f} mm over {g['skew_limit_mm']:.3f} mm (or not all routed)")

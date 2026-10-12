@@ -187,6 +187,39 @@ class GateTests(unittest.TestCase):
                 self.assertIn('paired known cohort 0/1; unknown before/after 0/1', out)
                 self.assertIn('90.0% → unknown', out)
 
+    def test_uncapped_completion_overrides_saturated_list_and_stale_ratio(self):
+        code, out = gate({'x': dict(clean=False, stop='exhausted', completion=.1,
+                                   unconnected_before=499, unconnected_after=100,
+                                   unconnected_uncapped={'before': 1000, 'after': 100})},
+                         {'x': dict(clean=False, stop='exhausted', completion=.99,
+                                    unconnected_before=499, unconnected_after=200,
+                                    unconnected_uncapped={'before': 1000, 'after': 200})})
+        self.assertEqual(code, 1)
+        self.assertIn('completion 90.0% -> 80.0%', out)
+
+    def test_mixed_censored_legacy_and_uncapped_is_labelled(self):
+        code, out = gate({'x': dict(clean=False, unconnected_before=499, unconnected_after=100)},
+                         {'x': dict(clean=False, unconnected_before=499, unconnected_after=100,
+                                    unconnected_uncapped={'before': 1000, 'after': 100})})
+        self.assertEqual(code, 0)
+        self.assertIn('mixed connectivity methods', out)
+        self.assertIn('legacy censored', out)
+        self.assertIn('unknown → 90.0%', out)
+
+    def test_unknown_capped_error_gate_cannot_pass(self):
+        code, out = gate({'x': (1., 'complete', {})},
+                         {'x': dict(clean=False, completion=1., stop='work',
+                                    error_gate='unknown', capped_types=['clearance'])})
+        self.assertEqual(code, 1)
+        self.assertIn('DRC error gate unknown', out)
+
+    def test_invalid_connectivity_judgment_cannot_pass_with_clean_false(self):
+        code, out = gate({'x': dict(clean=False, completion=.5)},
+                         {'x': dict(judge='failed', clean=False, completion=None,
+                                    unconnected_before=10, unconnected_after=5)})
+        self.assertEqual(code, 1)
+        self.assertIn('judge failed (after)', out)
+
     def test_unknown_completion_still_gates_clean_regression(self):
         code, out = gate({'x': (1.0, 'complete', {})},
                          {'x': dict(clean=False, completion=None, unconnected_before=499, unconnected_after=20)})

@@ -88,17 +88,20 @@ def main() -> int:
     with cf.ThreadPoolExecutor(a.jobs) as ex:
         res = dict(zip([(t, m) for t, m, *_ in jobs], ex.map(lambda j: route(j[2], j[3], a.work, j[4]), jobs)))
     drc_files = sorted({j[2] for j in jobs}) + [j[3] for j in jobs]
+    bench_run.REFILL = True
     with cf.ThreadPoolExecutor(a.drc_jobs) as ex:
         drcs = dict(zip(drc_files, ex.map(bench_run.drc, drc_files)))
+    bench_run.attach_connectivity([j for j in drcs.values() if j is not None])
     rows = []
     for tag, mode, src, dst, _ in jobs:
         r = res[(tag, mode)]
         before, after = drcs.get(src), drcs.get(dst)
-        row = {"board": tag, "mode": mode, "routed": r.get("routed"), "connections": r.get("connections")}
+        row = {"board": tag, "mode": mode, "routed": r.get("routed"), "connections": r.get("connections"), "exit": 0}
         if before and after:
-            row["unconnected"] = after["unconnected"]
-            row.update(bench_run.added_errors(before, after))
-            row["clean"] = after["unconnected"] == 0 and not row["added_errors"]
+            bench_run.apply_judgment(row, before, after)
+            row["unconnected"] = row.get("unconnected_uncapped", {}).get("after", after["unconnected"])
+        else:
+            row.update(judge="failed", clean=False, completion=None, error="KiCad DRC failed")
         row["pairs"] = pairs(dst, extra_pairs.get(tag, [])) if dst.exists() else []
         rows.append(row)
     print(f"{'board':34} {'mode':4} {'routed':>9} {'uncon':>5} {'added':>5}  pairs: coupled% gap(median/min) skew")
@@ -106,10 +109,11 @@ def main() -> int:
         pr = "  ".join(f"{p['net_a']}:{100 * p['coupled_share']:.0f}% {p['gap_median_mm']:.3f}/{p['gap_min_mm']:.3f} {p['skew_mm']:.2f}"
                        for p in r["pairs"])
         print(f"{r['board'][:34]:34} {r['mode']:4} {r['routed']}/{r['connections']:<4} {r.get('unconnected', '?'):>5} "
-              f"{sum(r.get('added_errors', {}).values()) if 'added_errors' in r else '?':>5}  {pr}")
+              f"{sum(r.get('added_errors', {}).values()) if 'added_errors' in r else '?':>5}  {pr} "
+              f"completion={r.get('completion')} error_gate={r.get('error_gate', 'unknown')} capped={r.get('capped_types', [])}")
     if a.json:
         pathlib.Path(a.json).write_text(json.dumps({"work": a.work, "on_args": a.on_args, "rows": rows}, indent=1))
-    return 0
+    return 1 if any(r.get("judge") == "failed" for r in rows) else 0
 
 
 if __name__ == "__main__":

@@ -167,13 +167,15 @@ def coupling(d: dict) -> dict:
 
 
 def metrics(unrouted: pathlib.Path, routed: pathlib.Path) -> dict:
+    bench_run.REFILL = True
     before, after = bench_run.drc(unrouted), bench_run.drc(routed)
-    res = {"board": str(routed)}
+    res = {"board": str(routed), "exit": 0}
     if before and after:
-        additions = bench_run.added_errors(before, after)
-        res.update({"unconnected": after["unconnected"], "router_errors": additions["added_errors"],
-                    **additions, **bench_run.completion(before["unconnected"], after["unconnected"]),
-                    "clean": after["unconnected"] == 0 and not additions["added_errors"]})
+        bench_run.apply_judgment(res, before, after)
+        res["unconnected"] = res.get("unconnected_uncapped", {}).get("after", after["unconnected"])
+        res["router_errors"] = res["added_errors"]
+    else:
+        res.update(judge="failed", clean=False, completion=None, error="KiCad DRC failed")
     bj = board_json(routed)
     res.update(geometry(bj))
     res.update(coupling(bj))
@@ -198,7 +200,7 @@ def main() -> int:
     a = ap.parse_args()
     labels = a.labels or [pathlib.Path(r).stem for r in a.routed]
     rows = [dict(metrics(pathlib.Path(a.unrouted), pathlib.Path(r)), label=l) for l, r in zip(labels, a.routed)]
-    cols = ["label", "completion", "clean", "router_errors", "length_mm", "detour", "vias", "bends", "sharp_bends", "narrowed_mm"]
+    cols = ["label", "completion", "clean", "error_gate", "capped_types", "router_errors", "length_mm", "detour", "vias", "bends", "sharp_bends", "narrowed_mm"]
     print(" | ".join(cols))
     for r in rows:
         print(" | ".join(str(r.get(c, "")) for c in cols))

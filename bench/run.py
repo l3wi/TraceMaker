@@ -41,6 +41,7 @@ from plane_metrics import copper_totals, plane_nets, unconnected_split
 from prepare_inputs import copy_rules, refill_board, set_boards
 from drc_judge import (JUDGE_CODE_VERSION, JUDGE_FLAGS, METRIC_SCHEMA_VERSION,
                        added_errors as instance_added_errors, completion, instance_counts, violations)
+import kicad_connectivity
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 FIX = ROOT / "bench/data/freerouting/scripts/benchmark/fixtures/PCBench"
@@ -75,6 +76,60 @@ def atomic_json(path, data):
 
 def added_errors(before, after):
     return instance_added_errors(before["report"], after["report"])
+
+
+def attach_connectivity(judgments):
+    """Count exactly the saved geometry KiCad judged, once for each board pair."""
+    judgments = [j for j in judgments if not
+                 (j["report"].get("connectivity") is not None or j["report"].get("connectivity_unavailable"))]
+    if not judgments:
+        return
+    paths = [pathlib.Path(j["analysis_board"]) for j in judgments if j.get("analysis_board")]
+    try:
+        counts = kicad_connectivity.count_unconnected(paths) if paths else {}
+    except kicad_connectivity.ConnectivityUnavailable as error:
+        counts = {}
+        reason = str(error)
+    else:
+        reason = "connectivity requires a saved refilled analysis board (--refill)"
+    for judgment in judgments:
+        path = judgment.get("analysis_board")
+        if path is not None and path in counts:
+            judgment["report"]["connectivity"] = counts[path]
+        else:
+            judgment["report"]["connectivity_unavailable"] = reason
+
+
+def apply_judgment(res, before, after):
+    """Shared by routing and non-mutating rejudgment; mismatch is a judge failure."""
+    attach_connectivity((before, after))
+    res.update(added_errors(before, after))
+    res["judge_cache_keys"] = {"before": before.get("cache_key"), "after": after.get("cache_key")}
+    res.update(unconnected_before=before["unconnected"], unconnected_after=after["unconnected"])
+    res["judge_reports"] = {"before": before.get("drc_report"), "after": after.get("drc_report")}
+    try:
+        res.update(completion(before["unconnected"], after["unconnected"],
+                              before_connectivity=before["report"].get("connectivity"),
+                              after_connectivity=after["report"].get("connectivity")))
+    except ValueError as error:
+        res.update(judge="failed", clean=False, completion=None, error=str(error))
+        return
+    res["connectivity_unavailable"] = {
+        stage: j["report"]["connectivity_unavailable"] for stage, j in (("before", before), ("after", after))
+        if j["report"].get("connectivity_unavailable")}
+    res["judge"] = "ok"
+    remaining = res.get("unconnected_uncapped", {}).get("after", after["unconnected"])
+    res["clean"] = (res.get("exit") in (0, 3) and remaining == 0
+                    and res["error_gate"] == "pass" and not res.get("place_added")
+                    and res.get("place_judge") not in ("failed", "unknown"))
+
+
+def connectivity_provenance(rows):
+    exact = [r for r in rows if r.get("connectivity_method")]
+    return dict(connectivity_method=sorted({r["connectivity_method"] for r in exact}),
+                kicad_python_version=sorted({r["kicad_python_version"] for r in exact}),
+                connectivity_unavailable={r["board"]: r["connectivity_unavailable"]
+                                          for r in rows if r.get("connectivity_unavailable")})
 
 
 def fixture_provenance(name, *, legacy=False):
@@ -114,7 +169,14 @@ def headline(rows, scheduled):
     return dict(boards=scheduled, scheduled=scheduled, attempted=len(rows), judged=len(judged),
                 clean_pass=round(sum(bool(r.get("clean")) for r in rows) / scheduled, 4) if scheduled else None,
                 completion=round(sum(known) / len(known), 4) if known else None,
+                pooled_completion=(1 - sum(r["unconnected_uncapped"]["after"] for r in judged
+                                          if "unconnected_uncapped" in r)
+                                   / sum(r["unconnected_uncapped"]["before"] for r in judged
+                                         if "unconnected_uncapped" in r))
+                    if sum(r.get("unconnected_uncapped", {}).get("before", 0) for r in judged) else None,
                 completion_boards=len(known), censored_boards=sum(bool(r.get("censored")) for r in rows),
+                judge_list_censored_boards=sum(bool(r.get("judge_list_censored")) for r in rows),
+                error_gate_unknown_boards=sum(r.get("error_gate") == "unknown" for r in rows),
                 judge_failures=scheduled-len(judged),
                 infrastructure_failures=sum(r.get("judge") != "ok" or r.get("exit") not in (0, 3)
                                             or r.get("place_judge") == "failed" for r in rows),
@@ -208,6 +270,8 @@ def drc(path: pathlib.Path, timeout: int = 600, planes: dict | None = None,
               "unconnected": len(d.get("unconnected_items", [])), "report": d, "cache_key": key,
               "drc_report": str(out), "provenance": identity,
               "cross_report": {"violations": [v for v in d.get("violations", []) if not own_footprint(v)]}}
+    if REFILL:
+        result["analysis_board"] = str(saved if saved is not None else filled)
     if planes is not None:
         result.update(unconnected_split(d.get("unconnected_items", []), planes))
     return result
@@ -254,6 +318,9 @@ def place_board(name: str, src: pathlib.Path, outdir: pathlib.Path, res: dict) -
     ref = FIX / name / "unrouted.kicad_pcb"
     human, moved = drc(ref if ref.exists() else src), drc(placed)
     if human and moved:
+        caps = instance_added_errors(human["report"], moved["report"])["capped_types"]
+        if set(caps) & PLACEMENT_ERRORS:
+            res["place_judge"] = "unknown"
         res["place_added"] = place_added(human, moved)
     else:
         res["place_judge"] = "failed"
@@ -261,8 +328,9 @@ def place_board(name: str, src: pathlib.Path, outdir: pathlib.Path, res: dict) -
 
 
 def place_added(human: dict, moved: dict) -> dict:
+    capped = set(instance_added_errors(human["report"], moved["report"])["capped_types"])
     added = violations(moved["cross_report"]) - violations(human["cross_report"])
-    return {t: n for t, n in instance_counts(added).items() if t in PLACEMENT_ERRORS}
+    return {t: n for t, n in instance_counts(added).items() if t in PLACEMENT_ERRORS and t not in capped}
 
 
 def dead_pins(board: pathlib.Path, out_json: pathlib.Path) -> int | None:
@@ -393,34 +461,168 @@ def run_board(name: str, outdir: pathlib.Path, time_limit: float) -> dict:
         ref = SRC_FIX / name / "processed.kicad_pcb"
     if ref.exists() and "style" in res:
         res["style_ref"] = style_of(ref, outdir / "boards" / f"{name}.style_ref.json")
-    before = drc(src, planes=planes)
+    input_saved = out.with_name(f"{name}.input.refilled.kicad_pcb") if REFILL else None
+    before = drc(src, planes=planes, saved=input_saved)
     saved = out.with_name(f"{name}.refilled.kicad_pcb") if REFILL else None
     after = drc(out, planes=planes, saved=saved) if out.exists() else None
     if saved is not None and saved.exists():
         res["refilled_board"] = str(saved.relative_to(outdir))
+    if input_saved is not None and input_saved.exists():
+        res["input_refilled_board"] = str(input_saved.relative_to(outdir))
+    res["judge_input"] = str(src)
+    res["judge_input_sha256"] = digest(src)
     if before is None or after is None:
         res["judge"] = "failed"
         return res
-    additions = added_errors(before, after)
-    res.update(additions)
-    added = additions["added_errors"]
-    res["judge"] = "ok"
-    res["judge_cache_keys"] = {"before": before.get("cache_key"), "after": after.get("cache_key")}
-    res.update({"unconnected_before": before["unconnected"], "unconnected_after": after["unconnected"], "added_errors": added})
+    apply_judgment(res, before, after)
     if planes is not None:
         res.update({f"{group}_unconnected_{stage}": judge[f"{group}_unconnected"]
                     for group in ("plane", "signal") for stage, judge in (("before", before), ("after", after))})
         initial, final = copper_totals(src, planes), copper_totals(out, planes)
+        if "unconnected_per_net" in res:
+            for stage, counts in res["unconnected_per_net"].items():
+                res[f"plane_unconnected_{stage}"] = sum(n for net, n in counts.items() if net in planes)
+                res[f"signal_unconnected_{stage}"] = sum(n for net, n in counts.items() if net not in planes)
         res.update({f"{group}_vias_added": final[f"{group}_vias"] - initial[f"{group}_vias"]
                     for group in ("plane", "signal")})
         res.update({f"{group}_track_mm_added": round(final[f"{group}_track_mm"] - initial[f"{group}_track_mm"], 4)
                     for group in ("plane", "signal")})
-    res.update(completion(before["unconnected"], after["unconnected"]))
-    if res["completion"] is not None:
-        res["completion"] = round(res["completion"], 4)
-    res["clean"] = (res["exit"] in (0, 3) and after["unconnected"] == 0
-                    and not added and not res.get("place_added") and res.get("place_judge") != "failed")
+    # Completion stays full precision; presentation rounds, never the regression gate.
     return res
+
+
+def rejudge_run(source, run_id=None):
+    """Publish fresh judgments without routing or modifying source artifacts."""
+    global REFILL
+    directory = pathlib.Path(source)
+    if not directory.is_dir():
+        directory = ROOT / "bench/results" / source
+    summary = json.loads((directory / "summary.json").read_text())
+    manifest_path = directory / "manifest.json"
+    prior_manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    if summary.get("state", "final") != "final" or prior_manifest.get("state", "final") != "final":
+        raise ValueError("rejudgment requires a final run")
+    rows = [json.loads(line) for line in (directory / "boards.jsonl").read_text().splitlines() if line.strip()]
+    names = [row["board"] for row in rows]
+    if not names or len(names) != len(set(names)):
+        raise ValueError("rejudgment roster is empty or duplicated")
+    for metadata in (summary, prior_manifest):
+        if "roster" in metadata and sorted(metadata["roster"]) != sorted(names):
+            raise ValueError("rejudgment roster does not match final run")
+    run_id = run_id or directory.name + "-rejudged"
+    target = ROOT / "bench/results" / run_id
+    if target.exists() and any(target.iterdir()):
+        raise ValueError(f"run directory is not empty: {target}; use a new run name")
+    version = kicad_version()
+    inputs = summary.get("provenance", {}).get("inputs", {})
+    fixtures = pathlib.Path(summary.get("fixtures", SRC_FIX))
+    prepared = []
+    for row in rows:
+        name = row["board"]
+        output = directory / "boards" / f"{name}.kicad_pcb"
+        if row.get("judge_input"):
+            src = pathlib.Path(row["judge_input"])
+        elif (row.get("place") or "").startswith("ok"):
+            src = directory / "boards" / f"{name}.placed.kicad_pcb"
+        else:
+            src = fixtures / name / "unrouted.kicad_pcb"
+        expected = (row.get("judge_input_sha256") or row.get("input_sha256")
+                    or inputs.get(name, {}).get("board_sha256")
+                    or row.get("preparation", {}).get("input_sha256"))
+        if not expected or digest(src) != expected:
+            raise ValueError(f"{name}: cannot prove preserved judge input hash")
+        expected_rules = inputs.get(name, {}).get("rules")
+        actual_rules = {ext: digest(src.with_suffix(ext)) for ext in (".kicad_pro", ".kicad_dru")
+                        if src.with_suffix(ext).exists()}
+        if expected_rules is not None and actual_rules != expected_rules:
+            raise ValueError(f"{name}: preserved input rules differ")
+        if not output.exists():
+            raise ValueError(f"{name}: saved raw output is missing")
+        prepared.append((row, src, output))
+        preparation = src.with_name("preparation.json")
+        inputs[name] = dict(board_sha256=digest(src), rules=actual_rules,
+                            manifest_sha256=digest(preparation) if preparation.exists() else None)
+    REFILL = True
+    (target / "boards").mkdir(parents=True, exist_ok=True)
+    provenance = dict(summary.get("provenance", {}), metric_schema_version=METRIC_SCHEMA_VERSION,
+                      judge_code_version=JUDGE_CODE_VERSION, kicad_version=version,
+                      judge_flags=JUDGE_FLAGS + ["--refill-zones", "--save-board"],
+                      inputs=inputs,
+                      rejudged_from=directory.name,
+                      source_boards_sha256=digest(directory / "boards.jsonl"),
+                      source_outputs={row["board"]: digest(output) for row, _, output in prepared})
+    manifest = dict(prior_manifest, run=run_id, state="running", roster=names, scheduled=len(names),
+                    provenance=provenance, rejudged_from=directory.name)
+    atomic_json(target / "manifest.json", manifest)
+    judged_rows = []
+    for old, src, output in prepared:
+        name = old["board"]
+        raw = target / "boards" / output.name
+        shutil.copyfile(output, raw)
+        copy_rules(output, raw)
+        route_json = pathlib.Path(str(output) + ".route.json")
+        if route_json.exists():
+            shutil.copyfile(route_json, pathlib.Path(str(raw) + ".route.json"))
+        row = {key: value for key, value in old.items() if key not in {
+            "judge", "clean", "completion", "censored", "judge_list_censored", "judge_cache_keys",
+            "judge_reports", "unconnected_before", "unconnected_after", "unconnected_uncapped",
+            "unconnected_per_net", "connectivity_method", "kicad_python_version",
+            "connectivity_unavailable", "added_errors", "added_nonrouting", "added_any",
+            "capped", "capped_types", "error_gate", "error"}}
+        row.update(metric_schema_version=METRIC_SCHEMA_VERSION, judge_input=str(src), judge_input_sha256=digest(src))
+        saved_input = target / "boards" / f"{name}.input.refilled.kicad_pcb"
+        saved_output = target / "boards" / f"{name}.refilled.kicad_pcb"
+        planes = row.get("plane_nets")
+        before, after = drc(src, planes=planes, saved=saved_input), drc(raw, planes=planes, saved=saved_output)
+        row.update(input_refilled_board=str(saved_input.relative_to(target)),
+                   refilled_board=str(saved_output.relative_to(target)))
+        if before is None or after is None:
+            row.update(judge="failed", clean=False, completion=None, error="KiCad rejudgment failed")
+        else:
+            apply_judgment(row, before, after)
+            if planes is not None:
+                for stage, j in (("before", before), ("after", after)):
+                    counts = row.get("unconnected_per_net", {}).get(stage)
+                    for group in ("plane", "signal"):
+                        row[f"{group}_unconnected_{stage}"] = (
+                            sum(n for net, n in counts.items() if (net in planes) == (group == "plane"))
+                            if counts is not None else j[f"{group}_unconnected"])
+        judged_rows.append(row)
+        ratio = f'{row["completion"]:.2%}' if row.get("completion") is not None else "unknown"
+        print(f'{name}: {row.get("unconnected_uncapped", {})}; completion {ratio}; gate {row.get("error_gate", "failed")}')
+    (target / "boards.jsonl").write_text("".join(json.dumps(row) + "\n" for row in judged_rows))
+    provenance.update(connectivity_provenance(judged_rows))
+    summary.update(headline(judged_rows, len(names)))
+    summary.update(run=run_id, state="final", roster=names, provenance=provenance, refill=True,
+                   rejudged_from=directory.name,
+                   boards_with_added_errors=sum(bool(row.get("added_errors")) for row in judged_rows),
+                   added_error_types=dict(Counter(kind for row in judged_rows for kind in row.get("added_errors", {}))))
+    valid = [row for row in judged_rows if row["judge"] == "ok"]
+    fr_rows = [row for row in valid if row.get("fr_rc12")]
+    fr241 = [row for row in valid if row.get("fr_241")]
+    summary.update(fr_rc12_clean_pass=sum(row["fr_rc12"]["clean"] for row in fr_rows) / len(fr_rows) if fr_rows else None,
+                   fr_241_clean_pass=sum(row["fr_241"]["clean"] for row in fr241) / len(fr241) if fr241 else None,
+                   both_clean=sum(row["clean"] and row["fr_rc12"]["clean"] for row in fr_rows),
+                   only_tracemaker_clean=sum(row["clean"] and not row["fr_rc12"]["clean"] for row in fr_rows),
+                   only_freerouting_clean=sum(not row["clean"] and row["fr_rc12"]["clean"] for row in fr_rows))
+    for key in ("plane_unconnected_before", "plane_unconnected_after", "signal_unconnected_before", "signal_unconnected_after"):
+        summary[key] = sum(row.get(key, 0) for row in judged_rows if row["judge"] == "ok")
+    feasible = [row for row in judged_rows if row["judge"] == "ok" and row.get("dead_pins") == 0]
+    summary.update(feasible_boards=len(feasible),
+                   clean_pass_feasible=sum(row["clean"] for row in feasible) / len(feasible) if feasible else None,
+                   plane_metrics_boards=sum("plane_unconnected_after" in row for row in judged_rows if row["judge"] == "ok"))
+    atomic_json(target / "summary.json", summary)
+    atomic_json(target / "manifest.json", dict(manifest, state="final", attempted=len(names),
+                                               judged=summary["judged"], judge_failures=summary["judge_failures"]))
+    report = ["# Rejudgment " + run_id, "", "Source: `" + directory.name + "`; raw outputs unchanged; no routing.",
+              "", "| Board | Before | After | Completion | Error gate |", "|---|---:|---:|---:|---|"]
+    for row in judged_rows:
+        counts = row.get("unconnected_uncapped", {})
+        ratio = f'{row["completion"]:.2%}' if row.get("completion") is not None else "unknown"
+        report.append(f'| {row["board"]} | {counts.get("before", "?")} | {counts.get("after", "?")} | {ratio} | {row.get("error_gate", "judge failed")} |')
+    (target / "report.md").write_text("\n".join(report) + "\n")
+    print(f"Saved {target}; mean={summary['completion']}, pooled={summary['pooled_completion']}")
+    return 1 if summary["infrastructure_failures"] else 0
 
 
 def main() -> int:
@@ -451,12 +653,15 @@ def main() -> int:
     ap.add_argument("--full", action="store_true", help="also route the set's `#slow` boards (the largest; run before committing, doc 10 §4)")
     ap.add_argument("--set-name", help="name of the board set for the summary (default: the tier)")
     ap.add_argument("--intents", help="route with DIR/<board>.intent.json routing intent manifests (doc 05 §45); missing ones are drafted from the input")
-    ap.add_argument("--rejudge-human", action="store_true",
-                    help="explicitly replace an existing human run's judgments, preserving its exact roster")
+    ap.add_argument("--rejudge", metavar="RUN",
+                    help="rejudge a final saved run without routing; publish --name or RUN-rejudged")
     a = ap.parse_args()
     explicit_boards = a.boards is not None
-    if a.rejudge_human and (not a.human or not a.name or explicit_boards):
-        ap.error("--rejudge-human requires --human --name and the existing full set roster")
+    if a.rejudge:
+        try:
+            return rejudge_run(a.rejudge, a.name)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            ap.error(str(error))
     global THREADS, PLACE_THREADS, SRC_FIX, PLACE_ARGS, WORK, REFILL, EXTRA, INTENTS, HUMAN
     PLACE_ARGS = (a.place_args or "").split()
     # With --work every board runs the whole portfolio whatever the thread count (D47); one thread runs its eight
@@ -505,16 +710,9 @@ def main() -> int:
     run_id = a.name or datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + f"-tier{a.tier}"
     outdir = ROOT / "bench/results" / run_id
     if outdir.exists() and any(outdir.iterdir()):
-        if not a.rejudge_human:
-            ap.error(f"run directory is not empty: {outdir}; use a new run name")
-        prior = json.loads((outdir / "summary.json").read_text())
-        prior_roster = [json.loads(line)["board"] for line in (outdir / "boards.jsonl").read_text().splitlines() if line.strip()]
-        if not prior.get("human") or sorted(prior_roster) != sorted(names) or prior.get("refill") != a.refill:
-            ap.error("human rejudgment must preserve the existing human roster and refill policy")
-    elif a.rejudge_human:
-        ap.error("--rejudge-human requires an existing human run")
+        ap.error(f"run directory is not empty: {outdir}; use a new run name")
     try:
-        inputs = {name: fixture_provenance(name, legacy=a.rejudge_human) for name in names}
+        inputs = {name: fixture_provenance(name) for name in names}
         version = kicad_version()
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         ap.error(str(error))
@@ -528,7 +726,7 @@ def main() -> int:
                       selection_mode=selection_mode)
     manifest = dict(run=run_id, state="running", roster=names, full=a.full,
                     selection_mode=selection_mode, scheduled=len(names), provenance=provenance,
-                    rejudge_human=a.rejudge_human)
+                    rejudged_from=None)
     atomic_json(outdir / "manifest.json", manifest)
     # Snapshot the engine binary so rebuilding during a run cannot mix versions.
     if not HUMAN:
@@ -559,7 +757,10 @@ def main() -> int:
             frc = r["fr_rc12"]["clean"] if r.get("fr_rc12") else None
             print(f"{tag} {r['board'][:44]:44} routed {r.get('routed', '?')}/{r.get('connections', '?')} unconn {r.get('unconnected_after', '?')} "
                   f"added {r.get('added_errors', {})} {r.get('seconds', 0):.1f}s  FR-RC12 clean={frc}", flush=True)
+            if r.get("judge") == "failed" and r.get("error"):
+                print(f"JUDGE FAILURE {r['board']}: {r['error']}", file=sys.stderr, flush=True)
     judged = [r for r in rows if r.get("judge") == "ok"]
+    provenance.update(connectivity_provenance(rows))
     n = len(names)
     fr_rows = [r for r in judged if r.get("fr_rc12")]
     fr_clean = sum(r["fr_rc12"]["clean"] for r in fr_rows)

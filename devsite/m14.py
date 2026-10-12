@@ -14,12 +14,15 @@ import json
 import pathlib
 import re
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 STATIC = pathlib.Path(__file__).resolve().parent / "static"
+sys.path.insert(0, str(ROOT / "bench"))
+from compare_runs import completion_value
 RESULTS = ROOT / "bench" / "results"
 RUN_RE = re.compile(r"^(gap19|gap20|srj19|srj20|fan31|pf19|pf20)")
 SET_OF = {"gap19": "srj19-gap", "gap20": "srj20-gap", "srj19": "srj19", "srj20": "srj20", "fan31": "fanout31", "pf19": "srj19-p1fail", "pf20": "srj20-p1fail"}
@@ -92,10 +95,14 @@ def runs(hours: float = 36) -> list[dict]:
         routed = sum(r.get("routed", 0) for r in rows)
         conns = sum(r.get("connections", 0) for r in rows)
         secs = sorted(r.get("seconds", 0) for r in rows)
+        known = [value for row in rows if (value := completion_value(row)) is not None
+                 and row.get("judge", "ok") == "ok"]
         out.append({
             "run": d.name, "set": set_name, "done": summ is not None, "boards": n, "total": total, "clean": clean,
             "clean_pct": clean / n if n else 0, "routed": routed, "connections": conns,
-            "completion": routed / conns if conns else 0, "vias": (sum(r.get("vias", 0) for r in rows) / n) if n else 0,
+            "completion": sum(known) / len(known) if known else None,
+            "completion_boards": len(known), "censored_boards": n - len(known),
+            "vias": (sum(r.get("vias", 0) for r in rows) / n) if n else 0,
             "median_s": secs[n // 2] if n else 0, "work": (summ or {}).get("work"),
             "args": (summ or {}).get("route_args", ""), "mtime": mt,
         })
