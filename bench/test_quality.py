@@ -237,6 +237,21 @@ class QualityTests(unittest.TestCase):
                     self.assertIn(kind,judged['capped_types'])
                     self.assertNotIn(kind,judged['added_errors'])
 
+    def test_exact_per_net_data_removes_censored_ground_na(self):
+        data=dict(nets=['GND'],pads=[],tracks=[],arcs=[],vias=[],copper_layers=[])
+        cap=dict(net='GND',connected=True,return_net='GND',return_connected=True,return_lead_mm=1)
+        with patch.object(scorecard,'effective_paths',return_value={'cap':cap}), \
+             patch.object(si,'all_fills',return_value={}), \
+             patch.object(si,'fills',return_value=({},set(),None)), \
+             patch.object(scorecard.craft,'measure',return_value={'per_pad_entry':{}}), \
+             patch.object(scorecard.craft,'power',return_value={}), \
+             patch.object(scorecard.craft,'thermal',return_value={}), \
+             patch.object(scorecard.returns,'grounded_islands',return_value={}):
+            categories,_,_=scorecard.measure(data,{},pathlib.Path('synthetic'),{},[],
+                censored=True,per_net={})
+        self.assertTrue(categories['decoupling']['cap']['return_connected'])
+        self.assertNotIn('return_reason',categories['decoupling']['cap'])
+
     @staticmethod
     def arc(net, radius, angles, centre=(0, 0)):
         points = [(round((centre[0] + radius * math.cos(math.radians(a))) * 1e6),
