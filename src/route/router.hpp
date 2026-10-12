@@ -82,6 +82,7 @@ struct RouterOptions {
   bool pair_twists = true;
   long pair_max_expansions = 0;  // 0: length-scaled 40k–250k local cap; explicit cap for controlled ablations
   bool pair_leg_cache = true;   // reuse invariant endpoint checks locally; false is the exact reference path
+  bool pair_exit_index = true;  // exact AABB guidance broad phase; false is the linear reference path
   Coord pair_skew = 0;
   // Per-pair limits for RouterOptions::pair_nets (same index; 0 or missing = pair_skew): component rules give each
   // interface its own limit (USB 2.0 1.27 mm, doc 15 USB2-02).
@@ -208,7 +209,7 @@ struct RouteResult {
   std::vector<model::Via> vias;
   int connections = 0, routed = 0;
   long expansions = 0;
-  long pair_work = 0;           // the part of `expansions` spent in coupled pair searches (closed states and leg checks)
+  long pair_work = 0;           // pair selection/guidance, candidate visits, geometry checks, pin probes and reconstruction
   int rips = 0, passes = 0;
   int enclosed = 0;             // searches that proved the source boxed in (no larger window tried)
   long nogood_skips = 0;        // attempts skipped because an identical attempt already failed

@@ -603,6 +603,7 @@ RouteJobResult run_route_job(RouteJob job) {
       const bool kept = after < before;
       log(fmt("refill repair: %d items unconnected after refilling again%s", after, kept ? "" : " (no better: repair discarded)"));
       res.pair_successes += r2.pair_successes;
+      res.pair_work += r2.pair_work;
       res.pair_anchor_skips += r2.pair_anchor_skips;
       res.pair_attempts.reserve(res.pair_attempts.size() + r2.pair_attempts.size());
       for (auto& attempt : r2.pair_attempts) {
@@ -874,8 +875,9 @@ RouteJobResult run_route_job(RouteJob job) {
         {"attempts", res.pair_attempts.size()}, {"successful_attempts", res.pair_successes}, {"fallback_attempts", fallback_attempts},
         {"surviving_routes", res.pairs}, {"anchored_cleanup_skips", res.pair_anchor_skips}, {"failure_classes", failure_classes}, {"details", attempts}};
     log(fmt("differential pairs: %zu wanted, %zu attempts, %d successful, %d fallback, %d surviving coupled routes, %ld work units",
-            want.size(), res.pair_attempts.size(), res.pair_successes, fallback_attempts, res.pairs, attempt_work));
-    out.summary["pair_work"] = attempt_work;
+            want.size(), res.pair_attempts.size(), res.pair_successes, fallback_attempts, res.pairs, res.pair_work));
+    out.summary["pair_work"] = res.pair_work;
+    out.summary["pair_setup_work"] = res.pair_work - attempt_work;
     for (const auto& [na, nb] : want) {
       const auto pr = route::pair_rule(lb.board, rules, re, na, nb);
       const auto st = route::measure_pair(res.tracks, res.vias, na, nb, route::coupled_threshold(pr));
