@@ -16,7 +16,8 @@ void add_route_options(CLI::App& app, RouteJob& job, bool require_paths) {
     double pitch_um, pair_skew_mm;
     bool no_kb = false;
   };
-  const auto state = std::make_shared<ParseState>(ParseState{job.opt.pitch / 1000.0, job.opt.pair_skew / 1e6});
+  const auto state = std::make_shared<ParseState>(
+      ParseState{static_cast<double>(job.opt.pitch) / 1000.0, static_cast<double>(job.opt.pair_skew) / 1e6});
   auto& ropt = job.opt;
   auto& r_job = job;
   auto& r_pitch_um = state->pitch_um;
