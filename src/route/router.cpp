@@ -2539,6 +2539,19 @@ struct Router::Impl {
         d(pad(A.pad_a).pos, pad(B.pad_a).pos) + d(pad(A.pad_b).pos, pad(B.pad_b).pos))
       std::swap(B.pad_a, B.pad_b);
     const model::Pad &pa1 = pad(A.pad_a), &pa2 = pad(A.pad_b), &pb1 = pad(B.pad_a), &pb2 = pad(B.pad_b);
+    // Interleaved duplicate terminals in one connector are local tree joins, not a through lane.
+    // Keep their independent fanout; forcing a coupled trunk would wrap around the other half.
+    if (pa1.footprint >= 0 && pa1.footprint == pa2.footprint && pa1.footprint == pb1.footprint && pa1.footprint == pb2.footprint &&
+        geom::orient(pa1.pos, pa2.pos, pb1.pos) == 0 && geom::orient(pa1.pos, pa2.pos, pb2.pos) == 0) {
+      const bool along_x = std::llabs(pa2.pos.x - pa1.pos.x) >= std::llabs(pa2.pos.y - pa1.pos.y);
+      auto axis = [&](Point p) { return along_x ? p.x : p.y; };
+      const Coord a0 = std::min(axis(pa1.pos), axis(pa2.pos)), a1 = std::max(axis(pa1.pos), axis(pa2.pos));
+      const Coord b0 = std::min(axis(pb1.pos), axis(pb2.pos)), b1 = std::max(axis(pb1.pos), axis(pb2.pos));
+      if ((a0 < b0 && b0 < a1 && a1 < b1) || (b0 < a0 && a0 < b1 && b1 < a1)) {
+        pair_why = "no coupled path for interleaved local terminals";
+        return false;
+      }
+    }
     model::LayerMask allowed = 0;  // layers both halves may use (custom disallow rules)
     for (int l = 0; l < nl; ++l)
       if (layer_ok(A.net, l) && layer_ok(B.net, l)) allowed |= model::layer_bit(l);
@@ -2609,11 +2622,11 @@ struct Router::Impl {
       }
       return true;
     };
-    if (se < 1'500'000) {
-      // Short pad-to-gap tapers retain a real constant-gap run. Both assignments and several
-      // taper lengths compete on common layers, without relaxing the exact commit gate.
+    if (se > static_cast<double>(w) && se < 1'500'000 &&
+        d(pa1.pos, pa2.pos) < 1'500'000 && d(pb1.pos, pb2.pos) < 1'500'000) {
+      // Short tapers are a fast candidate family, not a terminal routing decision. A small
+      // midpoint displacement alone does not make either actual half a short connection.
       pair_why = "short coupled taper blocked";
-      if (se <= static_cast<double>(w)) return false;
       const Dir2 u{static_cast<double>(E.x - S.x) / se, static_cast<double>(E.y - S.y) / se}, n{-u.y, u.x};
       PairHalf ha, hb;
       ha.net = A.net;
@@ -2636,11 +2649,10 @@ struct Router::Impl {
               if (!(p == q)) ha.segs.push_back({layer, {p, q, w}});
             for (const auto& [p, q] : {std::pair{pb1.pos, xb}, std::pair{xb, yb}, std::pair{yb, pb2.pos}})
               if (!(p == q)) hb.segs.push_back({layer, {p, q, w}});
-            if (commit_pair_halves(ia, ib, ha, hb, pr, true) == PairCommit::Coupled) return finish();
+            if (commit_pair_halves(ia, ib, ha, hb, pr, true) == PairCommit::Coupled && finish()) return true;
           }
       }
-      if (out_of_budget()) pair_why = "out of budget";
-      return false;
+      if (out_of_budget()) { pair_why = "out of budget"; return false; }
     }
     // Where the coupled section may start and end: within Rs / Re of the pad midpoints (legs are uncoupled length),
     // farther where the two pads lie far apart (pins with another pin between them).
@@ -2961,8 +2973,15 @@ struct Router::Impl {
         const auto committed = commit_pair_halves(ia, ib, ha, hb, pr);
         if (committed == PairCommit::Incompatible) continue;
         if (committed == PairCommit::Coupled) {
-          done = true;
-          break;
+          // The guard's strict search charges its own work. Flush pair work first so that
+          // it sees the same job allowance; rejection lifts both halves without finalising state.
+          charge();
+          if (finish()) {
+            done = true;
+            break;
+          }
+          if (out_of_budget()) stopped = true;
+          continue;
         }
         pair_why = "exact check of the finished pair";
         if (++finals >= 4) break;
@@ -3118,7 +3137,7 @@ struct Router::Impl {
       else if (expanded >= cap) pair_why = "pair search budget";
       return false;
     }
-    return finish();
+    return true;
   }
 
   // Named pairs and explicit/component pairs are a union, including USB DP/DM without a P/N spelling.

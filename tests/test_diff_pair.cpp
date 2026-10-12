@@ -524,6 +524,178 @@ TEST_CASE("blocked short taper never commits a half pair", "[diffpair][route]") 
   CHECK(result.vias.empty());
 }
 
+namespace {
+
+route::RouterOptions pair_finish_options(long work = 10'000'000) {
+  route::RouterOptions o;
+  o.diff_pairs = true;
+  o.allow_vias = false;
+  o.gpu_device = -1;
+  o.work_budget = work;
+  o.time_limit_s = 600;
+  o.optimize = false;
+  o.rip_up = false;
+  o.max_passes = 1;
+  o.max_restarts = 0;
+  return o;
+}
+
+void same_pair_copper(const route::RouteResult& a, const route::RouteResult& b, bool same_work = true) {
+  if (same_work) {
+    CHECK(a.expansions == b.expansions);
+    CHECK(a.pair_work == b.pair_work);
+  }
+  REQUIRE(a.tracks.size() == b.tracks.size());
+  REQUIRE(a.vias.size() == b.vias.size());
+  for (std::size_t i = 0; i < a.tracks.size(); ++i) {
+    CHECK(a.tracks[i].a == b.tracks[i].a);
+    CHECK(a.tracks[i].b == b.tracks[i].b);
+    CHECK(a.tracks[i].width == b.tracks[i].width);
+    CHECK(a.tracks[i].layer == b.tracks[i].layer);
+    CHECK(a.tracks[i].net == b.tracks[i].net);
+  }
+}
+
+model::Board straddled_pair() {
+  return io::read_board(sexpr::Document::parse(R"((kicad_pcb (version 20240108) (generator "pcbnew")
+    (general (thickness 1.6))
+    (layers (0 "F.Cu" signal) (44 "Edge.Cuts" user))
+    (setup (pad_to_mask_clearance 0))
+    (net 0 "") (net 1 "D_P") (net 2 "D_N") (net 3 "GND") (net 4 "W")
+    (footprint "T:P" (layer "F.Cu") (at 5 10) (property "Reference" "J1")
+      (pad "1" smd rect (at 0 -0.95) (size 0.3 0.3) (layers "F.Cu") (net 1 "D_P"))
+      (pad "2" smd rect (at 0 0.95) (size 0.3 0.3) (layers "F.Cu") (net 2 "D_N"))
+      (pad "3" smd rect (at 0 0) (size 0.3 0.3) (layers "F.Cu") (net 3 "GND")))
+    (footprint "T:P" (layer "F.Cu") (at 9 10) (property "Reference" "J2")
+      (pad "1" smd rect (at 0 -0.3) (size 0.3 0.3) (layers "F.Cu") (net 1 "D_P"))
+      (pad "2" smd rect (at 0 0.3) (size 0.3 0.3) (layers "F.Cu") (net 2 "D_N")))
+    (footprint "T:P" (layer "F.Cu") (at 7 10) (property "Reference" "J3")
+      (pad "1" smd rect (at 0 0) (size 0.3 0.3) (layers "F.Cu") (net 3 "GND")))
+    (segment (start 4.3 8.5) (end 4.3 11.5) (width 0.2) (locked yes) (layer "F.Cu") (net 4))
+    (segment (start 4.3 8.5) (end 4.6 8.5) (width 0.2) (locked yes) (layer "F.Cu") (net 4))
+    (segment (start 4.3 11.5) (end 4.6 11.5) (width 0.2) (locked yes) (layer "F.Cu") (net 4))
+    (gr_rect (start 0 0) (end 14 20) (stroke (width 0.1) (type default)) (fill none) (layer "Edge.Cuts"))
+  ))"));
+}
+
+}  // namespace
+
+TEST_CASE("blocked short taper falls through to a deterministic coupled search", "[diffpair][route]") {
+  auto b = fenced_pair();
+  b.tracks.clear();
+  for (auto& p : b.pads)
+    if (p.pos.x > 20'000'000) p.pos.x = 6'000'000;
+  // The fixed taper families all cross this fence; a paired dogleg can go around it.
+  b.tracks.push_back({{5'500'000, 9'400'000}, {5'500'000, 10'600'000}, 200'000, 0, 3, true, sexpr::kNoNode});
+  const auto r = rules_with(200'000, false, 0, 0);
+  const auto o = pair_finish_options();
+  const auto result = route::Router(b, r, o).run();
+  REQUIRE(result.pairs == 1);
+  CHECK(result.pair_work > 100);
+  CHECK(route::measure_pair(result.tracks, result.vias, 1, 2, 250'000).coupled_share() > 0.3);
+  same_pair_copper(result, route::Router(b, r, o).run());
+  const auto limited = route::Router(b, r, pair_finish_options(2'000)).run();
+  CHECK(limited.pair_work <= 2'000 / 10 + 64);
+  same_pair_copper(limited, route::Router(b, r, pair_finish_options(2'000)).run());
+  b.tracks.insert(b.tracks.end(), result.tracks.begin(), result.tracks.end());
+  CHECK(drc::run_drc(b, r).unconnected.empty());
+}
+
+TEST_CASE("pair search retries a geometrically legal finish that encloses a middle pin", "[diffpair][route]") {
+  auto b = straddled_pair();
+  b.copper.push_back(static_cast<int>(b.layers.size()));
+  b.layers.push_back({31, "B.Cu", "B.Cu", "signal", "", 1});
+  for (auto& p : b.pads)
+    if (p.net == 1 || p.net == 2) {
+      p.copper |= model::layer_bit(1);
+      p.type = model::PadType::ThruHole;
+      p.drill_x = p.drill_y = 100'000;
+    }
+  const auto r = rules_with(150'000, false, 0, 0);
+  auto o = pair_finish_options(100'000'000);
+  // Front-copper goals compete first, but they box the front-only ground pin; back copper leaves it open.
+  o.layer_cost_pm = {1000, 1100};
+  const auto result = route::Router(b, r, o).run();
+  REQUIRE(result.pairs == 1);
+  REQUIRE_FALSE(result.pair_attempts.empty());
+  CHECK(result.pair_attempts.front().detail.find("would enclose pin") != std::string::npos);
+  CHECK(result.routed == result.connections);
+  CHECK(result.expansions <= o.work_budget + 64);
+  same_pair_copper(result, route::Router(b, r, o).run());
+  b.tracks.insert(b.tracks.end(), result.tracks.begin(), result.tracks.end());
+  CHECK(drc::run_drc(b, r).unconnected.empty());
+}
+
+TEST_CASE("fully enclosed finish control restores copper before ordinary routing", "[diffpair][route]") {
+  auto b = straddled_pair();
+  // Extend the fence to the outer signal pads: no searched finish can leave the ground escape open.
+  b.tracks[1].b.x = b.tracks[2].b.x = 5'000'000;
+  struct RemovalSink final : events::Sink {
+    long removed = 0;
+    void publish(std::string message) override {
+      if (message.find("\"type\":\"track_remove\"") != std::string::npos) ++removed;
+    }
+    bool wants_transient() const override { return false; }
+  } sink;
+  auto o = pair_finish_options();
+  o.sink = &sink;
+  const auto r = rules_with(150'000, false, 0, 0);
+  const auto result = route::Router(b, r, o).run();
+  REQUIRE(result.pairs == 0);
+  CHECK(sink.removed > 0);
+  o.sink = nullptr;
+  o.diff_pairs = false;
+  const auto ordinary = route::Router(b, r, o).run();
+  // Failed pair insertion must leave no copper, near-obstacle or connection-state residue.
+  same_pair_copper(result, ordinary, false);
+  b.tracks.insert(b.tracks.end(), result.tracks.begin(), result.tracks.end());
+  CHECK(drc::run_drc(b, r).unconnected.empty());
+}
+
+TEST_CASE("small midpoint displacement does not bypass the search for long asymmetric halves", "[diffpair][route]") {
+  auto b = fenced_pair();
+  b.tracks.clear();
+  b.pads[0].pos = {5'000'000, 9'700'000};
+  b.pads[2].pos = {7'000'000, 9'850'000};
+  b.pads[1].pos = {9'000'000, 10'300'000};
+  b.pads[3].pos = {7'000'000, 10'300'000};
+  auto o = pair_finish_options(100'000);
+  o.pair_max_expansions = 100;
+  const auto r = rules_with(150'000, false, 0, 0);
+  const auto result = route::Router(b, r, o).run();
+  REQUIRE_FALSE(result.pair_attempts.empty());
+  CHECK(result.pair_attempts.front().work > 0);
+  CHECK(result.pair_attempts.front().reason != "short_taper_blocked");
+  same_pair_copper(result, route::Router(b, r, o).run());
+}
+
+TEST_CASE("interleaved duplicate connector joins remain independent fanouts", "[diffpair][route]") {
+  auto b = fenced_pair();
+  b.tracks.clear();
+  b.footprints.resize(1);
+  b.footprints[0].pads = {0, 1, 2, 3};
+  // USB-C-style B7/A6/A7/B6 row: each net joins its duplicates around the other.
+  for (std::size_t i = 0; i < b.pads.size(); ++i) {
+    auto& p = b.pads[i];
+    p.footprint = 0;
+    p.pos = {5'000'000, 9'000'000 + static_cast<Coord>(i) * 500'000};
+    p.size_x = 1'450'000;
+    p.size_y = 300'000;
+  }
+  const auto r = rules_with(100'000, true, 100'000, 100'000);
+  const auto o = pair_finish_options();
+  const auto result = route::Router(b, r, o).run();
+  REQUIRE_FALSE(result.pair_attempts.empty());
+  CHECK(result.pair_attempts.front().work == 0);
+  CHECK_FALSE(result.pair_attempts.front().coupled);
+  CHECK(result.pair_attempts.front().detail == "no coupled path for interleaved local terminals");
+  CHECK(result.pairs == 0);
+  CHECK(result.routed == result.connections);
+  same_pair_copper(result, route::Router(b, r, o).run());
+  b.tracks.insert(b.tracks.end(), result.tracks.begin(), result.tracks.end());
+  CHECK(drc::run_drc(b, r).unconnected.empty());
+}
+
 TEST_CASE("explicit USB pairs remain selected with name detection enabled", "[diffpair][route]") {
   auto b = fenced_pair();
   b.tracks.clear();
