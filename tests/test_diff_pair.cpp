@@ -6,6 +6,7 @@
 #include <cmath>
 
 #include "drc/copper.hpp"
+#include "drc/drc.hpp"
 #include "drc/rule_engine.hpp"
 #include "io/kicad/board_reader.hpp"
 #include "route/diff_pair.hpp"
@@ -119,6 +120,23 @@ TEST_CASE("pair geometry: offsets are symmetric and miters keep the offset dista
   }
 }
 
+TEST_CASE("pair pad exits follow rotated copper axes and offsets", "[diffpair]") {
+  model::Pad p;
+  p.pos = {2'000'000, 3'000'000};
+  p.size_x = 300'000;
+  p.size_y = 1'500'000;
+  p.drill_offset = {100'000, 0};
+  p.angle = 90;
+  const auto exits = route::pair_pad_exits(p, 200'000);
+  const Point centre = p.pos + geom::rotate(p.drill_offset, p.angle);
+  CHECK(dist(exits[0], centre) == 350'000);
+  CHECK(dist(exits[1], centre) == 350'000);
+  CHECK(dist(exits[2], centre) == 950'000);
+  CHECK(dist(exits[3], centre) == 950'000);
+  CHECK(exits[0].x == centre.x);
+  CHECK(exits[2].y == centre.y);
+}
+
 TEST_CASE("pair measurement: coupled share, gap and skew", "[diffpair]") {
   std::vector<model::Track> t;
   // Two parallel 10 mm tracks, 0.25 mm wide, edges 0.2 mm apart, then net 1 runs on alone for 2 mm.
@@ -191,13 +209,347 @@ TEST_CASE("pair search: rejected candidates are work, and the work budget stops 
   // thousands of rejected candidates. Charging only closed states left such attempts at about zero work.
   CHECK(full.pair_work > 5'000);
   CHECK(full.expansions >= full.pair_work);
-  // A budget far below the attempt's work stops it inside the attempt, within one check interval (64 candidates of at
-  // most 72 leg checks each), and the same budget gives the same run.
+  // Poll inside each nested leg check; the outer queue polls at most 64 states/candidates apart.
   const long budget = 2'000;
   const auto cut = route_fenced(b, budget);
   CHECK(cut.pair_work < full.pair_work);
-  CHECK(cut.expansions <= budget + 64 * 72);
+  CHECK(cut.pair_work <= budget / 10 + 64);
   const auto again = route_fenced(b, budget);
   CHECK(again.expansions == cut.expansions);
   CHECK(again.pair_work == cut.pair_work);
+}
+
+TEST_CASE("upfront pair probes reserve fixed work for ordinary connections", "[diffpair][route]") {
+  auto b = fenced_pair();
+  model::Net signal;
+  signal.id = 4;
+  signal.name = "SIGNAL";
+  b.nets.push_back(signal);
+  for (const Coord x : {10'000'000, 11'000'000}) {
+    auto p = b.pads.front();
+    p.net = signal.id;
+    p.pos = {x, 3'000'000};
+    p.footprint = -1;
+    p.node = sexpr::kNoNode;
+    b.pads.push_back(p);
+  }
+  route::RouterOptions o;
+  o.diff_pairs = true;
+  o.allow_vias = false;
+  o.gpu_device = -1;
+  o.optimize = false;
+  o.max_passes = 1;
+  o.rip_up = false;
+  o.max_restarts = 0;
+  o.work_budget = 100'000;
+  const auto r = rules_with(200'000, false, 0, 0);
+  const auto first = route::Router(b, r, o).run(), second = route::Router(b, r, o).run();
+  REQUIRE(first.connections == 3);
+  CHECK(first.routed == 1);
+  CHECK(first.pair_work <= o.work_budget / 10 + 64);
+  CHECK(first.stop != "work");
+  CHECK(first.expansions == second.expansions);
+  CHECK(first.pair_work == second.pair_work);
+  REQUIRE(first.tracks.size() == second.tracks.size());
+  for (std::size_t i = 0; i < first.tracks.size(); ++i) {
+    CHECK(first.tracks[i].net == signal.id);
+    CHECK(first.tracks[i].a == second.tracks[i].a);
+    CHECK(first.tracks[i].b == second.tracks[i].b);
+    CHECK(first.tracks[i].width == second.tracks[i].width);
+    CHECK(first.tracks[i].layer == second.tracks[i].layer);
+  }
+  b.tracks.insert(b.tracks.end(), first.tracks.begin(), first.tracks.end());
+  const auto report = drc::run_drc(b, r);
+  for (const auto& v : report.unconnected) CHECK(v.description.find("SIGNAL") == std::string::npos);
+  for (const auto& v : report.violations) {
+    CHECK(v.type != "clearance");
+    CHECK(v.type != "shorting_items");
+  }
+}
+
+TEST_CASE("pair cleanup preserves three-terminal tree connectivity", "[diffpair][route][tree]") {
+  auto b = fenced_pair();
+  b.tracks.clear();
+  for (auto& p : b.pads)
+    if (p.pos.x > 20'000'000) p.pos.x = 15'000'000;
+  b.footprints[1].pos.x = 15'000'000;
+  // Both nets have a terminal beside the trunk, in a separate package: ordinary routing can attach
+  // there rather than duplicate the pad-to-pad trunk. The pair cleanup must not move its anchor.
+  for (const model::NetId net : {1, 2}) {
+    auto p = b.pads[static_cast<std::size_t>(net - 1)];
+    p.pos = {10'000'000, net == 1 ? 17'000'000 : 17'600'000};
+    model::Footprint fp;
+    fp.reference = net == 1 ? "U3" : "U4";
+    fp.pos = p.pos;
+    fp.pads = {static_cast<int>(b.pads.size())};
+    p.footprint = static_cast<int>(b.footprints.size());
+    p.node = sexpr::kNoNode;
+    b.footprints.push_back(std::move(fp));
+    b.pads.push_back(p);
+  }
+  route::RouterOptions o;
+  o.diff_pairs = true;
+  o.tree_attach = true;
+  o.pair_max_expansions = 8;
+  o.allow_vias = false;
+  o.gpu_device = -1;
+  o.work_budget = 2'000'000;
+  o.time_limit_s = 600;
+  auto r = rules_with(200'000, false, 0, 0);
+  model::CustomRule limit;
+  limit.name = "force single routing before cleanup";
+  model::Constraint uncoupled;
+  uncoupled.type = "diff_pair_uncoupled";
+  uncoupled.max = 1;
+  limit.constraints.push_back(uncoupled);
+  r.custom.push_back(limit);
+  const auto result = route::Router(b, r, o).run();
+  REQUIRE(result.routed == result.connections);
+  REQUIRE(result.pair_anchor_skips > 0);
+  CHECK(result.pairs == 0);
+  bool restored_attempt = false;
+  for (const auto& attempt : result.pair_attempts) restored_attempt |= attempt.cleanup && !attempt.coupled;
+  CHECK(restored_attempt);
+  o.pair_max_expansions = 1;
+  const auto untouched = route::Router(b, r, o).run();
+  // Two different failed search depths must restore byte-identical physical copper.
+  // Keep pair selection enabled so only the failed-search depth differs.
+  REQUIRE(result.tracks.size() == untouched.tracks.size());
+  REQUIRE(result.vias.size() == untouched.vias.size());
+  for (std::size_t i = 0; i < result.tracks.size(); ++i) {
+    CHECK(result.tracks[i].a == untouched.tracks[i].a);
+    CHECK(result.tracks[i].b == untouched.tracks[i].b);
+    CHECK(result.tracks[i].width == untouched.tracks[i].width);
+    CHECK(result.tracks[i].layer == untouched.tracks[i].layer);
+    CHECK(result.tracks[i].net == untouched.tracks[i].net);
+  }
+  b.tracks.insert(b.tracks.end(), result.tracks.begin(), result.tracks.end());
+  b.vias.insert(b.vias.end(), result.vias.begin(), result.vias.end());
+  CHECK(drc::run_drc(b, r).unconnected.empty());
+}
+
+TEST_CASE("pair search couples adjacent fine-pitch rows with exact legal widths and gaps", "[diffpair][route]") {
+  std::string text = R"((kicad_pcb (version 20240108) (generator "pcbnew")
+    (general (thickness 1.6))
+    (layers (0 "F.Cu" signal) (31 "B.Cu" signal) (44 "Edge.Cuts" user))
+    (setup (pad_to_mask_clearance 0))
+    (net 0 "") (net 1 "D_P") (net 2 "D_N") (net 3 "GND") (net 4 "E_P") (net 5 "E_N")
+    (net 6 "F_P") (net 7 "F_N")
+    (footprint "T:P" (layer "F.Cu") (at 5 5) (property "Reference" "J1")
+      (pad "1" smd rect (at 0 -0.25) (size 1.5 0.3) (layers "F.Cu") (net 1 "D_P"))
+      (pad "2" smd rect (at 0 0.25) (size 1.5 0.3) (layers "F.Cu") (net 2 "D_N"))
+      (pad "3" smd rect (at 0 -0.75) (size 1.5 0.3) (layers "F.Cu") (net 3 "GND"))
+      (pad "4" smd rect (at 0 0.75) (size 1.5 0.3) (layers "F.Cu") (net 3 "GND"))
+      (pad "5" smd rect (at 0 1.25) (size 1.5 0.3) (layers "F.Cu") (net 4 "E_P"))
+      (pad "6" smd rect (at 0 1.75) (size 1.5 0.3) (layers "F.Cu") (net 5 "E_N"))
+      (pad "7" smd rect (at 0 2.25) (size 1.5 0.3) (layers "F.Cu") (net 3 "GND"))
+      (pad "8" smd rect (at 0 2.75) (size 1.5 0.3) (layers "F.Cu") (net 6 "F_P"))
+      (pad "9" smd rect (at 0 3.25) (size 1.5 0.3) (layers "F.Cu") (net 7 "F_N"))
+      (pad "10" smd rect (at 0 3.75) (size 1.5 0.3) (layers "F.Cu") (net 3 "GND")))
+    (footprint "T:P" (layer "B.Cu") (at 25 10) (property "Reference" "U1")
+      (pad "1" smd rect (at -0.25 0) (size 0.3 1.5) (layers "B.Cu") (net 1 "D_P"))
+      (pad "2" smd rect (at 0.25 0) (size 0.3 1.5) (layers "B.Cu") (net 2 "D_N"))
+      (pad "3" smd rect (at -0.75 0) (size 0.3 1.5) (layers "B.Cu") (net 3 "GND"))
+      (pad "4" smd rect (at 0.75 0) (size 0.3 1.5) (layers "B.Cu") (net 3 "GND"))
+      (pad "5" smd rect (at 1.25 0) (size 0.3 1.5) (layers "B.Cu") (net 4 "E_P"))
+      (pad "6" smd rect (at 1.75 0) (size 0.3 1.5) (layers "B.Cu") (net 5 "E_N"))
+      (pad "7" smd rect (at 2.25 0) (size 0.3 1.5) (layers "B.Cu") (net 3 "GND"))
+      (pad "8" smd rect (at 2.75 0) (size 0.3 1.5) (layers "B.Cu") (net 6 "F_P"))
+      (pad "9" smd rect (at 3.25 0) (size 0.3 1.5) (layers "B.Cu") (net 7 "F_N"))
+      (pad "10" smd rect (at 3.75 0) (size 0.3 1.5) (layers "B.Cu") (net 3 "GND")))
+    (gr_rect (start 0 0) (end 30 15) (stroke (width 0.1) (type default)) (fill none) (layer "Edge.Cuts"))
+  ))";
+  const auto original = io::read_board(sexpr::Document::parse(text));
+  auto r = rules_with(150'000, true, 150'000, 150'000);
+  r.minimums.track_width = 150'000;
+  model::CustomRule breakout;
+  breakout.name = "short pair breakouts";
+  model::Constraint uncoupled;
+  uncoupled.type = "diff_pair_uncoupled";
+  uncoupled.max = 4'000'000;
+  breakout.constraints.push_back(uncoupled);
+  r.custom.push_back(breakout);
+  route::RouterOptions o;
+  o.work_budget = 100'000'000;  // keep cached and exact-reference probes below their shared allowance
+  o.time_limit_s = 600;
+  o.gpu_device = -1;
+  o.diff_pairs = true;
+  for (const bool reversed : {false, true}) {
+    auto b = original;
+    if (reversed) {
+      for (auto& p : b.pads) {
+        p.pos = {30'000'000 - p.pos.x, 15'000'000 - p.pos.y};
+        p.angle += 180;
+      }
+    }
+    const auto result = route::Router(b, r, o).run();
+    auto reference_options = o;
+    reference_options.pair_leg_cache = false;
+    const auto reference = route::Router(b, r, reference_options).run();
+    REQUIRE(result.tracks.size() == reference.tracks.size());
+    REQUIRE(result.vias.size() == reference.vias.size());
+    CHECK(result.pair_work <= reference.pair_work);
+    for (std::size_t i = 0; i < result.tracks.size(); ++i) {
+      CHECK(result.tracks[i].a == reference.tracks[i].a);
+      CHECK(result.tracks[i].b == reference.tracks[i].b);
+      CHECK(result.tracks[i].width == reference.tracks[i].width);
+      CHECK(result.tracks[i].layer == reference.tracks[i].layer);
+      CHECK(result.tracks[i].net == reference.tracks[i].net);
+    }
+    for (std::size_t i = 0; i < result.vias.size(); ++i) {
+      CHECK(result.vias[i].pos == reference.vias[i].pos);
+      CHECK(result.vias[i].size == reference.vias[i].size);
+      CHECK(result.vias[i].drill == reference.vias[i].drill);
+      CHECK(result.vias[i].net == reference.vias[i].net);
+      CHECK(result.vias[i].layer_top == reference.vias[i].layer_top);
+      CHECK(result.vias[i].layer_bottom == reference.vias[i].layer_bottom);
+      CHECK(result.vias[i].type == reference.vias[i].type);
+    }
+    REQUIRE(result.pairs >= 3);
+    for (const auto& [a, partner] : {std::pair{1, 2}, std::pair{4, 5}, std::pair{6, 7}}) {
+      const auto st = route::measure_pair(result.tracks, result.vias, a, partner, 200'000);
+      CHECK(st.coupled_share() > 0.70);
+    }
+    for (const auto& t : result.tracks) CHECK(t.width >= r.minimums.track_width);
+    b.tracks.insert(b.tracks.end(), result.tracks.begin(), result.tracks.end());
+    b.vias.insert(b.vias.end(), result.vias.begin(), result.vias.end());
+    for (const auto& v : drc::run_drc(b, r).violations) {
+      INFO(v.description);
+      CHECK(v.type != "clearance");
+      CHECK(v.type != "shorting_items");
+      CHECK(v.type != "hole_clearance");
+    }
+  }
+}
+
+TEST_CASE("pair search drains a finish reached at its local state cap deterministically", "[diffpair][route]") {
+  auto b = fenced_pair();
+  b.tracks.clear();
+  for (auto& p : b.pads)
+    if (p.pos.x > 20'000'000) p.pos.x = 7'000'000;
+  route::RouterOptions o;
+  o.diff_pairs = true;
+  o.gpu_device = -1;
+  o.allow_vias = false;
+  o.optimize = false;
+  o.rip_up = false;
+  o.max_restarts = 0;
+  o.work_budget = 1'000'000;
+  const auto r = rules_with(200'000, false, 0, 0);
+  auto run = [&](long cap) {
+    o.pair_max_expansions = cap;
+    return route::Router(b, r, o).run();
+  };
+  long low = 1, high = 4096;
+  REQUIRE(run(high).pairs == 1);
+  while (low < high) {
+    const long middle = (low + high) / 2;
+    if (run(middle).pairs == 1) high = middle;
+    else low = middle + 1;
+  }
+  // The first cap that succeeds reaches its first legal goal on the final expansion.
+  REQUIRE(low > 1);
+  CHECK(run(low - 1).pairs == 0);
+  const auto first = run(low), second = run(low);
+  REQUIRE(first.pairs == 1);
+  CHECK(first.expansions == second.expansions);
+  CHECK(first.pair_work == second.pair_work);
+  REQUIRE(first.tracks.size() == second.tracks.size());
+  for (std::size_t i = 0; i < first.tracks.size(); ++i) {
+    CHECK(first.tracks[i].a == second.tracks[i].a);
+    CHECK(first.tracks[i].b == second.tracks[i].b);
+    CHECK(first.tracks[i].width == second.tracks[i].width);
+    CHECK(first.tracks[i].layer == second.tracks[i].layer);
+    CHECK(first.tracks[i].net == second.tracks[i].net);
+  }
+  b.tracks.insert(b.tracks.end(), first.tracks.begin(), first.tracks.end());
+  CHECK(drc::run_drc(b, r).unconnected.empty());
+}
+
+TEST_CASE("short pair tapers couple 0.5 to 1.5 mm links without relaxing clearance", "[diffpair][route]") {
+  for (const Coord length : {500'000, 1'000'000, 1'500'000})
+    for (const Coord spacing : {300'000, 500'000, 700'000})
+      for (bool mirrored : {false, true}) {
+        auto b = fenced_pair();
+        b.tracks.clear();
+        for (auto& p : b.pads) {
+          p.size_x = p.size_y = 100'000;
+          p.pos.x = p.pos.x > 20'000'000 ? 5'000'000 + length : 5'000'000;
+          p.pos.y = 10'000'000 + (p.net == 1 ? -spacing / 2 : spacing / 2);
+          if (mirrored) p.pos = {40'000'000 - p.pos.x, 20'000'000 - p.pos.y};
+        }
+        auto r = rules_with(100'000, true, 100'000, 100'000);
+        r.minimums.track_width = 100'000;
+        route::RouterOptions o;
+        o.diff_pairs = true;
+        o.allow_vias = false;
+        o.gpu_device = -1;
+        o.optimize = false;
+        o.rip_up = false;
+        o.work_budget = 5'000'000;  // geometry test: allow the complete taper matrix
+        const auto result = route::Router(b, r, o).run();
+        INFO(length);
+        INFO(spacing);
+        INFO(mirrored);
+        REQUIRE(result.pairs == 1);
+        const auto stats = route::measure_pair(result.tracks, result.vias, 1, 2, 150'000);
+        CHECK(stats.coupled_share() >= 0.30);
+        for (const auto& t : result.tracks) CHECK(t.width == 100'000);
+        b.tracks.insert(b.tracks.end(), result.tracks.begin(), result.tracks.end());
+        const auto report = drc::run_drc(b, r);
+        CHECK(report.unconnected.empty());
+        for (const auto& v : report.violations) {
+          INFO(v.description);
+          CHECK(v.type != "clearance");
+          CHECK(v.type != "shorting_items");
+        }
+      }
+}
+
+TEST_CASE("blocked short taper never commits a half pair", "[diffpair][route]") {
+  auto b = fenced_pair();
+  b.tracks.clear();
+  for (auto& p : b.pads)
+    if (p.pos.x > 20'000'000) p.pos.x = 6'000'000;
+  b.tracks.push_back({{5'500'000, 0}, {5'500'000, 20'000'000}, 200'000, 0, 3, true, sexpr::kNoNode});
+  route::RouterOptions o;
+  o.diff_pairs = true;
+  o.allow_vias = false;
+  o.gpu_device = -1;
+  o.work_budget = 20'000;
+  o.optimize = false;
+  const auto result = route::Router(b, rules_with(200'000, false, 0, 0), o).run();
+  CHECK(result.pairs == 0);
+  CHECK(result.tracks.empty());
+  CHECK(result.vias.empty());
+}
+
+TEST_CASE("explicit USB pairs remain selected with name detection enabled", "[diffpair][route]") {
+  auto b = fenced_pair();
+  b.tracks.clear();
+  b.nets[1].name = "USB_DP";
+  b.nets[2].name = "USB_DM";
+  const auto r = rules_with(200'000, false, 0, 0);
+  for (bool names : {false, true}) {
+    route::RouterOptions o;
+    o.gpu_device = -1;
+    o.diff_pairs = names;
+    o.pair_nets = {{1, 2}};
+    o.optimize = false;
+    o.work_budget = 2'000'000;
+    const auto result = route::Router(b, r, o).run();
+    REQUIRE(result.pairs == 1);
+    REQUIRE(result.pair_attempts.size() == 1);
+    CHECK(result.pair_successes == 1);
+    CHECK(result.pair_attempts[0].coupled);
+    CHECK(result.pair_attempts[0].reason == "coupled");
+    CHECK(result.pair_attempts[0].work == result.pair_work);
+  }
+  route::RouterOptions unselected;
+  unselected.gpu_device = -1;
+  unselected.diff_pairs = true;
+  unselected.optimize = false;
+  const auto ordinary = route::Router(b, r, unselected).run();
+  CHECK(ordinary.pair_attempts.empty());
+  CHECK(ordinary.pairs == 0);
 }

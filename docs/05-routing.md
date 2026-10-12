@@ -385,12 +385,410 @@ named otherwise, e.g. USB DP/DM from `--component-rules soft`; D50).
 |---|---|
 | Pair rule (`route/diff_pair.cpp`, `pair_rule`) | Width and gap, highest source first: a custom rule's `diff_pair_gap` (opt, else min); the net class's diff-pair width, gap and via gap when the project sets them; else the class width and the clearance KiCad requires between the halves (relaxed to the class diff-pair gap only for pairs KiCad recognises by name, as its DRC does). Never below the board minimums. `diff_pair_uncoupled` (max) limits the legs. Offsets carry a 1 µm rounding margin per side, so the gap comes out 2 µm wide of the rule. Coupled vias sit side by side at the via gap (and the mask web of untented vias) |
 | Coupled search (`route_pair`) | A* over (layer, lattice point, direction, which half is on the left). Moves: one straight lattice step; a 45° turn followed by K straight steps, K·pitch ≥ 2·offset·tan 22.5° + width so the inner track's miter never folds back; a coupled via pair (both halves jog out at 45° to the via spacing, change layer side by side, jog back; MV steps). Each move is checked exactly (`segment_state`, `via_state` against fixed and routed copper) on both offset tracks, so the coupled section keeps its gap by construction. Cost: length + K·pitch per turn + two vias; heuristic 2 × straight-line distance to the end pads plus a via pair while off the end pads' layers (weighted: legal, not optimal). Budget 600 states per lattice step of the pair's length (40 k–250 k). Work is the states closed plus every exact leg check of a start or goal candidate, legal or not, charged to the router's total every 64 steps, when the work budget and the time limit are also checked, so an attempt whose candidates all fail ends on either (§30, D77) |
-| Breakout and fan-in | Start candidates: every lattice point within R of the start pads' midpoint (0.3 × the pair's length, at least 1.5 × the pads' distance, 0.6–2.5 mm), 8 directions, sides by the shorter legs. Legs: straight, the two octilinear dog-legs, or the same to a point behind the end of the coupled section followed by a straight entry; at the pair width, then the neck-down width; checked exactly, against each other and against the other half's first straight run, when the A* pops the candidate. The pads must lie behind the start (ahead of the end), so legs never double back along the pair. Legs cost twice the coupled length, so coupling starts as close to the pads as the board allows. Goal candidates near the end pads wait in their own queue and are checked at least every 16 expansions; the first legal one is taken |
+| Breakout and fan-in | Start candidates: every lattice point within R of the start pads' midpoint (0.3 × the pair's length, at least 1.5 × the pads' distance, 0.6–2.5 mm), 8 directions, sides by the shorter legs. Legs: straight, octilinear dog-legs, straight-entry tails and rotated pad-axis lead-ins; at the pair width, then the neck-down width. Joint leg selection checks against the board, each other and the partner runway. Pads lie behind the start (ahead of the end), avoiding doubling back. Legs cost twice coupled length. Goal candidates compete with states at the actual cost of their legal legs, requeued after validation; the search drains reached goals at its unchanged local state cap (D119, D120), subject to the job work/time budget |
 | Commit | Both halves are built from corners only (a node's own offset point would fold an inner miter back), collinear runs merged, checked against each other geometrically, then exactly: each half against the board, the first committed, the second checked against it too, otherwise the first is taken back. Up to four finished candidates per search |
 | Enclosed pins | A pin of another net between the two pins of an end (the ground pin between P and N on HDMI parts) is tested with a short strict search before and after the pair; a pair that boxes in a pin that could escape before is taken back |
-| Negotiation and clean-up | A coupled half ripped by negotiation takes its partner with it, and the pair is tried coupled again (twice at most) before single routing. In the clean-up, pairs that ended up routed singly are lifted and routed coupled; on failure their old copper is restored exactly, so completion is unchanged. Via optimisation, smoothing and LNS leave coupled connections alone |
+| Negotiation and clean-up | A coupled half ripped by negotiation takes its partner with it, and the pair is tried coupled again (twice at most) before single routing. Cleanup never lifts a single-route trunk with routed tree children (D118). Other single halves are lifted transactionally; failure restores their copper and leaves endpoint/dependency metadata unchanged. A successful pair terminates at its planned pads and clears old tree attachment metadata only after the exact and enclosed-pin gates pass. Via optimisation, smoothing and LNS leave coupled connections alone |
 | Skew | `--pair-skew-mm X` (or a KiCad custom `skew` rule) meanders the shorter half in the clean-up with the length-tuning code until the halves differ by at most X/2 (meanders go to the free side) |
 | Measurement | `tracemaker pairs <board> [--pair A,B] [--json]`: per pair the track length, the coupled share (20 µm samples beside a parallel track of the other half on the same layer within gap + max(gap/4, 50 µm)), the gap kept (median, minimum), skew and vias. `tracemaker route` prints the same for the pairs it routed; `bench/pair_eval.py` routes boards off/on at a fixed budget and judges both with KiCad |
+
+**Pad-axis entry and joint legs (D119).** Fine-pitch endpoint candidates additionally leave along each of the
+pad's rotated copper axes, continuing straight past its edge before converging. The two legs are selected
+jointly: a legal first half rejected by the partner runway or gap check does not discard compatible
+alternatives. Candidate ordering is stable; both pair and neck-down widths still pass the same exact checks.
+Work is charged and polled inside the nested leg checks (not only once per 64 queue pops), so a blocked
+fine-pitch template cannot borrow a large chunk of a small job budget. No local state cap was raised.
+
+**Goal handling and cap ablations (D120).** `--pair-max-expansions N` explicitly overrides the local
+state cap for controlled experiments (`0`, the default, keeps the length-scaled 40k–250k cap).
+It does not override the job budget. Reaching the cap stops new states, not already queued goals;
+queued finishes are validated/requeued at actual total cost rather than chosen every 16 expansions.
+The focused regression finds the first sufficient cap, proves cap − 1 cannot couple, and repeats
+the cap-bound finish with identical copper and work.
+
+**Lane scheduling and exit guidance (D121).** Connection halves are matched before routing, then ordered
+by endpoint escape slack (distance past adjacent pad faces), component and connector pin number, with
+physical position and connection index as deterministic ties. Endpoint leg candidates pay a soft cost
+for crossing another selected lane's forward pad-axis exit on the same layer. Guidance never rejects
+legal copper, reserves no hard cells, and does not count as physical uncoupled length. The three-lane
+fine-pitch regression retains coupling and exact clearances in both board orientations.
+
+**Short links (D122).** Midpoint distances below 1.5 mm use finite pad-to-gap tapers with a real
+constant-gap middle run (15%, 25% or 35% of length per taper), both side assignments and common
+endpoint layers. Every proposed half and the partner gap pass the same exact, atomic acceptance
+gate as a searched pair, including the enclosed-pin guard and uncoupled-length limit. Exact checks
+are charged and polled. A blocked construction falls back to ordinary routing, not a partial pair.
+The focused matrix covers 0.5, 1.0 and 1.5 mm links at 0.3, 0.5 and 0.7 mm pitch, both orientations,
+with a full-height fixed-copper fence control. No pair-aware short layer-change template is claimed.
+
+**Pair selection and reporting (D123).** Named P/N-style detection and explicit/component-rule pairs
+are a union; enabling `--diff-pairs` does not hide an explicitly selected USB DP/DM pair. The route
+report's `pair_routing` object records wanted and attempted net pairs, chronological attempts, successful
+attempts, fallbacks, surviving coupled connection pairs, skipped tree anchors and failure classes.
+Each attempt names its four pad positions, phase, cleanup/refill-repair status, reason and charged work.
+Its scope is the selected portfolio variant plus any refill-repair pass, not discarded portfolio variants.
+A successful attempt is not necessarily a surviving pair: later negotiation, best-state restoration or a
+discarded refill repair can remove it. Fallback counts unsuccessful coupled attempts, including cleanup
+attempts whose ordinary copper was restored; it does not claim that every ordinary fallback finished.
+`pair_work` in the job report sums recorded attempts across this scope. Per-pair copper measurements
+also publish each half's via count and their imbalance. The human-parity arc metric is described in
+doc 10 §9 (D124); it is distinct from the engine's rule-gap sample diagnostic.
+
+**Local endpoint-check reuse (D126).** During one joint leg selection the board and the other half's
+first coupled runway are unchanged. Candidate geometry, stable length/guidance order and full/neck
+width choices are built once; their board/runway legality is checked once per candidate and width.
+Compatibility with each alternative partner leg is still polled, charged and checked. The local
+cache never survives the selection call, and committing a pair still rechecks both halves exactly
+against current copper. `--no-pair-leg-cache` runs the uncached reference; mirrored three-lane tests
+compare every output track and via against it. No local state cap or job budget is raised.
+
+**Bounded upfront pair probes (D127).** Coupling cannot spend the work needed to complete other nets.
+With a fixed-work job, all upfront pair passes share `max(1, work / 10)` charged work units
+across restarts: 10%, or 10 M / 20 M at the everyday 100 M / 200 M budgets.
+The allowance is consumed in stable pair-job order. A local probe cutoff does not mark the
+whole job stopped. Soft endpoint guidance also considers ordinary unrouted nets' forward pad exits,
+not only adjacent paired lanes; crossings remain legal and still pass the exact gate.
+Post-refill repair routes missing connections singly: its input already contains surviving pair
+copper as fixed obstacles, so full coupled probes there cannot negotiate that copper away.
+Both named and explicit/component selection are disabled in repair only; first-pass selection and
+surviving pair copper remain unchanged. The synthetic refill regression retains an easy coupled pair,
+forces repair with a second fenced pair, and checks zero repair pair probes, unchanged surviving
+copper and repeat equality across thread counts.
+This ceiling applies inside existing pair checks, not just between pairs; exhausting it leaves
+remaining connections for ordinary routing in its normal order, without declaring the whole job stopped.
+Negotiated pair retries and cleanup keep their existing behavior. No state cap, job budget, clearance
+or atomic exact-check gate is increased or relaxed. Wall-time-only jobs retain their previous behavior.
+The synthetic fenced-pair plus easy ordinary-net case checks fallback progress, local charging,
+whole-job stop handling, repeat-identical copper/work and exact connectivity/clearance; the existing
+mirrored three-lane cache/reference equality test remains separate from the new work-sharing policy.
+
+**Separate cap ablation.** On `antmicro-cm4-lvds-adapter` at 200 M work with the T protocol,
+`pairfix-step3-default` versus `pairfix-step3-cap500k` raises pairs over 50% rule-gap coupling from
+5/10 to 6/10 (the extra DSI lane is 92.1% coupled), with the same 7 KiCad unconnected and zero
+added errors. Pair work rises from 1,028,139 to 3,059,952; route CPU time from 64 s to 80 s.
+This is one board, not a tier-level justification for raising the default cap.
+
+
+**Step-6 tier measurement (D118–D125).** Built with the Metal preset in
+`build/agent-PairFixes`; every build used `/usr/bin/lockf /tmp/tm-build.lock`. The executable for
+the following tier/scorecard measurements is frozen as `build/agent-PairFixes/tracemaker-final`.
+Each implementation step passed its focused, full CTest and benchmark-Python checks before the next;
+step 6 has 283 CTest passes and three skips, with the two user-reported KiCad 10.0.3 parity failures
+excluded, not rerun, and 32 Python passes. The tree rollback control keeps pair-selection enabled
+and gives each added terminal a real footprint, rather than an unbound copied pad.
+
+Runs use one variant, soft zones, vias off pads, differential pairs, tree attachment and saved zone refills.
+Quick uses 100 M work; everyday modern-planes uses 200 M and excludes the five `#slow` boards.
+
+| Measurement | Baseline | Fixes |
+|---|---:|---:|
+| Quick clean / boards (`merged-quick-T` → `pairfix-final-quick-T`) | 28/30 | 28/30 |
+| Quick listed unconnected / boards with added errors | 2 / 0 | 2 / 0 |
+| Modern clean / boards (`dp-modern-200M-T` → `pairfix-modern-T`) | 1/11 | 1/11 |
+| Modern mean benchmark completion proxy | 88.2% | 89.7% |
+| Modern listed unconnected (censored-input caveat: doc 10 §9) | 356 | 335 |
+| Modern net pairs with nonzero / over-50% engine rule-gap coupling | 45/84 / 34/84 | 50/84 / 41/84 |
+| Length-weighted engine rule-gap coupled share | 60.43% | 66.49% |
+| Median engine pair skew | 1.108 mm | 0.688 mm |
+
+The quick paired gate passes: no board loses clean status or connectivity, zero added errors, and 28/30
+outputs are byte-identical. It is not a speed win: aggregate route CPU is 175 → 200 s; mechkeys alone is
+3.3 → 38.0 s. The modern paired gate **fails**: OCuLink has 11 → 14 unconnected and Yardforce 72 → 73.
+OCuLink remains the one board with added clearance errors (five → three); this is not clean acceptance.
+The older modern baseline predates the merge, so tier gains are not a per-fix causal ablation.
+Repeating CM4 at the same 200 M work produces a byte-identical routed board.
+
+**Fixed-work regression ablation.** `pairfix-ablate-step0` through `step5` route the same two prepared
+boards at 200 M work with the same T/refill settings; step 0 is the merged baseline, not the older
+pre-merge modern reference. Both boards stop for work in every arm. The first OCuLink loss appears
+in step 2 (charged joint endpoint selection); Yardforce loses two engine connections in step 2,
+then one additional KiCad connection in step 3. Pair ordering, short tapers and USB selection do
+not cause another loss on these boards.
+
+| Applied step | OCuLink engine / KiCad unconnected / work | Yardforce engine / KiCad unconnected / work |
+|---|---|---|
+| Merged baseline | 83/94 / 10 / 201,776,757 | 375/438 / 71 / 200,571,772 |
+| 1: tree safety | 83/94 / 10 / 201,776,757 | 375/438 / 71 / 200,571,772 |
+| 2: pad exits and joint legs | 77/94 / 14 / 203,389,606 | 373/438 / 72 / 201,908,749 |
+| 3: actual finish costs / drain | 77/94 / 14 / 200,560,462 | 373/438 / 73 / 204,806,963 |
+| 4: pair ordering and guides | 77/94 / 14 / 200,560,004 | 373/438 / 73 / 204,779,708 |
+| 5–6: short links / selection | 77/94 / 14 / 200,560,004 | 373/438 / 73 / 204,779,708 |
+
+This is a deterministic cutoff change, not run-to-run variation. OCuLink first-pass pair checks
+consume 17,773,104 work versus the original 1,611,361, and Yardforce 15,990,704 versus 680,786.
+OCuLink's new unresolved engine connections include GND J2.A5–A8, CPRSNT J2.B13–R5.2 and
+R5.2–R13.2, WAKE_C_alt J2.B10–R9.2, TX2± and TX3±. Yardforce's USS_5_ECHO_5V
+U12.11–J7.3 and USS_4_ECHO_5V U12.9–J7.5 are not attempted before the cutoff.
+This evidence does not establish that the new coupled geometry fences those missing routes.
+The avoidable repeated B-leg board/runway checks are removed by local reuse (D126);
+the exact acceptance gates and work budget are not relaxed.
+
+The D126 cache check (`pairfix-ablate-legcache`, same 200 M work) restores Yardforce to
+375/438 and 71 KiCad unconnected, matching the merged baseline and improving on the pre-merge
+72. Its first-pass pair work falls 15,990,704→3,108,077. OCuLink pair work falls
+17,773,104→8,688,935 but remains 77/94 and 14 KiCad unconnected, with three added clearance
+errors. That regression is still unresolved; local reuse is not an accepted full-tier connectivity fix.
+The cache change passes 1,867 focused assertions in 13 cases, 283 full CTest cases plus three
+skips, and 32 Python tests. The full-tier and scorecard figures in this section are the frozen
+step-6 measurements, not fresh measurements of D126.
+
+The uncached reference (`pairfix-ablate-legreference`) retains Yardforce's 373/438 and 73
+unconnected at the same budget, isolating the recovery to saved exact-check work. OCuLink's
+output board is byte-identical across the cached reference comparison and the frozen step-6
+run. These checks do not justify a speed claim: the two-board route CPU totals are 250 s cached
+and 228 s uncached, with different surviving Yardforce copper.
+
+The historical step-6 human scorecard (recorded below; D127 refreshes `build/quality/pairfix.{json,md}`) freezes 44
+commonly connected pair obligations. “Parity” below means matching or beating the human, not average
+coupled fraction; all-obligation percentages use 57 assessable obligations and charge missing routes as losses.
+
+| Human-parity metric | Baseline macro / pooled | Fixes macro / pooled | Baseline → fixes all-obligation pooled |
+|---|---:|---:|---:|
+| Coupled fraction at the human modal gap | 29.69% / 31.82% | 55.21% / 52.27% | 26.32% → 40.35% |
+| Copper skew | 17.19% / 22.73% | 21.88% / 27.27% | 19.30% → 21.05% |
+| Via-count imbalance | 85.42% / 86.36% | 96.88% / 97.73% | 75.44% → 80.70% |
+
+Actual values on those same 44 commonly connected obligations:
+
+| Value | Human | Baseline | Step-6 fixes |
+|---|---:|---:|---:|
+| Length-weighted coupled fraction at the human gap | 82.79% | 46.29% | 59.81% |
+| Median copper skew | 0.102 mm | 1.502 mm | 1.084 mm |
+| Mean via-count imbalance | 0 | 0.159 | 0.023 |
+| Obligations with zero via imbalance | 44/44 | 38/44 | 43/44 |
+
+Missing pair obligations increase seven → nine; eleven are not assessable. Both router arms have only one
+eligible board. Small-pad process passes fall five → four, electrical passes remain one, and no-new-DRC
+passes remain seven of eleven. Category gains cannot compensate for those gates.
+
+The nine missing obligations are not nine new losses: six become missing and four recover.
+New losses are CM4 DSI.CLK and DSI.D2; GMSL CSI0.D3 and CSI1.D1; OCuLink TX2 and TX3.
+Recovered obligations are Framos CSI_D3; GMSL CSI0.D0 and CSI1.D2; OCuLink RX2.
+OCuLink TX1 and Cynthion CONTROL PHY PHY_D / TARGET_FS_MONITOR_D remain missing in both arms.
+Thus board missing counts change CM4 0→2, Framos 1→0, GMSL 2→2 (different lanes),
+OCuLink 2→3 and Cynthion 2→2. CM4's newly unresolved DSI.D2_N and DSI.CLK_P also stop at
+the search work budget; their partners alone do not satisfy a pair obligation.
+
+
+| Survey attempt class | Pre-merge debug survey (96 attempts) | Fixes setup phase (99 attempts) |
+|---|---:|---:|
+| Coupled | 48 | 68 |
+| Local search cap | 29 | 22 |
+| Unconditional “too short” rejection | 18 | 0 |
+| Exact short taper blocked | — | 7 |
+| No coupled path | 1 | 2 |
+
+The old debug survey has no phase marker, so these are survey scopes, not paired failure probabilities.
+Across the final selected variants and refill repairs there are 173 attempts: 73 successful, 100 fallback,
+54 surviving coupled connection pairs (distinct from the 50 net-pair diagnostics), and five skipped tree
+anchors. Retry/cleanup adds 12 negotiation and two cleanup attempts; refill repair adds 60, mostly already
+occupied endpoint templates (52 no-path, six blocked short tapers, two job-budget stops).
+
+**Pair-aware BGA breakout is not entered (D125).** The prerequisite “steps 1–6 measure well” is not met:
+two boards lose connectivity, missing obligations increase and process gates remain unsatisfied. No paired
+via-site/channel bookkeeping or partial layer-aware breakout template is introduced in this change.
+
+**OCuLink budget diagnosis (D127).** Frozen baseline `pairfix-ablate-step0/tracemaker`
+and cached `pairfix-ablate-legcache/tracemaker`, identical T/refill flags and one thread:
+
+| Work budget | Baseline routed / KiCad unconnected | Cached routed / KiCad unconnected |
+|---|---:|---:|
+| 200 M | 83/94 / 10 | 77/94 / 14 |
+| 400 M | 85/94 / 8 | 85/94 / 9 |
+| 800 M | 85/94 / 7 | 85/94 / 9 |
+
+Every routing arm stops on work. Additional budget restores the ground, presence and wake connections;
+it does not demonstrate that the remaining difference is a permanent geometric fence.
+The cached 200 M job spends 112.51 M work on pair attempts across initial routing and refill repair;
+refill repair alone spends 103.82 M on upfront pair passes. The 5% ceiling cuts that repair phase
+to 10 M but leaves 14 unconnected; the everyday 1% ceiling cuts it to 2 M and yields 11.
+The ordinary routing order is therefore affected by both pair probe work and where its cutoff falls,
+not just the total nominal job budget.
+
+The nearest-other-pair geometry on the cached 800 M output is recorded with segment endpoints in
+`build/quality/pairreg-diagnosis.json`. J2.A5/A8 lie beside RX0/RX1 copper (0.390 mm from
+pad centre to the nearest track edge), while J1.23/J1.25 lie beside RX2/RX1 (0.890 mm).
+J2.B13 and J2.B10 are over 2.08 mm from the nearest pair-track edge. These distances identify
+nearby copper but do **not** prove a blocked pad exit or a closed routing channel.
+No pair is labelled a proven fence and no speculative hard reservation or rip exception is added.
+
+**Rejected 1% D127 trial.** `pairreg-D127-quick-T` runs all 30 quick boards at 100 M;
+`pairreg-D127-modern-planes-T` runs the 11 everyday modern boards at 200 M, without `--full`.
+Both use `--refill --variants 1 --soft-zones --keep-vias-off-pads --diff-pairs --tree-attach`.
+Full CTest in `build/agent-PairFixes`: 284 passed, three skipped, only the two pre-existing
+KiCad 10.0.3 parity failures. The five-pair USB integration gate and mirrored cached/reference
+geometry equality pass.
+
+| Gate | Baseline | Final | Worse boards | Added errors |
+|---|---:|---:|---:|---:|
+| Quick clean boards | 28/30 | 28/30 | 0 | 0 |
+| Quick KiCad unconnected | 2 | 2 | 0 | 0 |
+| Everyday modern KiCad unconnected | 356 | 327 | 0 | 5 clearance errors on OCuLink, also 5 in the baseline |
+
+Modern per-board comparison against `dp-modern-200M-T`:
+
+| Board | Baseline unconnected | Final unconnected |
+|---|---:|---:|
+| antmicro-cm4-lvds-adapter | 12 | 9 |
+| antmicro-framos-csi-adapter | 3 | 3 |
+| antmicro-gmsl-deserializer | 17 | 14 |
+| antmicro-m2-oculink-adapter | 11 | 11 |
+| antmicro-usb-c-power-adapter | 5 | 4 |
+| gsg-cynthion | 189 | 182 |
+| mnt-pocket-reform-wifi | 13 | 8 |
+| openmower-gps-carrier | 0 | 0 |
+| openmower-universal-logic | 29 | 24 |
+| openmower-xesc-carrier | 5 | 2 |
+| openmower-yardforce-mainboard | 72 | 70 |
+
+The named everyday-modern connectivity gate passes in this trial, but this is **not** a complete OCuLink recovery
+against the merged frozen step-0 binary: that binary has 10 unconnected, versus final 11.
+The engine's planned-route count also remains worse (83/94 baseline versus 79/94 final).
+OCuLink's five added clearance errors remain; no new-error-free modern claim is made.
+No permanent pad-exit-fence cause is established by the sweep or nearest-track geometry.
+
+The rejected 1% trial scorecard used `human-modern-planes`, the reviewed modern intent directory
+and four measurement jobs. All arms share 41 connected/assessable
+pair obligations; 57 all-obligation targets are assessable and eleven are not.
+
+| Common-obligation value | Human | Baseline | D127 final |
+|---|---:|---:|---:|
+| Length-weighted coupling at the human gap | 82.02% | 49.87% | 43.98% |
+| Median planar copper skew | 0.0795 mm | 1.5154 mm | 1.5356 mm |
+| Mean absolute via-count imbalance | 0 | 0.1707 | 0.1220 |
+| Zero via imbalance | 41/41 | 35/41 | 37/41 |
+
+| Common-obligation human parity | Baseline macro / pooled | D127 macro / pooled |
+|---|---:|---:|
+| Coupled fraction | 38.44% / 36.59% | 39.58% / 41.46% |
+| Copper skew | 18.23% / 24.39% | 14.06% / 19.51% |
+| Via-count imbalance | 85.00% / 85.37% | 89.69% / 90.24% |
+
+More commonly connected obligations meet the human coupling threshold, but length-weighted coupling
+and median skew worsen. Missing pair obligations rise 7→14: CM4 0→2, GMSL 2→4, OCuLink 2→5,
+Cynthion 2→3; Framos improves 1→0. Small-pad process passes fall 5→4; no-new-DRC passes remain
+7/11, eligible boards remain 1/11, and one board is censored. These losses reject the 1% trial
+despite its aggregate KiCad connectivity gate passing.
+
+**Zero local-clearance inheritance (D128).** A zero pad or footprint clearance is KiCad's
+inherit sentinel, not a zero-clearance override. The rule engine now walks pad → footprint →
+net class using only positive local overrides; an explicit zero custom rule remains an explicit
+rule. The OCuLink input's J1 footprint has `(clearance 0)`: treating it as an override incorrectly
+reduced the 0.125 mm net-class clearance to the 0.1 mm board minimum. KiCad rejected three
+diagonal track/pad gaps (0.1161 and 0.1228 mm) that the engine previously admitted. A small
+synthetic diagonal checks the inherited rule in both item orders and the exact obstacle gate,
+including zero pad/footprint combinations and positive override precedence.
+
+**D127 final selection and stop-aware acceptance (D129).** The selected configuration is
+`pairreg-single10-all-exits`: a general 10% upfront share, single-route refill repair,
+ordinary-net soft exit guidance and D128 inheritance. No board name, per-board threshold,
+default state cap or job budget is changed. The fair-share and centre-distance-repair experiments
+are not retained. Exit status is not a finish indicator: the engine `route.json` stop reason is.
+Only a new completed run getting worse, or a previously completed run becoming work-limited,
+counts as a connectivity regression. Budget-limited differences remain reported.
+
+The same T/refill flags apply to all variants. Each has all 30 quick, 11 everyday modern
+and eight everyday mid boards. `build/quality/pairreg-variants.json` records every per-board
+comparison, engine stop reason, raw increase and budget-limited classification.
+All variants have zero stop-aware regressions and preserve finished counts 30→30, 3→3 and 0→0.
+This does not turn unfinished routing into a clean result.
+
+Variant labels: A1 = 1% share/coupled repair; A5 = 5%/coupled repair; S5 = 5%/single repair;
+Z5 = S5 plus zero-local inheritance; E5 = Z5 plus all-net soft exits; E10 = 10% plus those
+same changes (**selected**); M10 = E10 with centre-distance repair planning; F10 = fair 10%
+shares/single repair, without the all-net extension. Every quick per-board count is unchanged
+in every variant: 28 clean boards, two total unconnected items, zero added errors.
+
+| Variant | Upfront share | Repair probes | OCuLink unconnected | Modern added errors | Common pair cohort | Weighted human-gap coupling | Missing pairs |
+|---|---:|---|---:|---:|---:|---:|---:|
+| A1 | 1% | coupled | 11 | 5 | 41 | 43.98% | 14 |
+| A5 | 5% | coupled | 14 | 3 | 44 | 56.43% | 9 |
+| S5 | 5% | single | 12 | 3 | 44 | 56.43% | 9 |
+| Z5 | 5% | single | 12 | 0 | 44 | 56.43% | 9 |
+| E5 | 5% | single | 12 | 0 | 44 | 56.41% | 9 |
+| E10 selected | 10% | single | 12 | 0 | 44 | 56.70% | 9 |
+| M10 | 10% | single, centre plan | 14 | 0 | 44 | 56.70% | 9 |
+| F10 | 10%, fair shares | single | 12 | 0 | 43 | 54.27% | 12 |
+
+The common cohort is explicitly shown because A1/F10 exclude different missing obligations;
+their weighted values are not same-cohort estimates of a causal effect. Missing counts always
+include all 57 assessable obligations. All quick and mid variants add zero errors; every raw
+modern connectivity increase above is on a work-limited engine run, not a D129 regression.
+The fair-share experiment loses quality and is not retained.
+
+
+| Everyday modern board | Baseline | A1 | A5 | S5 | Z5 | E5 | E10 final | M10 | F10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| antmicro-cm4-lvds-adapter | 12 | 9 | 9 | 8 | 8 | 8 | 8 | 9 | 8 |
+| antmicro-framos-csi-adapter | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 | 3 |
+| antmicro-gmsl-deserializer | 17 | 14 | 20 | 19 | 19 | 19 | 11 | 11 | 12 |
+| antmicro-m2-oculink-adapter | 11 | 11 | 14 | 12 | 12 | 12 | 12 | 14 | 12 |
+| antmicro-usb-c-power-adapter | 5 | 4 | 4 | 3 | 3 | 3 | 3 | 4 | 3 |
+| gsg-cynthion | 189 | 182 | 182 | 181 | 181 | 181 | 181 | 182 | 181 |
+| mnt-pocket-reform-wifi | 13 | 8 | 8 | 8 | 8 | 8 | 8 | 8 | 8 |
+| openmower-gps-carrier | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+| openmower-universal-logic | 29 | 24 | 26 | 26 | 26 | 26 | 26 | 26 | 26 |
+| openmower-xesc-carrier | 5 | 2 | 2 | 2 | 2 | 2 | 2 | 2 | 2 |
+| openmower-yardforce-mainboard | 72 | 70 | 71 | 71 | 71 | 71 | 71 | 71 | 71 |
+
+| Everyday mid board | Baseline | A1 | A5 | S5 | Z5 | E5 | E10 final | M10 | F10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| CoreOne-xCORE200-Original_CoreOne | 128 | 109 | 109 | 109 | 109 | 109 | 109 | 109 | 109 |
+| KiCad-Library_Teensy_test_layout | 52 | 36 | 36 | 36 | 36 | 36 | 36 | 36 | 36 |
+| LeeChee_1800 | 58 | 26 | 21 | 21 | 21 | 21 | 21 | 21 | 21 |
+| MonApollo_analog-board | 99 | 59 | 59 | 59 | 59 | 59 | 59 | 59 | 59 |
+| front-end-modules_LimeSDR_Sony | 69 | 60 | 60 | 60 | 60 | 60 | 60 | 60 | 60 |
+| kitspace_EEZ%20DIB%20MCU%20r1B2 | 78 | 73 | 74 | 72 | 72 | 72 | 72 | 74 | 72 |
+| kitspace_d20_r0.1 | 64 | 61 | 61 | 60 | 60 | 60 | 60 | 61 | 60 |
+| sbc_sbc | 87 | 87 | 87 | 86 | 86 | 86 | 86 | 87 | 86 |
+
+The full `nb-mid-200M-T` reference includes three slow boards outside the everyday roster.
+`pairreg-mid-baseline-everyday-T` is an unchanged-row eight-board view with source-board links,
+not a new baseline route or a reduced new-run roster. `bench/compare_runs.py` passes all three
+selected gates; reports are `build/quality/pairreg-final-{quick,modern,mid}-gate.md`.
+
+| Final tier | Finished baseline → final | Work-limited final | Unconnected baseline → final | Stop-aware worse | Added errors |
+|---|---:|---:|---:|---:|---:|
+| Quick 100 M | 30→30 | 0 | 2→2 | 0 | 0 |
+| Everyday modern 200 M | 3→3 | 8 | 356→325 | 0 | 0 |
+| Everyday mid 200 M | 0→0 | 8 | 635→503 | 0 | 0 |
+
+OCuLink is still 11→12 unconnected and 83→77/94 engine routes, with stop `work` in both
+arms: it is budget-limited, not a completed-run regression or a claimed recovery.
+The pad-axis evidence in `build/quality/pairreg-pad-exit-evidence.json` identifies RX0−/RX1+
+in J2.A5's short-axis probes and RX1− beside J2.A8; long-axis probes remain open.
+No paired tracks block the four sampled axes at CPRSNT B13, WAKE B10 or the TX2 pads.
+These are capsule-distance probes, not a proof of whole-board routability or a permanent fence.
+
+The requested final human scorecard is `build/quality/pairfix.{json,md}`. All values below
+use the same 44 commonly connected obligations; missing counts use all 57 assessable obligations.
+
+| Value | Human | Pre-fix baseline | Historical step 6 | Selected final |
+|---|---:|---:|---:|---:|
+| Length-weighted coupling at human gap | 82.79% | 46.29% | 59.81% | 56.70% |
+| Median planar copper skew | 0.1023 mm | 1.5018 mm | 1.084 mm | 1.1962 mm |
+| Mean absolute via-count imbalance | 0 | 0.1591 | 0.0227 | 0.0909 |
+| Zero via imbalance | 44/44 | 38/44 | 43/44 | 41/44 |
+| Missing pair obligations | 0 | 7 | 9 | 9 |
+
+The user selects final's improvement over the pre-fix baseline under the stop-aware gate,
+not step-6 parity. Coupling, skew and via imbalance remain worse than step 6; missing
+obligations remain two above baseline. Final common human parity is coupling 53.12% macro /
+50.00% pooled, skew 21.88% / 27.27%, via imbalance 92.71% / 93.18%.
+Small-pad process passes remain 4/11 versus baseline 5/11; eligible boards remain 1/11,
+and one is censored. The scorecard's no-new-DRC count is 8/11 versus 7/11; these process
+gates differ from the benchmark's added-error gate and are not waived or called clean.
+Quick route CPU is 175→279 s, including mechkeys 3.3→67.8 s; 28/30 boards are byte-identical
+and that group spans −11% to +57% CPU changes. This is not a speed-win claim.
+
+Final full CTest in `build/agent-PairFixes`: 285 pass, three skip, only the two pre-existing
+KiCad 10.0.3 parity failures (`kicad_drc_parity`, `kicad_drc_broken_parity`), out of 290 cases.
+The work-sharing, exact local-inheritance, paired USB, synthetic repair and cached/reference
+geometry checks pass. All 37 benchmark Python tests pass. No commit or push is made.
+
+
+
+
 
 **Results.** 18 PCBench boards with differential pairs by name (USB, Ethernet, HDMI/TMDS, DisplayPort lanes, PCIe,
 MDI), one variant, `--work 30000000`, KiCad 10 DRC (`bench/pair_eval.py`):

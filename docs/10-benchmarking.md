@@ -247,7 +247,10 @@ are refilled (StickHub: 17, 15 and 13); read a change in that type alone as nois
 
 ## 5. Gates (used by the roadmap)
 
-1. No board in `quick` gets worse in clean pass or completion (`compare_runs.py`).
+1. No board in `quick` gets worse in clean pass or completion (`compare_runs.py`). Only boards the router
+   finished count: the router's stop reason (`<board>.kicad_pcb.route.json`, `stop`) is `complete` in the after
+   run. A board stopped by its work budget is listed, not gated, because its unconnected count shows where the
+   budget ran out rather than what the change did; a board that finished before and no longer finishes fails (D129).
 2. Zero added KiCad DRC errors on every board that was clean before (`compare_runs.py`).
 3. Time within budget on every board (with `--work`, the budget is work units; wall time only stops the job).
 4. Routed boards byte-identical unless the change is meant to change results (`compare_runs.py
@@ -508,6 +511,16 @@ proof: its conditional quality is excluded conservatively. The full per-board ga
 | Pad entry | Off-axis (>15°), corner (15% of small dimension), wider-than-face flags per contacted pad | Shape-aware rectangle/roundrect heuristic; not an IPC violation; custom/unsupported geometry and omitted arcs publish |
 | Routing craft | Acute exposed centreline junctions per net | Outward-ray angle below 90°, excluding pad/via-swallowed joints; ordinary 45° bends are not acute defects |
 | Efficiency | Unique vias and exact segment/arc mm per fixed pad-ID spanning-rank proxy | Same connected nets; no router-dependent denominator; extra return/thermal vias or intentional tuning are not automatically waste |
+
+Differential coupling measures straight parallel spans and concentric circular arcs directly (D124).
+Three KiCad arc points recover centre, radius and signed sweep; angular interval intersections become
+exact arc-length intervals, including reversed sweeps, wraparound and partial overlap. Arc centres may
+differ by at most 10 nm to absorb integer-point fitting noise; the gap tolerance remains the declared
+human-gap tolerance above. Independently tessellated concentric arcs no longer fail a straight-segment
+direction test. Crossing straight lines and shifted-centre crossing arcs do not couple. Mixed line/arc
+and nonconcentric-arc spans are not inferred as coupled: this is a geometric parallel-run proxy, not
+electromagnetic field analysis. The return-plane metric retains its existing ≤1 µm arc chord tessellation;
+its geometry and tolerances do not change.
 
 Every metric has its own human-parity table; there is **no weighted total**. Better-than-human values receive
 wins rather than being clipped at parity. Other practical equivalence bands are published in JSON:

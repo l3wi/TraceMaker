@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -584,9 +585,13 @@ RouteJobResult run_route_job(RouteJob job) {
     if (before > 0 && job.refill_repair && time_left > 0) {
       route::RouterOptions o2 = opt;
       o2.soft_zones = false;
+      // Existing routed copper is fixed in this connectivity repair. Re-probing coupled
+      // routes cannot negotiate it away and only starves the missing single connections.
+      o2.diff_pairs = false;
+      o2.pair_nets.clear();
       o2.sink = nullptr;
       o2.time_limit_s = time_left;
-      const auto r2 = route::Router(rf.board, rules, o2).run();
+      auto r2 = route::Router(rf.board, rules, o2).run();
       for (int p = 0; p < route::kWorkPhases; ++p)
         all_work.phase[static_cast<std::size_t>(p)] += r2.work.phase[static_cast<std::size_t>(p)];
       log(fmt("refill repair: routed %d/%d connections, %zu tracks, %zu vias, %ld expansions", r2.routed, r2.connections, r2.tracks.size(),
@@ -597,9 +602,17 @@ RouteJobResult run_route_job(RouteJob job) {
       const int after = unconnected(drc::refill_zones(routed, rules).board);
       const bool kept = after < before;
       log(fmt("refill repair: %d items unconnected after refilling again%s", after, kept ? "" : " (no better: repair discarded)"));
+      res.pair_successes += r2.pair_successes;
+      res.pair_anchor_skips += r2.pair_anchor_skips;
+      res.pair_attempts.reserve(res.pair_attempts.size() + r2.pair_attempts.size());
+      for (auto& attempt : r2.pair_attempts) {
+        attempt.refill_repair = true;
+        res.pair_attempts.push_back(std::move(attempt));
+      }
       if (kept) {
         res.tracks.insert(res.tracks.end(), r2.tracks.begin(), r2.tracks.end());
         res.vias.insert(res.vias.end(), r2.vias.begin(), r2.vias.end());
+        res.pairs += r2.pairs;
         unconnected_after_refill = after;
       }
       refill_summary["repair"] = {{"connections", r2.connections}, {"routed", r2.routed}, {"tracks", r2.tracks.size()},
@@ -841,8 +854,28 @@ RouteJobResult run_route_job(RouteJob job) {
       if (std::find(want.begin(), want.end(), p) == want.end() && std::find(want.begin(), want.end(), std::make_pair(p.second, p.first)) == want.end())
         want.push_back(p);
     nlohmann::json pj = nlohmann::json::array();
-    log(fmt("differential pairs: %zu wanted, %d coupled pair routes (re-coupling included), %ld work units", want.size(), res.pairs, res.pair_work));
-    out.summary["pair_work"] = res.pair_work;
+    int fallback_attempts = 0;
+    long attempt_work = 0;
+    std::map<std::string, int> failure_classes;
+    std::set<std::pair<model::NetId, model::NetId>> attempted;
+    nlohmann::json attempts = nlohmann::json::array();
+    for (const auto& attempt : res.pair_attempts) {
+      attempt_work += attempt.work;
+      attempted.emplace(std::min(attempt.a, attempt.b), std::max(attempt.a, attempt.b));
+      if (!attempt.coupled) { ++fallback_attempts; ++failure_classes[attempt.reason]; }
+      nlohmann::json pads = nlohmann::json::array();
+      for (const auto p : attempt.pads) pads.push_back({{"x_mm", nm_to_mm(p.x)}, {"y_mm", nm_to_mm(p.y)}});
+      attempts.push_back({{"net_a", lb.board.nets[static_cast<std::size_t>(attempt.a)].name},
+                         {"net_b", lb.board.nets[static_cast<std::size_t>(attempt.b)].name}, {"pads", pads},
+                         {"phase", route::work_phase_name(attempt.phase)}, {"cleanup", attempt.cleanup}, {"refill_repair", attempt.refill_repair},
+                         {"coupled", attempt.coupled}, {"reason", attempt.reason}, {"detail", attempt.detail}, {"work", attempt.work}});
+    }
+    out.summary["pair_routing"] = {{"scope", "selected_variant_and_refill_repair"}, {"wanted_net_pairs", want.size()}, {"attempted_net_pairs", attempted.size()},
+        {"attempts", res.pair_attempts.size()}, {"successful_attempts", res.pair_successes}, {"fallback_attempts", fallback_attempts},
+        {"surviving_routes", res.pairs}, {"anchored_cleanup_skips", res.pair_anchor_skips}, {"failure_classes", failure_classes}, {"details", attempts}};
+    log(fmt("differential pairs: %zu wanted, %zu attempts, %d successful, %d fallback, %d surviving coupled routes, %ld work units",
+            want.size(), res.pair_attempts.size(), res.pair_successes, fallback_attempts, res.pairs, attempt_work));
+    out.summary["pair_work"] = attempt_work;
     for (const auto& [na, nb] : want) {
       const auto pr = route::pair_rule(lb.board, rules, re, na, nb);
       const auto st = route::measure_pair(res.tracks, res.vias, na, nb, route::coupled_threshold(pr));
@@ -852,7 +885,8 @@ RouteJobResult run_route_job(RouteJob job) {
               (st.length_a + st.length_b) / 2e6, 100 * st.coupled_share(), st.gap_median / 1e6, nm_to_mm(pr.gap), pr.source.c_str(), st.skew() / 1e6,
               st.vias_a, st.vias_b));
       pj.push_back({{"net_a", a}, {"net_b", b}, {"coupled_share", st.coupled_share()}, {"gap_mm", st.gap_median / 1e6}, {"target_gap_mm", nm_to_mm(pr.gap)},
-                    {"skew_mm", st.skew() / 1e6}, {"length_mm", (st.length_a + st.length_b) / 2e6}});
+                    {"skew_mm", st.skew() / 1e6}, {"length_mm", (st.length_a + st.length_b) / 2e6},
+                    {"vias_a", st.vias_a}, {"vias_b", st.vias_b}, {"via_imbalance", std::abs(st.vias_a - st.vias_b)}});
     }
     out.summary["pairs"] = pj;
   }

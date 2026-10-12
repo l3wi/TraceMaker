@@ -72,14 +72,16 @@ struct RouterOptions {
   bool micro_vias = false;
   bool blind_vias = false;      // use blind/buried vias where a through via is blocked, if the board allows them
   bool diff_pairs = false;      // route P/N pairs together as coupled tracks first (falls back to single routing)
-  // Component rules (doc 15 P3): these net pairs only are routed coupled first when diff_pairs is off (e.g. USB 2.0
-  // D+/D- bound by tm::crules, whose names need not end in P/N or +/-). Empty = none.
+  // Component rules (doc 15 P3): explicit pairs (e.g. USB DP/DM), always unioned with name
+  // detection when diff_pairs is enabled. Empty = no explicit pairs.
   std::vector<std::pair<model::NetId, model::NetId>> pair_nets;
   // Intra-pair skew limit for pairs routed coupled (0 = only KiCad custom `skew` rules): the shorter half gets meanders
   // in the clean-up until the halves differ by at most half of it (length tuning code, doc 05 §15).
   // Coupled pairs may twist: change layer one half after the other and cross in between, so that a pair whose
   // pin order is mirrored between its ends can still be routed coupled (doc 05 §24).
   bool pair_twists = true;
+  long pair_max_expansions = 0;  // 0: length-scaled 40k–250k local cap; explicit cap for controlled ablations
+  bool pair_leg_cache = true;   // reuse invariant endpoint checks locally; false is the exact reference path
   Coord pair_skew = 0;
   // Per-pair limits for RouterOptions::pair_nets (same index; 0 or missing = pair_skew): component rules give each
   // interface its own limit (USB 2.0 1.27 mm, doc 15 USB2-02).
@@ -214,7 +216,19 @@ struct RouteResult {
   int restarts = 0;
   int lns_fixed = 0;            // open connections closed by the regional rebuild (doc 16 F4)
   int optimized = 0;
-  int pairs = 0;
+  int pairs = 0;                // coupled connection pairs surviving in the retained routing state
+  int pair_successes = 0;       // successful attempts, including retries and later discarded states
+  int pair_anchor_skips = 0;    // cleanup candidates skipped because routed children attach to them
+  struct PairAttempt {
+    model::NetId a = 0, b = 0;
+    std::array<geom::Point, 4> pads{};
+    WorkPhase phase = WorkPhase::Setup;
+    bool cleanup = false, coupled = false;
+    long work = 0;
+    std::string reason, detail;
+    bool refill_repair = false;  // app reporting distinguishes the post-refill router pass
+  };
+  std::vector<PairAttempt> pair_attempts;  // stable chronological order, including fallbacks
   int length_tuned = 0;
   // Buses: connections routed as a lane of their group (leaders and the members that followed one), and connections
   // of a group routed otherwise ("left the bus"), in the state returned.
@@ -266,7 +280,7 @@ struct RouteResult {
       if (is("track on a layer that takes no tracks") || is("no common layer at an end")) return "layer_stranded";
       if (is("out of budget")) return "out_of_budget";
       if (is("ripped up by ")) return "ripped_not_rerouted";
-      if (is("too short to couple")) return "pair_too_short";
+      if (is("short coupled taper blocked")) return "short_taper_blocked";
       if (is("no coupled path")) return "no_coupled_path";
       if (is("would enclose pin ")) return "would_enclose_pin";
       return "unknown";  // retain the complete detail for future router diagnostics

@@ -91,11 +91,29 @@ def exact_copper_length(d, n):
     return length
 
 
-def segs(d, n):
-    """Return prototype mm segments, tessellating arcs via plane_metrics.
+def _arc_parameters(arc):
+    """Circle centre, radius and signed angular interval from three nm points."""
+    sx, sy, mx, my, ex, ey = (arc[k] / 1e6 for k in ("sx", "sy", "mx", "my", "ex", "ey"))
+    ux, uy, vx, vy = mx - sx, my - sy, ex - sx, ey - sy
+    determinant = 2 * (ux * vy - uy * vx)
+    if abs(determinant) < 1e-12:
+        raise ValueError("collinear arc")
+    u2, v2 = ux * ux + uy * uy, vx * vx + vy * vy
+    cx = sx + (vy * u2 - uy * v2) / determinant
+    cy = sy + (ux * v2 - vx * u2) / determinant
+    radius = math.hypot(sx - cx, sy - cy)
+    start, middle, end = (math.atan2(y - cy, x - cx) for x, y in ((sx, sy), (mx, my), (ex, ey)))
+    sweep = (end - start) % math.tau
+    if (middle - start) % math.tau > sweep:
+        sweep -= math.tau
+    return dict(cx=cx, cy=cy, radius=radius, start=start, sweep=sweep)
 
-    The shared tessellator uses <=0.001 mm sagitta (the prototype called this
-    same helper); lengths here are chord lengths, unlike exact_copper_length.
+
+def segs(d, n, *, tessellate_arcs=False):
+    """Return mm copper primitives for coupling, with exact circular arc lengths.
+
+    Return-plane coverage explicitly requests chord tessellation (<=0.001 mm
+    sagitta); coupling instead compares concentric circular angular intervals.
     """
     out = []
     for track in d["tracks"]:
@@ -110,6 +128,11 @@ def segs(d, n):
     for arc in d.get("arcs", []):
         if arc["net"] != n:
             continue
+        if not tessellate_arcs:
+            circle = _arc_parameters(arc)
+            out.append(dict(arc=circle, width=arc["width"] / 1e6, layer=arc["layer"],
+                            len=circle["radius"] * abs(circle["sweep"])))
+            continue
         points = pm.arc_geometry(_arc_node(arc), True)
         for p, q in zip(points, points[1:]):
             out.append({
@@ -120,21 +143,42 @@ def segs(d, n):
 
 
 def _overlaps(s, t):
+    """Coupled intervals along s, in mm; crossings have no parallel interval."""
     if s["layer"] != t["layer"]:
-        return None
+        return []
+    if "arc" in s or "arc" in t:
+        if "arc" not in s or "arc" not in t:
+            return []
+        a, b = s["arc"], t["arc"]
+        # Ten nm accommodates integer point rounding, not distinct crossing circles.
+        if math.hypot(a["cx"] - b["cx"], a["cy"] - b["cy"]) > 1e-5:
+            return []
+        gap = abs(a["radius"] - b["radius"]) - (s["width"] + t["width"]) / 2
+        if gap < -0.005:
+            return []
+        alo, ahi = sorted((a["start"], a["start"] + a["sweep"]))
+        blo, bhi = sorted((b["start"], b["start"] + b["sweep"]))
+        shift = math.floor((alo - blo) / math.tau)
+        intervals = []
+        for turn in range(shift - 1, shift + 3):
+            lo, hi = max(alo, blo + turn * math.tau), min(ahi, bhi + turn * math.tau)
+            if hi <= lo:
+                continue
+            if a["sweep"] >= 0:
+                intervals.append(((lo - a["start"]) * a["radius"], (hi - a["start"]) * a["radius"], gap))
+            else:
+                intervals.append(((a["start"] - hi) * a["radius"], (a["start"] - lo) * a["radius"], gap))
+        return intervals
     ux, uy = (s["ex"] - s["sx"]) / s["len"], (s["ey"] - s["sy"]) / s["len"]
     vx, vy = (t["ex"] - t["sx"]) / t["len"], (t["ey"] - t["sy"]) / t["len"]
-    if abs(ux * vy - uy * vx) > math.sin(math.radians(5)):
-        return None
-    # Preserve the prototype's stricter parallel test: crossings do not couple.
     if abs(ux * vy - uy * vx) > 1e-4:
-        return None
+        return []
     dx, dy = t["sx"] - s["sx"], t["sy"] - s["sy"]
     gap = abs(dx * uy - dy * ux) - (s["width"] + t["width"]) / 2
     a = dx * ux + dy * uy
     b = (t["ex"] - s["sx"]) * ux + (t["ey"] - s["sy"]) * uy
     lo, hi = max(0, min(a, b)), min(s["len"], max(a, b))
-    return (lo, hi, gap) if hi > lo and gap >= -0.005 else None
+    return [(lo, hi, gap)] if hi > lo and gap >= -0.005 else []
 
 
 def target_gap(sa, sb):
@@ -145,9 +189,9 @@ def target_gap(sa, sb):
     histogram = collections.Counter()
     for s in sa:
         for t in sb:
-            overlap = _overlaps(s, t)
-            if overlap and 0 <= overlap[2] <= 0.5:
-                histogram[round(overlap[2] / 0.025) * 0.025] += overlap[1] - overlap[0]
+            for overlap in _overlaps(s, t):
+                if 0 <= overlap[2] <= 0.5:
+                    histogram[round(overlap[2] / 0.025) * 0.025] += overlap[1] - overlap[0]
     return histogram.most_common(1)[0][0] if histogram else None
 
 
@@ -165,9 +209,9 @@ def coupled(sa, sb, gap):
         for s in aa:
             intervals = []
             for t in bb:
-                overlap = _overlaps(s, t)
-                if overlap and abs(overlap[2] - gap) <= max(0.025, 0.2 * gap):
-                    intervals.append(overlap[:2])
+                for overlap in _overlaps(s, t):
+                    if abs(overlap[2] - gap) <= max(0.025, 0.2 * gap):
+                        intervals.append(overlap[:2])
             end = -1
             for lo, hi in sorted(intervals):
                 good += max(0, hi - max(lo, end))
@@ -344,7 +388,7 @@ def retmetric(d, nets, uf, broad):
         touching = {l for l in span if l in uf and uf[l].intersects(disk)}
         ground_vias.append((via, touching))
     for n in sorted(nets):
-        segments = segs(d, n)
+        segments = segs(d, n, tessellate_arcs=True)
         lines = [LineString([(s["sx"], s["sy"]), (s["ex"], s["ey"])]) for s in segments]
         for s, line in zip(segments, lines):
             total += s["len"]

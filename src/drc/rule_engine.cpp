@@ -784,8 +784,13 @@ Coord RuleEngine::clearance(const CopperItem& a, const CopperItem& b, int layer)
   auto local = [&](const CopperItem& it) -> Coord {
     if (it.kind != ItemKind::Pad) return -1;
     const auto& pad = b_.pads[static_cast<std::size_t>(it.index)];
-    if (pad.clearance >= 0) return pad.clearance;
-    return b_.footprints[static_cast<std::size_t>(pad.footprint)].clearance;
+    // KiCad's zero pad/footprint clearance means inherited, not a zero-clearance override.
+    if (pad.clearance > 0) return pad.clearance;
+    if (it.footprint >= 0) {
+      const Coord value = b_.footprints[static_cast<std::size_t>(it.footprint)].clearance;
+      if (value > 0) return value;
+    }
+    return -1;
   };
   const Coord la = local(a), lb = local(b);
   Coord req = (la >= 0 || lb >= 0) ? std::max(la, lb) : std::max(netclass(a).clearance, netclass(b).clearance);

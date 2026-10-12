@@ -53,6 +53,21 @@ STITCH = (HEAD + '  (footprint "T:H" (layer "F.Cu") (at 3 17) (property "Referen
           '    (pad "1" thru_hole circle (at 0 0) (size 1.6 1.6) (drill 0.8) (layers "*.Cu") (net 1 "GND")))\n' +
           pad("R3", 10, 5, 3, "S", size=1) + pad("R4", 20, 5, 3, "S", "B.Cu", size=1) + zone("F.Cu") + zone("B.Cu") + ")\n")
 
+# One easy short pair survives; a second pair is trapped inside locked rings.
+# Refill repair must keep the first pair's copper and spend no work on coupled probes.
+PAIR_REPAIR = HEAD.replace('(31 "B.Cu" signal)', '').replace(
+    '(net 4 "W1") (net 5 "W2")', '(net 4 "D_P") (net 5 "D_N") (net 6 "E_P") (net 7 "E_N")')
+for x in (10, 11):
+    PAIR_REPAIR += pad(f"E{x}P", x, 3, 6, "E_P", size=0.2)
+    PAIR_REPAIR += pad(f"E{x}N", x, 3.6, 7, "E_N", size=0.2)
+for x in (5, 25):
+    PAIR_REPAIR += pad(f"D{x}P", x, 9.7, 4, "D_P", size=0.3)
+    PAIR_REPAIR += pad(f"D{x}N", x, 10.3, 5, "D_N", size=0.3)
+    for a, b in (((x - 0.75, 9), (x + 0.75, 9)), ((x + 0.75, 9), (x + 0.75, 11)),
+                 ((x + 0.75, 11), (x - 0.75, 11)), ((x - 0.75, 11), (x - 0.75, 9))):
+        PAIR_REPAIR += seg(*a, *b, 3, locked=True)
+PAIR_REPAIR += ")\n"
+
 errors = []
 
 
@@ -96,6 +111,27 @@ def main() -> int:
     wsrc, ssrc = work / "widen_in.kicad_pcb", work / "stitch_in.kicad_pcb"
     wsrc.write_text(WIDEN)
     ssrc.write_text(STITCH)
+
+    # --- connectivity-only refill repair of pair boards
+    psrc = work / "pair_repair_in.kicad_pcb"
+    psrc.write_text(PAIR_REPAIR)
+    popts = ["--soft-zones", "--diff-pairs"]
+    poff, _ = route(tm, psrc, work / "pair_repair_off.kicad_pcb", popts + ["--no-refill-repair"])
+    pon, _ = route(tm, psrc, work / "pair_repair_on.kicad_pcb", popts)
+    pon2, _ = route(tm, psrc, work / "pair_repair_on2.kicad_pcb", popts, threads=2)
+    repair = pon.get("refill", {}).get("repair")
+    check(repair is not None, "blocked pair did not exercise refill repair")
+    attempts = pon.get("pair_routing", {}).get("details", [])
+    check(any(a.get("coupled") for a in attempts), "easy short pair did not survive before refill")
+    check(not any(a.get("refill_repair") for a in attempts), "refill repair repeated coupled probes")
+    if repair:
+        check(repair["work"]["setup"]["expansions"] == 0, "repair charged upfront coupled work")
+    check(pon.get("unconnected_after_refill") <= poff.get("unconnected_after_refill"), "repair lost connectivity")
+    check((work / "pair_repair_on.kicad_pcb").read_bytes() == (work / "pair_repair_on2.kicad_pcb").read_bytes(),
+          "pair refill repair is not deterministic across thread counts")
+    e_off = [t for t in inspect(tm, work / "pair_repair_off.kicad_pcb")["tracks"] if t["net"] in ("E_P", "E_N")]
+    e_on = [t for t in inspect(tm, work / "pair_repair_on.kicad_pcb")["tracks"] if t["net"] in ("E_P", "E_N")]
+    check(e_on and e_on == e_off, "repair changed the surviving coupled copper")
 
     # --- style metric
     s1, _ = route(tm, ssrc, work / "style1.kicad_pcb", [], threads=1, variants=3)

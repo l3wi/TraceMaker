@@ -91,6 +91,13 @@ Point miter_point(Point c, int d1, int d2, double s) {
   return offset_point(c, Dir2{(n1.x + n2.x) / k, (n1.y + n2.y) / k}, s);
 }
 
+std::array<Point, 4> pair_pad_exits(const model::Pad& pad, Coord lead) {
+  const Coord x = pad.size_x / 2 + lead, y = pad.size_y / 2 + lead;
+  const Point centre = pad.pos + geom::rotate(pad.drill_offset, pad.angle);
+  return {centre + geom::rotate(Point{x, 0}, pad.angle), centre + geom::rotate(Point{-x, 0}, pad.angle),
+          centre + geom::rotate(Point{0, y}, pad.angle), centre + geom::rotate(Point{0, -y}, pad.angle)};
+}
+
 PairStats measure_pair(const std::vector<model::Track>& tracks, const std::vector<model::Via>& vias, NetId a, NetId c, Coord coupled_gap) {
   PairStats st;
   std::vector<const model::Track*> ta, tc;

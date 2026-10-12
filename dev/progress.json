@@ -844,8 +844,32 @@
      "done": true
     },
     {
-     "text": "Router quality gaps vs human (modern-planes, review 2026-10-11): diff-pair coupling (with --diff-pairs 45/84 pairs coupled; fine-pitch pair fan-in fails, survey and draft on wip/router-fixes-premerge), return vias at layer changes (1 mm parity 65 %; compare main's D92 stitching), supply widths 0.625x human (main's --widen-power), off-axis pad entry 32 % vs 21 %",
+     "text": "Router quality gaps vs human remain open after the user-selected D127 single10-all-exits configuration: weighted common human-gap coupling improves baseline 46.29% -> final 56.70%, median skew 1.502 -> 1.196 mm and via imbalance 0.159 -> 0.091, but step 6 had 59.81%, 1.084 mm and 0.023. Missing pair obligations remain 9 versus baseline 7; small-pad process passes remain 4/11 versus 5/11 and eligible boards 1/11. User accepts baseline improvement with stop-aware routing gates, not full human or step-6 parity.",
      "done": false
+    },
+    {
+     "text": "Differential-pair tree safety (D118): cleanup skips anchored single-route trunks; successful pairs reset old physical endpoint/dependency metadata after all exact gates. Three-terminal pair connectivity regression and focused pair tests pass.",
+     "done": true
+    },
+    {
+     "text": "Differential-pair endpoint and short-link fixes (D119-D123): rotated pad-axis exits, joint leg selection with charged inner checks, queued-goal draining at unchanged caps, soft connector-lane exit guidance, exact short tapers and unioned USB selection. Focused tests cover three lanes, mirrored ends, tree rollback, cap-bound goals, small budgets and blocked short links; structured attempt/fallback/surviving report landed.",
+     "done": true
+    },
+    {
+     "text": "Human-parity differential arc measurement (D124): exact concentric-circle angular overlaps replace incompatible independent chord directions; reversed/wrapped/partial arc and crossing controls pass. Return-plane tessellation unchanged.",
+     "done": true
+    },
+    {
+     "text": "Differential-pair regression ablation and local exact-check reuse (D125-D126): same-input 200 M step runs isolate OCuLink loss to step 2 and Yardforce losses to steps 2-3. Cached/reference copper equality tests pass; local reuse saves first-pass pair work (OCuLink 17.77 M -> 8.69 M; Yardforce 15.99 M -> 3.11 M) and recovers Yardforce, not OCuLink. Latest checks: 1,867 focused assertions, 283 full CTest passes / 3 skips, 32 Python passes; known parity failures excluded. Full-tier figures are frozen before the cache change, not latest-code acceptance.",
+     "done": true
+    },
+    {
+     "text": "Differential-pair budget regression (D127) accepted under D129: general 10% upfront allowance across restarts, single-route refill repair retaining coupled copper, ordinary-net soft escape guidance; no board-specific thresholds or higher caps/budgets. All 30 quick, 11 modern and 8 mid boards measured: finished counts 30->30 / 3->3 / 0->0, zero stop-aware regressions and zero added errors. OCuLink 11->12 is work->work, reported budget limited. Final full CTest 285 pass / 3 skip / 2 known KiCad 10.0.3 parity failures; all 37 bench Python tests pass; synthetic work-share/repair and cached-reference equality pass. Scorecard: build/quality/pairfix.json; all variant evidence: build/quality/pairreg-variants.json.",
+     "done": true
+    },
+    {
+     "text": "Zero local-clearance inheritance (D128): zero pad/footprint fields inherit rather than reduce net-class clearance to the board floor. Generic exact-obstacle regression covers symmetry and positive-override precedence (15 assertions); historical OCuLink track/pad gaps now match KiCad, and final quick/modern/mid have zero added errors on all 49 boards.",
+     "done": true
     },
     {
      "text": "origin/main 0.9.0 merge (D116/D117): shared options preserve tree/planes/intent and TUI/config/buses/SRJ/passes; decision collisions renumbered to D99-D115. Metal build warning-free; full CTest 276 pass, 3 skip, 2 pre-existing KiCad 10.0.3 parity failures; 18 benchmark Python tests pass; quick and modern+intent protocol smoke routes execute",

@@ -6,8 +6,10 @@
 
 A run is a directory bench/results/<run-id> or just the run id. Per board: routed boards byte-identical or not,
 completion and clean pass before and after, added DRC errors. Exit status 1 when a gate fails:
-  1. no board gets worse in clean pass or completion;
-  2. no added KiCad DRC errors on a board that was clean before;
+  1. no board that finished gets worse in clean pass or completion, and no board that finished before stops
+     finishing. "Finished" means the router's own stop reason is "complete" (`<board>.kicad_pcb.route.json`);
+     a board stopped by its work budget measures the budget, not the change, so it is listed but not gated;
+  2. no added KiCad DRC errors on a board that was clean before (finished or not: committed copper must be legal);
   3. both runs hold the same boards, and at least one;
   with --expect-identical (speed-ups, refactors): every routed board byte-identical.
 The style metric (doc 05 §39) is shown per board where it changed; it is informational and never gated.
@@ -48,6 +50,14 @@ def digest(path: pathlib.Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
 
 
+def stop_reason(run_dir: pathlib.Path, name: str, row: dict) -> str | None:
+    """The router's stop reason ("complete", "work", ...); None for runs that never recorded it."""
+    if row.get("stop"):
+        return row["stop"]
+    route = run_dir / "boards" / f"{name}.kicad_pcb.route.json"
+    return json.loads(route.read_text()).get("stop") if route.exists() else None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("before")
@@ -59,7 +69,7 @@ def main() -> int:
     adir, after = load(a.after)
     boards = sorted(set(before) & set(after))
     missing = sorted(set(before) ^ set(after))
-    identical, rows, failures, notes = 0, [], [], []
+    identical, rows, failures, notes, unfinished = 0, [], [], [], []
     plane_columns = any("plane_unconnected_after" in r for r in list(before.values()) + list(after.values()))
     noise: list[float] = []  # CPU change of byte-identical boards: same work, so run-to-run noise or a uniform speed change
 
@@ -82,7 +92,13 @@ def main() -> int:
             continue
         worse = (b["clean"] and not f["clean"]) or f["completion"] < b["completion"]
         added = f["added_errors"] if b["clean"] and f["added_errors"] else {}
-        if worse:
+        sb, sf = stop_reason(bdir, name, b), stop_reason(adir, name, f)
+        if sb == "complete" and sf is not None and sf != "complete":
+            failures.append(f"{name}: no longer finishes (stop {sb} -> {sf})")
+        elif worse and sf is not None and sf != "complete":
+            # Budget-limited: the unconnected count measures where the budget ran out, not the change.
+            unfinished.append(f"{name}: completion {b['completion']:.1%} -> {f['completion']:.1%} (stop {sb} -> {sf}; not gated)")
+        elif worse:
             failures.append(f"{name}: worse (clean {b['clean']} -> {f['clean']}, completion {b['completion']:.1%} -> {f['completion']:.1%})")
         if added:
             failures.append(f"{name}: added DRC errors on a board clean before: {added}")
@@ -155,6 +171,8 @@ def main() -> int:
         out += ["", "| Board | " + " | ".join(k.replace("_", " ").capitalize() for k in STYLE_KEYS) + " |", "|---|" + "---|" * len(STYLE_KEYS)] + style_rows
     if notes:
         out += ["", "CPU time at equal work, beyond what the byte-identical boards show as noise (not a gate; check speed at equal wall time, doc 10 §5):"] + [f"- {x}" for x in notes]
+    if unfinished:
+        out += ["", "Worse but stopped by the work budget in the after run (listed, not gated; doc 10 §5):"] + [f"- {x}" for x in unfinished]
     out += ["", "Gates: " + ("pass" if not failures else "FAIL")] + [f"- {x}" for x in failures]
     text = "\n".join(out) + "\n"
     print(text, end="")

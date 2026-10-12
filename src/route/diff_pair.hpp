@@ -4,6 +4,7 @@
 // how a routed pair came out (coupled share, gap, intra-pair skew). The coupled search itself lives in the router
 // (route/router.cpp, `route_pair`), which owns the lattice and the transaction state.
 #include <algorithm>
+#include <array>
 #include <optional>
 #include <string>
 #include <vector>
@@ -44,6 +45,8 @@ Dir2 left_normal(int d);
 geom::Point offset_point(geom::Point p, Dir2 v, double s);
 // Miter corner of a polyline offset by `s` (signed: + left) where the centreline turns from direction d1 to d2.
 geom::Point miter_point(geom::Point c, int d1, int d2, double s);
+// Four straight exits along the rotated copper axes, outside the pad by `lead`.
+std::array<geom::Point, 4> pair_pad_exits(const model::Pad& pad, Coord lead);
 
 // A routed pair, measured on its tracks: a sample of one half counts as coupled where a parallel track of the
 // other half on the same layer lies within `coupled_gap` edge to edge.

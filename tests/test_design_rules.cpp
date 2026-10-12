@@ -97,6 +97,38 @@ TEST_CASE("explicit project selects its custom rules for a renamed board", "[rul
   CHECK_THROWS_AS(io::read_design_rules(f.pcb.string(), (f.dir / "missing.kicad_pro").string()), std::runtime_error);
 }
 
+TEST_CASE("zero local pad and footprint clearance inherits the net class", "[rules][route]") {
+  const auto original = io::read_board(sexpr::Document::parse(board_text("")));
+  model::DesignRules rules;
+  model::NetClass cls;
+  cls.name = "Default";
+  cls.clearance = 125'000;
+  cls.track_width = 150'000;
+  rules.classes.push_back(cls);
+  rules.minimums.clearance = 100'000;
+  for (const auto& [pad_clearance, fp_clearance] :
+       {std::pair<Coord, Coord>{-1, 0}, {0, -1}, {0, 0}, {0, 200'000}, {300'000, 200'000}}) {
+    auto b = original;
+    b.pads[0].pos = {5'000'000, 5'000'000};
+    b.pads[0].size_x = 350'000;
+    b.pads[0].size_y = 3'000'000;
+    b.pads[0].clearance = pad_clearance;
+    b.footprints[0].clearance = fp_clearance;
+    const auto copper = drc::build_copper(b);
+    drc::CopperItem probe;
+    probe.kind = drc::ItemKind::Track;
+    probe.net = 2;
+    probe.layers = model::layer_bit(0);
+    const drc::RuleEngine engine(b, rules);
+    const Coord expected = pad_clearance > 0 ? pad_clearance : fp_clearance > 0 ? fp_clearance : cls.clearance;
+    CHECK(engine.clearance(copper.items.front(), probe, 0) == expected);
+    CHECK(engine.clearance(probe, copper.items.front(), 0) == expected);
+    // The diagonal passes the 0.1 mm board minimum but violates the inherited 0.125 mm class.
+    route::Obstacles obstacles(b, rules);
+    CHECK(obstacles.segment_state({4'754'757, 3'300'000}, {4'554'757, 3'500'000}, 0, 150'000, 2, false, nullptr) == 2);
+  }
+}
+
 TEST_CASE("project rules retain KiCad 10 defaults key by key", "[rules][io]") {
   const Files f("defaults", board_text(""), "");
   auto check_defaults = [](const model::DesignRules& r) {
@@ -166,7 +198,7 @@ TEST_CASE("unrouted categories follow final diagnostics without parsing pad refe
       {"exact check rejected the lattice path", "exact_check_rejected"},
       {"track on a layer that takes no tracks", "layer_stranded"}, {"out of budget", "out_of_budget"},
       {"ripped up by /SIG and not routed again", "ripped_not_rerouted"},
-      {"no common layer at an end", "layer_stranded"}, {"too short to couple", "pair_too_short"},
+      {"no common layer at an end", "layer_stranded"}, {"short coupled taper blocked", "short_taper_blocked"},
       {"no coupled path", "no_coupled_path"}, {"exact check of the finished pair", "exact_check_rejected"},
       {"pair search budget", "search_budget"}, {"would enclose pin U1.2 between the halves", "would_enclose_pin"},
       {"boxed in; escapes/neck-down: no path in window; negotiated: out of budget", "out_of_budget"},

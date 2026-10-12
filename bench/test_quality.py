@@ -2,6 +2,7 @@
 """Synthetic measurement cases: holes/named nets, missing references, censoring."""
 import hashlib
 import json
+import math
 import pathlib
 import tempfile
 import unittest
@@ -108,6 +109,39 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(rows['unknown']['all_obligations']['missing'],0)
         self.assertEqual(rows['unknown']['all_obligations']['eligible'],0)
         self.assertEqual(rows['broken']['all_obligations']['loss'],1)
+
+    @staticmethod
+    def arc(net, radius, angles, centre=(0, 0)):
+        points = [(round((centre[0] + radius * math.cos(math.radians(a))) * 1e6),
+                   round((centre[1] + radius * math.sin(math.radians(a))) * 1e6)) for a in angles]
+        return dict(net=net, layer="F.Cu", width=200000, sx=points[0][0], sy=points[0][1],
+                    mx=points[1][0], my=points[1][1], ex=points[2][0], ey=points[2][1])
+
+    def test_concentric_arc_coupling_uses_exact_circle_intervals(self):
+        for angles in ((0, 45, 90), (90, 45, 0), (315, 360, 405)):
+            d = dict(tracks=[], arcs=[self.arc("USB_DP", 5, angles), self.arc("USB_DM", 5.4, angles)])
+            a, b = si.segs(d, "USB_DP"), si.segs(d, "USB_DM")
+            self.assertAlmostEqual(si.target_gap(a, b), .2)
+            good, total = si.coupled(a, b, .2)
+            self.assertAlmostEqual(total, (5 + 5.4) * math.pi / 2, places=5)
+            self.assertAlmostEqual(good / total, 1, places=6)  # integer-nm three-point rounding
+            self.assertEqual(si.coupled(a, b, .1)[0], 0)
+
+    def test_partial_concentric_arcs_union_and_crossing_controls(self):
+        d = dict(tracks=[], arcs=[self.arc("USB_DP", 5, (0, 45, 90)),
+                                  self.arc("USB_DM", 5.4, (45, 90, 135))])
+        a, b = si.segs(d, "USB_DP"), si.segs(d, "USB_DM")
+        good, total = si.coupled(a, b, .2)
+        self.assertAlmostEqual(good / total, .5, places=6)
+        # Duplicate partner geometry is unioned, not counted twice.
+        self.assertAlmostEqual(si.coupled(a, b + b, .2)[0], good + (good * 5.4 / 10.4), places=5)
+        crossing = dict(tracks=[], arcs=[d["arcs"][0], self.arc("USB_DM", 5.4, (45, 90, 135), centre=(1, 0))])
+        self.assertIsNone(si.target_gap(si.segs(crossing, "USB_DP"), si.segs(crossing, "USB_DM")))
+        self.assertEqual(si.coupled(si.segs(crossing, "USB_DP"), si.segs(crossing, "USB_DM"), .2)[0], 0)
+        tracks = dict(tracks=[
+            dict(net="USB_DP", layer="F.Cu", sx=0, sy=0, ex=1000000, ey=0, width=200000),
+            dict(net="USB_DM", layer="F.Cu", sx=500000, sy=-500000, ex=500000, ey=500000, width=200000)])
+        self.assertEqual(si.coupled(si.segs(tracks, "USB_DP"), si.segs(tracks, "USB_DM"), .2)[0], 0)
 
 
 if __name__ == '__main__':
